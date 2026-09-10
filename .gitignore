@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.backup*
+
+# Local runtimes and compiled helpers
+benchmark/
+bin/
+.venv/
+venv/
+
+# OCR inputs, generated books, and transient output
+*_book/
+.work/
+output/
+dist/
+build/
+
+# Local editor files
+.idea/
+.vscode/
