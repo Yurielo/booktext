@@ -1,0 +1,25 @@
+{
+  "schema_version": "0.1",
+  "artifact_type": "booktext.integra_ocr_candidate",
+  "source": {
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "format": "IMAGE",
+    "page_count": 1,
+    "revision_id": "booktext-source-revision-fixture-001"
+  },
+  "provider": {
+    "component_id": "booktext.fixture",
+    "implementation_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "model_id": "fixture-model",
+    "model_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "blocks": [
+    {
+      "unit_kind": "IMAGE",
+      "unit_index": 1,
+      "region": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+      "text": "Fixture text.",
+      "confidence": 0.97
+    }
+  ]
+}

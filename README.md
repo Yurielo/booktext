@@ -14,6 +14,8 @@
 
 Этапы, зависимости и критерии готовности описаны в
 [плане разработки](DEVELOPMENT_PLAN.md).
+Контракт будущего адаптера описан в
+[Booktext → Integra OCR adapter contract](docs/INTEGRA_OCR_ADAPTER_CONTRACT.md).
 
 ## Возможности
 
