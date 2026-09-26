@@ -93,6 +93,25 @@ Surya и Vision. Перед повторным включением в осно�
 контрольные страницы 305, 306, 320 и 321; текущие экспериментальные версии не
 используются автоматически.
 
+## Канонический пакет документа
+
+Для уже полученного `book.json` можно сформировать переносимые `document.json`
+и `manifest.json`, не копируя абсолютные пути в артефакты:
+
+```bash
+python3 tools/build_document_package.py \
+  --book-json /path/to/book-output/book.json \
+  --source /path/to/original.pdf \
+  --surya-results /path/to/book-output/surya/surya-input/results.json \
+  --review-json /path/to/book-output/review.json \
+  --output-dir /path/to/document-package
+```
+
+Пакет создаёт стабильные идентификаторы источников, документа, ревизии, страниц,
+блоков и ячеек. Для Surya-блоков он сохраняет исходный HTML, координаты, порядок
+чтения и выбранный машинный текст. Если таких данных нет, это явно отмечается в
+`limitations`, а не заменяется недоказанным происхождением.
+
 Файлы `tools/hybrid_*` и `tools/visual_recheck_v18.py` сохранены как история
 экспериментов. Они не входят в текущую production-архитектуру и не должны
 использоваться для автоматического OCR arbitration.
