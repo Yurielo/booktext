@@ -57,22 +57,27 @@ python3 booktext.py --ocr surya --pages 1-20 source.pdf
 python3 booktext.py --help
 ```
 
-## Реконструкция frequency-таблиц
+## Консервативное извлечение таблиц
 
-Прототип использует существующий `surya/surya-input/results.json` и
-`vision/page-NNNN.json`; повторный OCR не запускается.
+Извлечение использует существующий `surya/surya-input/results.json` и не
+запускает OCR повторно. Оно сохраняет исходный HTML, развёрнутую grid-таблицу,
+границы и confidence Surya. Значения не исправляются и не заменяются.
 
 ```bash
-python3 tools/reconstruct_frequency_table.py \
-  --page 320 \
-  --data-root /path/to/book-output
+python3 tools/extract_surya_tables.py \
+  --results /path/to/book-output/surya/surya-input/results.json \
+  --output-dir /path/to/table-output \
+  --pages 305,306,320,321
 ```
 
-По умолчанию создаются `/tmp/page-0320-table.json` и
-`/tmp/page-0320-table.tsv`. Каждая ячейка содержит primary-значение Surya,
-значение Vision, источник решения, confidence, bbox и `review_required`.
-Совпадение подтверждается только независимым согласием OCR; при расхождении
-сохраняется primary-значение Surya и выставляется review-флаг.
+`manifest.json` не содержит абсолютный путь к исходнику: вместо него хранится
+имя и SHA-256. Страницы без найденной таблицы или без результата также явно
+попадают в manifest.
+
+`tools/reconstruct_frequency_table.py` остаётся прежним прототипом сопоставления
+Surya и Vision. Перед повторным включением в основной путь он должен пройти
+контрольные страницы 305, 306, 320 и 321; текущие экспериментальные версии не
+используются автоматически.
 
 Файлы `tools/hybrid_*` и `tools/visual_recheck_v18.py` сохранены как история
 экспериментов. Они не входят в текущую production-архитектуру и не должны
@@ -81,6 +86,6 @@ python3 tools/reconstruct_frequency_table.py \
 ## Проверка
 
 ```bash
-python3 -m py_compile booktext.py tools/reconstruct_frequency_table.py
+python3 -m py_compile booktext.py tools/extract_surya_tables.py
 python3 -m unittest discover -s tests -v
 ```
