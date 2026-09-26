@@ -112,6 +112,16 @@ python3 tools/build_document_package.py \
 чтения и выбранный машинный текст. Если таких данных нет, это явно отмечается в
 `limitations`, а не заменяется недоказанным происхождением.
 
+Для набора фотографий до OCR зафиксируйте ориентацию оригиналов:
+
+```bash
+python3 tools/inspect_photo_set.py --source IMG_1275.JPG --source IMG_1276.JPG \
+  --output photo-set.json
+```
+
+Manifest сохраняет хеши, исходную геометрию, EXIF-ориентацию и результат
+`imagemagick:auto-orient`; повёрнутые снимки получают `review_required: true`.
+
 Файлы `tools/hybrid_*` и `tools/visual_recheck_v18.py` сохранены как история
 экспериментов. Они не входят в текущую production-архитектуру и не должны
 использоваться для автоматического OCR arbitration.
