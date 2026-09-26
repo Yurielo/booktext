@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 
@@ -548,22 +550,25 @@ def _surya_html_to_text(value):
 
     text = str(value)
 
-    # Preserve useful structural breaks before stripping tags.
+    # Preserve useful structural breaks before stripping tags.  These are raw
+    # regular expressions: escaping ``\\s`` or ``\\t`` here would match a
+    # literal backslash and a letter, which corrupts ordinary text such as
+    # "treatment".
     text = re.sub(
-        r"(?i)<br\\s*/?>|</p\\s*>|</div\\s*>|</li\\s*>|"
-        r"</tr\\s*>|</h[1-6]\\s*>",
-        "\\n",
+        r"(?i)<br\s*/?>|</p\s*>|</div\s*>|</li\s*>|"
+        r"</tr\s*>|</h[1-6]\s*>",
+        "\n",
         text,
     )
-    text = re.sub(r"(?i)</t[dh]\\s*>", "\\t", text)
+    text = re.sub(r"(?i)</t[dh]\s*>", "\t", text)
     text = re.sub(r"<[^>]+>", "", text)
 
     text = html.unescape(text)
-    text = text.replace("\\xa0", " ")
+    text = text.replace("\xa0", " ")
 
     lines = []
     for line in text.splitlines():
-        line = re.sub(r"[ \\t]+", " ", line).strip()
+        line = re.sub(r"[ \t]+", " ", line).strip()
         if line:
             lines.append(line)
 
@@ -649,22 +654,29 @@ def recognize_pages_surya(pages, output_dir, temp_dir):
         destination = input_dir / f"page-{page_number:04d}.png"
         shutil.copy2(page, destination)
 
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Keep a previous successful OCR result intact until Surya has produced a
+    # complete, readable replacement.  A failed rerun must not erase review
+    # evidence from the earlier run.
+    staging_dir = output_dir.parent / (
+        f".{output_dir.name}.staging-{uuid.uuid4().hex}"
+    )
+    staging_dir.mkdir(parents=True, exist_ok=False)
 
     print()
     print("===== Surya OCR =====")
     print(f"Пакетная обработка страниц: {len(pages)}")
 
-    run([
-        str(SURYA_CLI),
-        str(input_dir),
-        "--output_dir", str(output_dir),
-    ])
+    try:
+        run([
+            str(SURYA_CLI),
+            str(input_dir),
+            "--output_dir", str(staging_dir),
+        ])
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
-    result_files = list(output_dir.rglob("results.json"))
+    result_files = list(staging_dir.rglob("results.json"))
 
     if not result_files:
         raise RuntimeError(
@@ -713,6 +725,23 @@ def recognize_pages_surya(pages, output_dir, temp_dir):
             + ", ".join(str(x) for x in missing)
         )
 
+    previous_dir = None
+    if output_dir.exists():
+        previous_dir = output_dir.parent / (
+            f".{output_dir.name}.previous-{uuid.uuid4().hex}"
+        )
+        os.replace(output_dir, previous_dir)
+
+    try:
+        os.replace(staging_dir, output_dir)
+    except OSError:
+        if previous_dir is not None and previous_dir.exists():
+            os.replace(previous_dir, output_dir)
+        raise
+    else:
+        if previous_dir is not None:
+            shutil.rmtree(previous_dir)
+
     print(f"Surya OCR получен для страниц: {len(texts)}")
     return texts
 
@@ -756,7 +785,8 @@ def require_vision():
 
 def _qa_tokenize(text):
     return re.findall(
-        r"[A-Za-zА-Яа-яЁё0-9]+(?:[-–—][A-Za-zА-Яа-яЁё0-9]+)*|[¼½¾]",
+        r"[+-]?(?:\d+(?:[.,]\d+)?|[¼½¾])|"
+        r"[A-Za-zА-Яа-яЁё0-9]+(?:[-–—][A-Za-zА-Яа-яЁё0-9]+)*",
         text or "",
         flags=re.UNICODE,
     )
@@ -775,6 +805,14 @@ def _qa_norm(text):
 def _qa_collapsed(tokens):
     value = "".join(_qa_norm(x) for x in tokens)
     return re.sub(r"[^a-zа-я0-9¼½¾]+", "", value, flags=re.IGNORECASE)
+
+
+def _qa_is_word_segmentation(tokens):
+    """Return true only for a harmless split inside alphabetic text."""
+    return bool(tokens) and all(
+        re.fullmatch(r"[A-Za-zА-Яа-яЁё]+", token) is not None
+        for token in tokens
+    )
 
 
 def _vision_union_bbox(items):
@@ -892,6 +930,8 @@ def vision_qa_page(page, page_number, surya_text, vision_dir):
         if (
             surya_part
             and vision_part
+            and _qa_is_word_segmentation(surya_part)
+            and _qa_is_word_segmentation(vision_part)
             and _qa_collapsed(surya_part) == _qa_collapsed(vision_part)
         ):
             continue
@@ -961,6 +1001,91 @@ def create_searchable_pdf(page_records, output_pdf, temp_dir, languages):
             "Текст, Markdown и изображения всё равно сохранены."
         )
         return False
+
+
+def write_review_outputs(review_json_path, review_text_path, qa_pages, review_items):
+    """Persist QA evidence without treating failed pages as clean pages."""
+    failed_pages = [
+        item for item in qa_pages
+        if isinstance(item, dict) and item.get("error")
+    ]
+    status = "complete" if not failed_pages else "partial"
+
+    review_json_path.write_text(
+        json.dumps(
+            {
+                "policy": (
+                    "Surya remains the primary OCR. Apple Vision differences "
+                    "are review candidates only; no automatic text replacement "
+                    "is performed."
+                ),
+                "status": status,
+                "pages": qa_pages,
+                "review": review_items,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    review_lines = [
+        "BOOKTEXT OCR REVIEW",
+        "",
+        "Основной текст: Surya.",
+        "Apple Vision используется только для независимой проверки.",
+        "Ни одно расхождение ниже автоматически не исправляло book_clean.txt.",
+        "",
+    ]
+
+    if failed_pages:
+        review_lines.extend([
+            "СТАТУС: НЕПОЛНАЯ ПРОВЕРКА.",
+            "Apple Vision не завершил проверку следующих страниц:",
+        ])
+        for item in failed_pages:
+            review_lines.append(
+                f"- страница {item.get('page', '—')}: {item['error']}"
+            )
+        review_lines.append("")
+
+    current_page = None
+    for item in review_items:
+        page_number = item["page"]
+
+        if page_number != current_page:
+            current_page = page_number
+            review_lines.extend([
+                "",
+                f"===== СТРАНИЦА {page_number} =====",
+                "",
+            ])
+
+        confidence = item.get("vision_confidence")
+        confidence_text = (
+            f"{confidence:.3f}"
+            if isinstance(confidence, (int, float))
+            else "—"
+        )
+
+        review_lines.extend([
+            f"[{item.get('category', 'text')}] "
+            f"{item.get('kind', '').upper()}",
+            f"SURYA : {item.get('surya', '')}",
+            f"VISION: {item.get('vision', '')}",
+            f"VISION CONFIDENCE: {confidence_text}",
+            "",
+        ])
+
+    if not review_items and not failed_pages:
+        review_lines.append(
+            "Значимых расхождений Surya / Apple Vision не найдено."
+        )
+
+    review_text_path.write_text(
+        "\n".join(review_lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
 
 
 def main():
@@ -1374,69 +1499,11 @@ def main():
 
     # Independent OCR review queue.
     if args.ocr == "surya" and not args.no_qa:
-        review_json_path.write_text(
-            json.dumps(
-                {
-                    "policy": (
-                        "Surya remains the primary OCR. "
-                        "Apple Vision differences are review candidates only; "
-                        "no automatic text replacement is performed."
-                    ),
-                    "pages": qa_pages,
-                    "review": review_items,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        review_lines = [
-            "BOOKTEXT OCR REVIEW",
-            "",
-            "Основной текст: Surya.",
-            "Apple Vision используется только для независимой проверки.",
-            "Ни одно расхождение ниже автоматически не исправляло book_clean.txt.",
-            "",
-        ]
-
-        current_page = None
-
-        for item in review_items:
-            page_number = item["page"]
-
-            if page_number != current_page:
-                current_page = page_number
-                review_lines.extend([
-                    "",
-                    f"===== СТРАНИЦА {page_number} =====",
-                    "",
-                ])
-
-            confidence = item.get("vision_confidence")
-            confidence_text = (
-                f"{confidence:.3f}"
-                if isinstance(confidence, (int, float))
-                else "—"
-            )
-
-            review_lines.extend([
-                f"[{item.get('category', 'text')}] "
-                f"{item.get('kind', '').upper()}",
-                f"SURYA : {item.get('surya', '')}",
-                f"VISION: {item.get('vision', '')}",
-                f"VISION CONFIDENCE: {confidence_text}",
-                "",
-            ])
-
-        if not review_items:
-            review_lines.append(
-                "Значимых расхождений Surya / Apple Vision не найдено."
-            )
-
-        review_text_path.write_text(
-            "\n".join(review_lines).rstrip() + "\n",
-            encoding="utf-8",
+        write_review_outputs(
+            review_json_path,
+            review_text_path,
+            qa_pages,
+            review_items,
         )
 
     # Убираем временную рабочую папку.
