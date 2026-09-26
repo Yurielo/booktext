@@ -1,0 +1,98 @@
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import booktext
+
+
+class SuryaTextConversionTests(unittest.TestCase):
+    def test_preserves_letters_and_block_boundaries(self):
+        text = booktext._surya_html_to_text(
+            "<p>The treatment &amp; Stomach.</p><p>Next text.</p>"
+        )
+        self.assertEqual(text, "The treatment & Stomach.\nNext text.")
+
+    def test_separates_table_cells_without_losing_digits(self):
+        text = booktext._surya_html_to_text(
+            "<table><tr><td>352.05</td><td>353.50</td></tr></table>"
+        )
+        self.assertEqual(text, "352.05 353.50")
+
+
+class VisionQATests(unittest.TestCase):
+    def _compare(self, surya, vision):
+        payload = {
+            "words": [
+                {
+                    "text": vision,
+                    "confidence": 0.9,
+                    "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
+                }
+            ]
+        }
+        process = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload).encode(), stderr=b""
+        )
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            booktext, "require_vision"
+        ), patch.object(booktext.subprocess, "run", return_value=process):
+            return booktext.vision_qa_page(
+                Path(temp) / "page.png", 1, surya, Path(temp) / "vision"
+            )
+
+    def test_preserves_numeric_punctuation_and_signs_for_review(self):
+        for surya, vision in (("1.5", "15"), ("-5", "5"), ("352.05", "352.5")):
+            with self.subTest(surya=surya, vision=vision):
+                self.assertTrue(self._compare(surya, vision)["differences"])
+
+    def test_ignores_only_alphabetic_word_segmentation(self):
+        self.assertFalse(self._compare("treatment", "treat ment")["differences"])
+        self.assertTrue(self._compare("1.5", "1 5")["differences"])
+
+
+class ReviewOutputTests(unittest.TestCase):
+    def test_failed_qa_is_reported_as_partial_not_clean(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            json_path = root / "review.json"
+            text_path = root / "review.txt"
+            booktext.write_review_outputs(
+                json_path,
+                text_path,
+                [{"page": 3, "error": "Vision OCR failed"}],
+                [],
+            )
+            report = json.loads(json_path.read_text(encoding="utf-8"))
+            text = text_path.read_text(encoding="utf-8")
+
+        self.assertEqual(report["status"], "partial")
+        self.assertIn("НЕПОЛНАЯ ПРОВЕРКА", text)
+        self.assertNotIn("Значимых расхождений", text)
+
+
+class SuryaOutputSafetyTests(unittest.TestCase):
+    def test_failed_rerun_keeps_previous_raw_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            page = root / "page.png"
+            page.write_bytes(b"page")
+            output = root / "surya"
+            output.mkdir()
+            (output / "previous.txt").write_text("keep", encoding="utf-8")
+
+            with patch.object(booktext, "require_surya"), patch.object(
+                booktext, "run", side_effect=subprocess.CalledProcessError(1, ["surya"])
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    booktext.recognize_pages_surya([(1, page)], output, root / "work")
+
+            self.assertEqual(
+                (output / "previous.txt").read_text(encoding="utf-8"), "keep"
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
