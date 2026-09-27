@@ -121,12 +121,15 @@ python3 booktext.py --region-map reviewed-regions.json source.pdf
 
 ### Извлечение уже существующего текста
 
-Для TXT, Markdown, RTF, DOCX и цифрового PDF сначала используйте native
-extraction. Пустая страница или неподдержанный формат явно получают статус
-`OCR_REQUIRED`, а не создают пустой текст под видом успешного результата:
+Для TXT, Markdown, RTF, DOCX, цифрового PDF и DjVu со скрытым текстовым слоем
+сначала используйте native extraction. Пустая страница или неподдержанный
+формат явно получают статус `OCR_REQUIRED`, а не создают пустой текст под видом
+успешного результата. У PDF и DjVu поддерживается тот же выбор физических
+страниц:
 
 ```bash
 python3 tools/extract_native_text.py source.docx --output native-text.json
+python3 tools/extract_native_text.py source.djvu --pages 5,7,11 --exclude-pages 7 --output native-text.json
 ```
 
 ## Консервативное извлечение таблиц
