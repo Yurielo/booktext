@@ -48,6 +48,24 @@ class DocumentPackageTests(unittest.TestCase):
             self.assertIsNone(fallback["raw_ocr"])
             self.assertIn("block_coordinates_and_raw_ocr_unavailable", fallback["limitations"])
 
+    def test_selected_image_pages_keep_their_original_source_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sources = []
+            for number in range(1, 12):
+                source = root / f"page-{number:04d}.jpg"
+                source.write_bytes(f"source-{number}".encode())
+                sources.append(source)
+            book = {
+                "sources": [str(path) for path in sources],
+                "pages": [{"page": 5, "text": "five"}, {"page": 7, "text": "seven"}, {"page": 11, "text": "eleven"}],
+            }
+            document = MODULE.make_document(
+                book=book, source_paths=sources, book_sha256="c" * 64, surya=None, review=None,
+            )
+            self.assertEqual([page["source_locator"]["source_index"] for page in document["pages"]], [5, 7, 11])
+            self.assertEqual([page["source_locator"]["physical_page_number"] for page in document["pages"]], [5, 7, 11])
+
 
 if __name__ == "__main__":
     unittest.main()
