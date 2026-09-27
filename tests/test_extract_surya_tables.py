@@ -53,6 +53,22 @@ class SuryaTableExtractionTests(unittest.TestCase):
         self.assertEqual(manifest["pages"][1]["status"], "MISSING")
         self.assertEqual(table["grid"], [["Cell"]])
 
+    def test_image_only_and_explicit_figure_are_review_only(self):
+        payload = {"page-0001": [{"blocks": [
+            {"label": "Table", "html": "<img/>", "bbox": [1, 2, 3, 4]},
+            {"label": "Figure", "html": "<img/>", "bbox": [5, 6, 7, 8], "table_context": True},
+        ]}], "page-0002": [{"blocks": [
+            {"label": "Figure", "html": "<img/>", "bbox": [1, 2, 3, 4]},
+        ]}]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); results = root / "results.json"; output = root / "output"
+            results.write_text(json.dumps(payload), encoding="utf-8")
+            with patch.object(sys, "argv", ["x", "--results", str(results), "--output-dir", str(output), "--pages", "1,2"]):
+                main()
+            pages = json.loads((output / "manifest.json").read_text())["pages"]
+        self.assertTrue(all(item["review_required"] for item in pages[0]["tables"]))
+        self.assertEqual(pages[1]["status"], "NO_TABLE_BLOCK")
+
 
 if __name__ == "__main__":
     unittest.main()

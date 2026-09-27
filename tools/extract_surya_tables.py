@@ -169,12 +169,33 @@ def main():
         ]
 
         if not tables:
-            print(f"PAGE {page_number:03d}: NO_TABLE_BLOCK")
-            manifest.append({
-                "page": page_number,
-                "status": "NO_TABLE_BLOCK",
-                "tables": []
-            })
+            review_regions = [
+                block for block in blocks
+                if isinstance(block, dict)
+                and str(block.get("label", "")).lower() == "figure"
+                and block.get("table_context") is True
+            ]
+            if review_regions:
+                print(f"PAGE {page_number:03d}: FALLBACK_REVIEW")
+                manifest.append({
+                    "page": page_number,
+                    "status": "FALLBACK_REVIEW",
+                    "tables": [
+                        {
+                            "index": index,
+                            "status": "fallback_review",
+                            "source": "surya_figure_table_context",
+                            "review_required": True,
+                            "diagnostic": "skipped_figure_explicitly_marked_table_context",
+                            "bbox": block.get("bbox"),
+                            "confidence": block.get("confidence"),
+                        }
+                        for index, block in enumerate(review_regions, start=1)
+                    ],
+                })
+            else:
+                print(f"PAGE {page_number:03d}: NO_TABLE_BLOCK")
+                manifest.append({"page": page_number, "status": "NO_TABLE_BLOCK", "tables": []})
             continue
 
         page_entry = {
@@ -188,9 +209,9 @@ def main():
 
             if "<table" not in raw_html.lower():
                 status = (
-                    "IMAGE_ONLY"
+                    "fallback_review"
                     if "<img" in raw_html.lower()
-                    else "NON_HTML_TABLE"
+                    else "fallback_review"
                 )
 
                 print(
@@ -201,6 +222,9 @@ def main():
                 page_entry["tables"].append({
                     "index": table_index,
                     "status": status,
+                    "source": "surya_table_block",
+                    "review_required": True,
+                    "diagnostic": "image_only_or_non_html_table_block",
                     "bbox": block.get("bbox"),
                     "confidence": block.get("confidence"),
                 })
@@ -278,6 +302,25 @@ def main():
                 "bbox": block.get("bbox"),
                 "confidence": block.get("confidence"),
             })
+
+        # A Figure is never treated as a table based on geometry alone.  A
+        # producer must explicitly flag table_context before it becomes a
+        # review region; no cells are reconstructed here.
+        for block in blocks:
+            if (
+                isinstance(block, dict)
+                and str(block.get("label", "")).lower() == "figure"
+                and block.get("table_context") is True
+            ):
+                page_entry["tables"].append({
+                    "index": len(page_entry["tables"]) + 1,
+                    "status": "fallback_review",
+                    "source": "surya_figure_table_context",
+                    "review_required": True,
+                    "diagnostic": "skipped_figure_explicitly_marked_table_context",
+                    "bbox": block.get("bbox"),
+                    "confidence": block.get("confidence"),
+                })
 
         manifest.append(page_entry)
 

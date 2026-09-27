@@ -1086,6 +1086,22 @@ def create_searchable_pdf(page_records, output_pdf, temp_dir, languages):
         return False
 
 
+def extract_structured_tables(surya_dir, tables_dir, page_numbers):
+    """Emit deterministic Surya HTML table artefacts without OCR correction."""
+    results = surya_dir / "surya-input" / "results.json"
+    if not results.exists():
+        return {}
+    tool = Path(__file__).parent / "tools" / "extract_surya_tables.py"
+    run([
+        sys.executable, tool, "--results", results,
+        "--output-dir", tables_dir,
+        "--pages", ",".join(str(page) for page in page_numbers),
+    ], quiet=True)
+    manifest_path = tables_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return {item["page"]: item for item in manifest["pages"]}
+
+
 def write_review_outputs(review_json_path, review_text_path, qa_pages, review_items):
     """Persist QA evidence without treating failed pages as clean pages."""
     failed_pages = [
@@ -1321,6 +1337,7 @@ def main():
     descriptions_dir = output_dir / "descriptions"
     surya_dir = output_dir / "surya"
     vision_dir = output_dir / "vision"
+    tables_dir = output_dir / "tables"
     work_dir = output_dir / ".work"
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1328,6 +1345,7 @@ def main():
     images_dir.mkdir(exist_ok=True)
     descriptions_dir.mkdir(exist_ok=True)
     work_dir.mkdir(exist_ok=True)
+    tables_dir.mkdir(exist_ok=True)
 
     markdown_path = output_dir / "book.md"
     text_path = output_dir / "book_clean.txt"
@@ -1439,6 +1457,15 @@ def main():
                 )
                 sys.exit(1)
 
+        table_pages = {}
+        if args.ocr == "surya":
+            try:
+                table_pages = extract_structured_tables(
+                    surya_dir, tables_dir, [page_number for page_number, _page in pages]
+                )
+            except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                print(f"Предупреждение: структурированные таблицы не извлечены: {error}")
+
         for sequence, (page_number, page) in enumerate(pages, start=1):
             print(
                 f"===== Страница {page_number} "
@@ -1532,6 +1559,7 @@ def main():
                     region for region in regions
                     if region.get("ocr_action") == "exclude"
                 ],
+                "tables": table_pages.get(page_number, {"status": "NOT_APPLICABLE", "tables": []}),
             })
 
         if not args.no_pdf:
