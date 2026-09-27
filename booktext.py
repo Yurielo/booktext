@@ -10,12 +10,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
 
 from tools.process_lifecycle import LifecycleRegistry
+from tools.review_priority import PRIORITIES, prioritise_review, priority_text
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -1199,7 +1201,119 @@ def write_review_outputs(review_json_path, review_text_path, qa_pages, review_it
     )
 
 
+def write_review_priority_outputs(review_json_path, review_text_path, qa_pages, review_items, records):
+    """Write a separate priority layer without changing raw QA evidence."""
+    artifact = prioritise_review(qa_pages, review_items, records)
+    review_json_path.write_text(
+        json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    review_text_path.write_text(priority_text(artifact), encoding="utf-8")
+    return artifact
+
+
+def build_run_summary(
+    records,
+    total_pages,
+    elapsed_seconds,
+    qa_pages,
+    review_items,
+    priority_artifact,
+    ocr_engine="surya",
+    qa_enabled=True,
+    input_source_count=1,
+):
+    """Build the stable, machine-readable completion result for one run."""
+    qa_failures = [item for item in qa_pages if item.get("error")]
+    table_entries = [
+        table
+        for record in records
+        for table in (record.get("tables") or {}).get("tables", [])
+        if isinstance(table, dict)
+    ]
+    structured_tables = sum(item.get("status") == "HTML_TABLE" for item in table_entries)
+    fallback_tables = sum(item.get("status") == "fallback_review" for item in table_entries)
+    visual_count = sum(len(record.get("visuals") or []) for record in records)
+    excluded_region_count = sum(len(record.get("ocr_exclusions") or []) for record in records)
+    warnings = [
+        {
+            "kind": "vision_qa_failure",
+            "page": item.get("page"),
+            "message": item.get("error"),
+        }
+        for item in qa_failures
+    ]
+    return {
+        "schema_version": "1.0",
+        "artifact_type": "booktext.run_summary",
+        "booktext_version": __version__,
+        "pages": {
+            "source_total": total_pages,
+            "requested": len(records),
+            "processed": len(records),
+            "failed": 0,
+        },
+        "input_source_count": input_source_count,
+        "ocr_engine": ocr_engine,
+        "qa_enabled": qa_enabled,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "qa": {
+            "pages_checked": len(qa_pages),
+            "pages_failed": len(qa_failures),
+            "raw_difference_count": len(review_items),
+        },
+        "review_priority": priority_artifact["counts"],
+        "tables": {
+            "structured": structured_tables,
+            "fallback_review": fallback_tables,
+        },
+        "visuals": {
+            "detected_or_extracted": visual_count,
+            "ocr_exclusion_regions": excluded_region_count,
+        },
+        "outputs": {
+            "primary_text": "book_clean.txt",
+            "markdown": "book.md",
+            "manifest": "book.json",
+            "raw_review": "review.json" if qa_enabled else None,
+            "prioritised_review": "review_priority.json",
+            "prioritised_review_text": "review_priority.txt",
+            "run_summary": "run_summary.json",
+        },
+        "warnings": warnings,
+        "policy": "Surya remains primary OCR; Apple Vision and table fallback are review evidence only.",
+    }
+
+
+def format_completion_summary(summary, priority_path):
+    """Return the compact CLI completion block for a completed run."""
+    counts = summary["review_priority"]
+    lines = [
+        "RUN SUMMARY",
+        (
+            "Pages processed / failed: "
+            f"{summary['pages']['processed']} / {summary['pages']['failed']} "
+            f"(source total: {summary['pages']['source_total']})"
+        ),
+        f"Elapsed: {summary['elapsed_seconds']:.3f}s",
+        f"Raw QA differences: {summary['qa']['raw_difference_count']}",
+        "Review priority: " + ", ".join(
+            f"{priority}={counts.get(priority, 0)}" for priority in PRIORITIES
+        ),
+        (
+            "Tables structured / fallback review: "
+            f"{summary['tables']['structured']} / {summary['tables']['fallback_review']}"
+        ),
+        f"Warnings: {len(summary['warnings'])}",
+        f"Prioritised review: {priority_path}",
+    ]
+    if counts.get("HIGH", 0) == 0:
+        lines.append("HIGH review: none.")
+    return "\n".join(lines)
+
+
 def main():
+    started_at = time.monotonic()
     parser = argparse.ArgumentParser(
         description=(
             "Локальная оцифровка PDF, DjVu и изображений: OCR, "
@@ -1365,6 +1479,9 @@ def main():
     json_path = output_dir / "book.json"
     review_json_path = output_dir / "review.json"
     review_text_path = output_dir / "review.txt"
+    review_priority_json_path = output_dir / "review_priority.json"
+    review_priority_text_path = output_dir / "review_priority.txt"
+    run_summary_path = output_dir / "run_summary.json"
     searchable_pdf = output_dir / "book_ocr.pdf"
 
     print()
@@ -1672,6 +1789,29 @@ def main():
             review_items,
         )
 
+    priority_artifact = write_review_priority_outputs(
+        review_priority_json_path,
+        review_priority_text_path,
+        qa_pages,
+        review_items,
+        records,
+    )
+    run_summary = build_run_summary(
+        records,
+        total_pages,
+        time.monotonic() - started_at,
+        qa_pages,
+        review_items,
+        priority_artifact,
+        ocr_engine=args.ocr,
+        qa_enabled=args.ocr == "surya" and not args.no_qa,
+        input_source_count=len(sources),
+    )
+    run_summary_path.write_text(
+        json.dumps(run_summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
     # Убираем временную рабочую папку.
     shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1685,6 +1825,8 @@ def main():
     print("Страницы:", pages_dir)
     print("Изображения:", images_dir)
     print("Описания:", descriptions_dir)
+    print("Run summary:", run_summary_path)
+    print("Prioritised review:", review_priority_text_path)
 
     if args.ocr == "surya" and surya_dir.exists():
         print("Surya raw output:", surya_dir)
@@ -1701,6 +1843,9 @@ def main():
 
     if searchable_pdf.exists():
         print("Поисковый PDF:", searchable_pdf)
+
+    print()
+    print(format_completion_summary(run_summary, review_priority_text_path))
 
 
 if __name__ == "__main__":

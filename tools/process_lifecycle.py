@@ -30,12 +30,40 @@ class ManagedProcess:
             except ProcessLookupError:
                 return False
         except ProcessLookupError:
-            return False
+            # A short-lived child can leave its newly-created process group
+            # between spawn and cleanup.  Its direct PID is still owned by
+            # this registry, so terminate and reap only that PID rather than
+            # treating the missing group as proof that cleanup is complete.
+            if self.process.poll() is None:
+                try:
+                    os.kill(self.process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    self.process.wait(timeout=graceful_timeout)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.kill(self.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    self.process.wait(timeout=graceful_timeout)
+            return True
         deadline = time.monotonic() + graceful_timeout
         while time.monotonic() < deadline:
             try:
                 os.killpg(self.pgid, 0)
             except (ProcessLookupError, PermissionError):
+                # Reap the owned direct child before reporting success.  A
+                # vanished group alone is not a reliable completion signal.
+                if self.process.poll() is None:
+                    try:
+                        self.process.wait(timeout=graceful_timeout)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.kill(self.process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        self.process.wait(timeout=graceful_timeout)
                 return True
             time.sleep(0.02)
         try:
