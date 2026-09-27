@@ -64,7 +64,13 @@ def build_rtf(book: dict, review: dict) -> tuple[str, dict]:
     for item in review.get("review", []):
         if item.get("kind") in {"replace", "delete"} and item.get("surya"):
             by_page.setdefault(item.get("page"), []).append(item["surya"])
-    body = [r"{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}{\colortbl ;\red255\green255\blue0;}\fs22"]
+    body = [
+        r"{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}{\colortbl ;\red255\green255\blue0;}\fs22",
+        r"\b BOOKTEXT OCR HUMAN REVIEW\b0\par ",
+        "Yellow text is an unresolved difference between OCR engines. "
+        "Check it against the source image; edit only when the image supports the change. "
+        r"The raw TXT remains unchanged.\par\par ",
+    ]
     report = {"artifact_type": "booktext.review_rtf_report", "pages": []}
     for page in book.get("pages", []):
         number, text = page.get("page"), str(page.get("text", ""))
