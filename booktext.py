@@ -22,7 +22,10 @@ DEFAULT_OCR_ENGINE = "surya"
 SURYA_CLI = Path.home() / "AITools/booktext/benchmark/surya-env/bin/surya_ocr"
 VISION_OCR = Path.home() / "AITools/booktext/bin/visionocr"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
-VISUAL_TYPES = {"figure", "photo", "diagram", "chart", "map", "table", "illustration"}
+VISUAL_TYPES = {"figure", "photo", "diagram", "chart", "map", "table", "illustration", "handwriting"}
+EXCLUDED_OCR_REGION_TYPES = {
+    "handwriting", "figure", "photo", "diagram", "chart", "map", "illustration",
+}
 
 
 def run(command, check=True, capture=False, quiet=False):
@@ -316,6 +319,7 @@ def detect_visual_regions(page, model):
 Ты анализируешь страницу отсканированной книги.
 
 Найди только значимые НЕтекстовые или смешанные визуальные области:
+- handwriting (рукописные пометки, подчёркивания, маргиналии)
 - figure
 - illustration
 - photo
@@ -422,7 +426,59 @@ y1 = нижняя.
         if not duplicate:
             unique.append(candidate)
 
+    for region in unique:
+        region["source"] = "automatic_detection"
+        region["ocr_action"] = (
+            "exclude" if region["type"] in EXCLUDED_OCR_REGION_TYPES else "include"
+        )
     return unique
+
+
+def load_region_map(path):
+    """Load deliberately small, reviewable per-page OCR exclusions."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Не удалось прочитать карту областей: {error}") from error
+
+    if payload.get("schema_version") != 1 or not isinstance(payload.get("pages"), list):
+        raise RuntimeError(
+            "Карта областей должна содержать schema_version: 1 и массив pages."
+        )
+
+    by_page = {}
+    for page_item in payload["pages"]:
+        if not isinstance(page_item, dict) or not isinstance(page_item.get("page"), int):
+            raise RuntimeError("У каждой записи карты должен быть целый номер page.")
+        page_number = page_item["page"]
+        if page_number < 1 or page_number in by_page:
+            raise RuntimeError("Номера страниц в карте должны быть уникальными и >= 1.")
+
+        regions = []
+        for item in page_item.get("regions", []):
+            if not isinstance(item, dict) or item.get("action") != "exclude":
+                raise RuntimeError("Каждая область карты должна иметь action: exclude.")
+            region_type = str(item.get("type", "handwriting")).lower().strip()
+            if region_type not in EXCLUDED_OCR_REGION_TYPES:
+                raise RuntimeError(f"Недопустимый тип исключаемой области: {region_type}")
+            bbox = item.get("bbox_percent")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                raise RuntimeError("bbox_percent должен содержать четыре координаты.")
+            try:
+                x0, y0, x1, y1 = [float(value) for value in bbox]
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("Координаты bbox_percent должны быть числами.") from error
+            if not (0 <= x0 < x1 <= 100 and 0 <= y0 < y1 <= 100):
+                raise RuntimeError("bbox_percent должен находиться в диапазоне 0..100.")
+            regions.append({
+                "type": region_type,
+                "bbox": [x0, y0, x1, y1],
+                "confidence": None,
+                "source": "manual_region_map",
+                "ocr_action": "exclude",
+            })
+        by_page[page_number] = regions
+    return by_page
 
 
 def image_dimensions(page):
@@ -478,12 +534,15 @@ def mask_and_extract_visuals(page, page_number, regions, images_dir, work_dir):
             crop_path,
         ], quiet=True)
 
-        draw_parts.append(f"rectangle {left},{top} {right},{bottom}")
+        if region.get("ocr_action") == "exclude":
+            draw_parts.append(f"rectangle {left},{top} {right},{bottom}")
 
         visual_records.append({
             "index": index,
             "type": region["type"],
             "confidence": region["confidence"],
+            "source": region.get("source", "automatic_detection"),
+            "ocr_action": region.get("ocr_action", "include"),
             "bbox_percent": region["bbox"],
             "bbox_pixels": [left, top, right, bottom],
             "image": str(crop_path),
@@ -491,6 +550,8 @@ def mask_and_extract_visuals(page, page_number, regions, images_dir, work_dir):
 
     if not visual_records:
         return page, []
+    if not draw_parts:
+        return page, visual_records
 
     command = [
         "magick",
@@ -973,6 +1034,18 @@ def create_searchable_pdf(page_records, output_pdf, temp_dir, languages):
     if not page_records:
         return False
 
+    if any(
+        visual.get("ocr_action") == "exclude"
+        for record in page_records
+        for visual in record.get("visuals", [])
+    ):
+        print(
+            "Поисковый PDF не создан: есть исключённые области. "
+            "Нельзя безопасно делать независимый OCR-слой, возвращающий "
+            "рукопись или текст внутри иллюстраций."
+        )
+        return False
+
     source_images = [record["page_image_absolute"] for record in page_records]
     intermediate_pdf = temp_dir / "selected_pages.pdf"
 
@@ -1132,6 +1205,15 @@ def main():
     )
 
     parser.add_argument(
+        "--region-map",
+        type=Path,
+        help=(
+            "JSON-карта ручных исключений OCR по областям страницы. "
+            "Для указанной страницы она заменяет автоматическое обнаружение."
+        ),
+    )
+
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help=f"Визуальная модель Ollama (по умолчанию {DEFAULT_MODEL})"
@@ -1186,6 +1268,14 @@ def main():
         sys.exit(1)
 
     source = sources[0]
+
+    manual_regions = {}
+    if args.region_map:
+        try:
+            manual_regions = load_region_map(args.region_map.expanduser().resolve())
+        except RuntimeError as error:
+            print(f"Ошибка: {error}")
+            sys.exit(1)
 
     if args.ocr == "surya":
         try:
@@ -1275,12 +1365,59 @@ def main():
         print(f"Будет обработано страниц: {len(pages)} из {total_pages}")
         print()
 
+        for mapped_page in manual_regions:
+            if mapped_page > total_pages:
+                print(
+                    f"Ошибка: карта областей содержит отсутствующую страницу {mapped_page}."
+                )
+                sys.exit(1)
+
+        page_work = {}
+        for page_number, page in pages:
+            regions = []
+            visual_records = []
+            ocr_page = page
+            try:
+                # A map entry (including an empty one) is a reviewed decision
+                # and therefore takes precedence over heuristic detection.
+                if page_number in manual_regions:
+                    regions = manual_regions[page_number]
+                elif not args.raw_ocr:
+                    regions = detect_visual_regions(page, args.model)
+
+                if regions:
+                    print(
+                        f"Страница {page_number}: областей для обработки/исключения: "
+                        f"{len(regions)}"
+                    )
+                elif not args.raw_ocr:
+                    print(f"Страница {page_number}: значимых областей не найдено.")
+
+                ocr_page, visual_records = mask_and_extract_visuals(
+                    page, page_number, regions, images_dir, work_dir
+                )
+            except RuntimeError as error:
+                print(
+                    "Предупреждение: карта/обнаружение областей не сработала; "
+                    f"выполняю OCR всей страницы. Причина: {error}"
+                )
+                regions = []
+                visual_records = []
+                ocr_page = page
+
+            page_work[page_number] = {
+                "regions": regions,
+                "visuals": visual_records,
+                "ocr_page": ocr_page,
+            }
+
         surya_texts = {}
 
         if args.ocr == "surya":
             try:
                 surya_texts = recognize_pages_surya(
-                    pages,
+                    [(page_number, page_work[page_number]["ocr_page"])
+                     for page_number, _page in pages],
                     surya_dir,
                     temp_dir,
                 )
@@ -1298,40 +1435,9 @@ def main():
                 f"({sequence} из {len(pages)}) ====="
             )
 
-            regions = []
-            visual_records = []
-            ocr_page = page
-
-            if not args.raw_ocr:
-                try:
-                    regions = detect_visual_regions(page, args.model)
-                    if regions:
-                        print(f"Найдено визуальных областей: {len(regions)}")
-                    else:
-                        print("Значимых визуальных областей не найдено.")
-
-                    masked_page, visual_records = mask_and_extract_visuals(
-                        page,
-                        page_number,
-                        regions,
-                        images_dir,
-                        work_dir,
-                    )
-
-                    # Surya OCR has already processed the complete page and
-                    # must retain captions/tables/text around visual regions.
-                    # The old Tesseract path keeps its original masking.
-                    if args.ocr == "tesseract":
-                        ocr_page = masked_page
-
-                except RuntimeError as error:
-                    print(
-                        "Предупреждение: обнаружение изображений не сработало; "
-                        f"выполняю OCR всей страницы. Причина: {error}"
-                    )
-                    regions = []
-                    visual_records = []
-                    ocr_page = page
+            regions = page_work[page_number]["regions"]
+            visual_records = page_work[page_number]["visuals"]
+            ocr_page = page_work[page_number]["ocr_page"]
 
             if args.ocr == "surya":
                 text = surya_texts.get(page_number, "")
@@ -1341,7 +1447,7 @@ def main():
             if args.ocr == "surya" and not args.no_qa:
                 try:
                     qa_result = vision_qa_page(
-                        page,
+                        ocr_page,
                         page_number,
                         text,
                         vision_dir,
@@ -1381,7 +1487,11 @@ def main():
             for visual in visual_records:
                 image_abs = Path(visual["image"])
 
-                if args.no_descriptions:
+                if visual.get("ocr_action") == "exclude":
+                    description = (
+                        "Описание исключено: область не передаётся в OCR или LLM."
+                    )
+                elif args.no_descriptions:
                     description = "Описание отключено параметром --no-descriptions."
                 else:
                     description = describe_visual(
@@ -1408,6 +1518,10 @@ def main():
                 "page_image_absolute": str(page),
                 "text": text,
                 "visuals": visual_records,
+                "ocr_exclusions": [
+                    region for region in regions
+                    if region.get("ocr_action") == "exclude"
+                ],
             })
 
         if not args.no_pdf:
@@ -1489,6 +1603,7 @@ def main():
                 "qa_pages": qa_pages,
                 "pages_filter": args.pages,
                 "excluded_pages": args.exclude_pages,
+                "region_map": str(args.region_map) if args.region_map else None,
                 "pages": json_records,
             },
             ensure_ascii=False,

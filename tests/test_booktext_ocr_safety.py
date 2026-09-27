@@ -37,6 +37,36 @@ class PageSelectionTests(unittest.TestCase):
         self.assertEqual(booktext.choose_pages(20, "5-11", "7,9-10"), [5, 6, 8, 11])
 
 
+class RegionExclusionTests(unittest.TestCase):
+    def test_manual_region_map_is_validated_and_marks_exclusion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "regions.json"
+            path.write_text(json.dumps({
+                "schema_version": 1,
+                "pages": [{
+                    "page": 5,
+                    "regions": [{
+                        "type": "handwriting",
+                        "action": "exclude",
+                        "bbox_percent": [10, 20, 30, 40],
+                    }],
+                }],
+            }), encoding="utf-8")
+            result = booktext.load_region_map(path)
+
+        self.assertEqual(result[5][0]["ocr_action"], "exclude")
+        self.assertEqual(result[5][0]["source"], "manual_region_map")
+
+    def test_searchable_pdf_is_not_created_for_excluded_regions(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(booktext, "run") as run:
+            created = booktext.create_searchable_pdf(
+                [{"visuals": [{"ocr_action": "exclude"}]}],
+                Path(temp) / "result.pdf", Path(temp), "eng",
+            )
+        self.assertFalse(created)
+        run.assert_not_called()
+
+
 class VisionQATests(unittest.TestCase):
     def _compare(self, surya, vision):
         payload = {
