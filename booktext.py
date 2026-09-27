@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,8 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+
+from tools.process_lifecycle import LifecycleRegistry
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -29,17 +32,25 @@ EXCLUDED_OCR_REGION_TYPES = {
 MAX_AUTOMATIC_HANDWRITING_AREA_PERCENT = 20.0
 
 
+OWNED_CHILDREN = LifecycleRegistry()
+
+
 def run(command, check=True, capture=False, quiet=False):
     command = [str(x) for x in command]
     if not quiet:
         print("→", " ".join(command))
-    return subprocess.run(
+    child = OWNED_CHILDREN.spawn(
         command,
-        check=check,
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
     )
+    stdout, stderr = child.process.communicate()
+    child.cleanup()
+    result = subprocess.CompletedProcess(command, child.process.returncode, stdout, stderr)
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, command, stdout, stderr)
+    return result
 
 
 def require(command, optional=False):
@@ -1691,4 +1702,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    def _cleanup_signal(_signum, _frame):
+        OWNED_CHILDREN.handle_signal(_signum, _frame)
+
+    signal.signal(signal.SIGINT, _cleanup_signal)
+    signal.signal(signal.SIGTERM, _cleanup_signal)
+    try:
+        main()
+    finally:
+        OWNED_CHILDREN.cleanup()
