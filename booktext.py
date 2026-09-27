@@ -22,6 +22,7 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 DEFAULT_MODEL = "gemma3:4b"
 DEFAULT_OCR_LANGUAGES = "rus+eng"
 DEFAULT_OCR_ENGINE = "surya"
+__version__ = "0.1.0"
 SURYA_CLI = Path.home() / "AITools/booktext/benchmark/surya-env/bin/surya_ocr"
 VISION_OCR = Path.home() / "AITools/booktext/bin/visionocr"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
@@ -1211,6 +1212,7 @@ def main():
         nargs="+",
         help="Один PDF/DjVu/файл изображения или несколько изображений"
     )
+    parser.add_argument("--version", action="version", version=f"booktext {__version__}")
 
     parser.add_argument(
         "--lang",
@@ -1334,13 +1336,13 @@ def main():
     if not args.no_pdf:
         require("ocrmypdf")
 
-    require("pdftoppm")
-    require("ddjvu")
-    require("djvused")
-
     if source.suffix.lower() == ".pdf":
+        require("pdftoppm")
         require("mutool", optional=True)
         require("qpdf", optional=True)
+    if source.suffix.lower() in {".djvu", ".djv"}:
+        require("ddjvu")
+        require("djvused")
 
     output_dir = source.parent / f"{source.stem}_book"
     pages_dir = output_dir / "pages"

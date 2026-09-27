@@ -27,12 +27,22 @@
 - консервативная реконструкция таблиц частот из уже полученных Surya/Vision
   данных.
 
-## Требования
+## Установка и preflight (macOS)
 
-Проект рассчитан на macOS/Apple Silicon. Основной CLI ожидает внешние утилиты
-`magick`, `pdftoppm`, `ddjvu`, `djvused`, `tesseract`, `ocrmypdf` и локально
-установленный Surya CLI с `llama-server`. Для описания иллюстраций может
-использоваться Ollama.
+Booktext `0.1.0` рассчитан на macOS, особенно Apple Silicon. Версию проверяйте
+командой `python3 booktext.py --version`. Требуется Python 3.11+ и ImageMagick
+(`magick`) для изображений. Для Surya нужны его изолированный CLI и
+`llama-server` из llama.cpp; модели Surya скачиваются локально и занимают
+несколько гигабайт диска. Apple Vision helper нужен только для QA, Tesseract —
+для режима `--ocr tesseract` и searchable PDF, OCRmyPDF — только если не задан
+`--no-pdf`. PDF требует `pdftoppm` (опционально `mutool`/`qpdf` как fallback),
+DjVu — `ddjvu` и `djvused`. Ollama требуется только для автоматического поиска
+визуальных областей и описаний; с `--raw-ocr` он не нужен.
+
+Установите системные утилиты удобным для вашей системы способом, соберите
+Vision helper при необходимости и настройте Surya/llama.cpp по их официальным
+инструкциям. Не копируйте локальные пути другого компьютера: CLI сам сообщит
+недостающую программу и затронутый режим.
 
 Apple Vision helper собирается с обязательным флагом `-parse-as-library`:
 
@@ -43,6 +53,21 @@ swiftc -parse-as-library vision/VisionOCR.swift -o bin/visionocr
 
 Локальные окружения, бинарники, модели, исходные книги и результаты OCR в Git
 не добавляются.
+
+## Production output contract
+
+`book_clean.txt` и `book.md` — выбранный основной OCR-текст и читаемое
+представление. `book.json` — машинный page-level manifest и ссылки на assets.
+`review.json`/`review.txt` при включённом QA содержат только evidence
+разногласий Surya/Vision, не автоматические исправления. `tables/` хранит
+authoritative структурированные артефакты только для native Surya HTML tables;
+`table_review/` и `fallback_review` — evidence для человека, не verified cells.
+`images/` и `descriptions/` содержат выделенные визуальные области; searchable
+PDF создаётся только когда он не нарушит политику исключений.
+
+Ограничения: локальные OCR-ошибки возможны; disagreement двух движков — повод
+для review, а не доказательство ошибки; image-only и ambiguous tables требуют
+human review и никогда не становятся подтверждёнными ячейками автоматически.
 
 ## Основной CLI
 
