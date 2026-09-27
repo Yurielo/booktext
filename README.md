@@ -87,6 +87,16 @@ python3 booktext.py --pages 1-20 --exclude-pages 5,7,11 source.pdf
 python3 booktext.py --help
 ```
 
+### Извлечение уже существующего текста
+
+Для TXT, Markdown, RTF, DOCX и цифрового PDF сначала используйте native
+extraction. Пустая страница или неподдержанный формат явно получают статус
+`OCR_REQUIRED`, а не создают пустой текст под видом успешного результата:
+
+```bash
+python3 tools/extract_native_text.py source.docx --output native-text.json
+```
+
 ## Консервативное извлечение таблиц
 
 Извлечение использует существующий `surya/surya-input/results.json` и не
