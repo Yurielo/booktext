@@ -72,25 +72,70 @@ def _surya_blocks(page_result: dict[str, Any] | None) -> list[dict[str, Any]]:
     return [block for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
 
 
+def _canonical_path(path: Path | str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+def _build_sources(
+    book: dict[str, Any], source_paths: list[Path]
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    declared = [_canonical_path(path) for path in book.get("sources", [])]
+    sources = []
+    source_by_path = {}
+    for input_index, path in enumerate(source_paths, start=1):
+        canonical_path = _canonical_path(path)
+        source_index = (
+            declared.index(canonical_path) + 1
+            if canonical_path in declared
+            else input_index
+        )
+        digest = sha256_file(path)
+        source = {
+            "source_id": stable_id("source", digest),
+            "source_index": source_index,
+            "filename": path.name,
+            "sha256": digest,
+        }
+        sources.append(source)
+        source_by_path[canonical_path] = source
+    return sources, source_by_path
+
+
+def _source_for_page(
+    book: dict[str, Any],
+    source_by_path: dict[str, dict[str, Any]],
+    sources: list[dict[str, Any]],
+    page_number: int,
+    page_index: int,
+) -> tuple[dict[str, Any], int]:
+    declared = [_canonical_path(path) for path in book.get("sources", [])]
+    if len(declared) > 1:
+        if page_number > len(declared):
+            raise ValueError(f"page {page_number} has no declared source image")
+        source = source_by_path.get(declared[page_number - 1])
+        if source is None:
+            raise ValueError(f"source for physical page {page_number} was not supplied")
+        return source, 1
+    if len(sources) == 1:
+        return sources[0], page_number
+    if page_index > len(sources):
+        raise ValueError(f"page {page_number} has no supplied source")
+    return sources[page_index - 1], 1
+
+
 def make_document(
     *, book: dict[str, Any], source_paths: list[Path], book_sha256: str,
     surya: dict[str, Any] | None, review: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    sources = []
-    for index, path in enumerate(source_paths, start=1):
-        digest = sha256_file(path)
-        sources.append({
-            "source_id": stable_id("source", digest),
-            "source_index": index,
-            "filename": path.name,
-            "sha256": digest,
-        })
+    sources, source_by_path = _build_sources(book, source_paths)
     document_id = stable_id("document", ":".join(item["sha256"] for item in sources))
     revision_id = stable_id("revision", f"{document_id}:{book_sha256}")
     pages = []
     for page_index, page in enumerate(book.get("pages", []), start=1):
         page_number = int(page.get("page", page_index))
-        source = sources[min(page_index - 1, len(sources) - 1)]
+        source, source_unit_index = _source_for_page(
+            book, source_by_path, sources, page_number, page_index
+        )
         page_id = stable_id("page", f"{revision_id}:{page_number}")
         surya_page = get_page(surya, page_number) if surya else None
         blocks = []
@@ -142,7 +187,11 @@ def make_document(
             "page_id": page_id,
             "page_number": page_number,
             "source_id": source["source_id"],
-            "source_locator": {"source_index": source["source_index"], "page_number": page_number},
+            "source_locator": {
+                "source_index": source["source_index"],
+                "source_unit_index": source_unit_index,
+                "physical_page_number": page_number,
+            },
             "prepared_page_asset": page.get("page_image"),
             "blocks": blocks,
         })
