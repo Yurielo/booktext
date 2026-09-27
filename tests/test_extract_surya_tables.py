@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.extract_surya_tables import expand_grid, main, parse_table
+import booktext
 
 
 class SuryaTableExtractionTests(unittest.TestCase):
@@ -68,6 +69,19 @@ class SuryaTableExtractionTests(unittest.TestCase):
             pages = json.loads((output / "manifest.json").read_text())["pages"]
         self.assertTrue(all(item["review_required"] for item in pages[0]["tables"]))
         self.assertEqual(pages[1]["status"], "NO_TABLE_BLOCK")
+
+    def test_production_wrapper_returns_page_references_and_artifacts(self):
+        payload = {"page-0313": [{"blocks": [
+            {"label": "Table", "html": "<table><tr><td>A</td></tr></table>"},
+            {"label": "Table", "html": "<table><tr><td>B</td></tr></table>"},
+        ]}], "page-0319": [{"blocks": [{"label": "Table", "html": "<img/>"}]}]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); surya = root / "surya" / "surya-input"; surya.mkdir(parents=True)
+            (surya / "results.json").write_text(json.dumps(payload), encoding="utf-8")
+            references = booktext.extract_structured_tables(root / "surya", root / "tables", [313, 319])
+            self.assertEqual(len(references[313]["tables"]), 2)
+            self.assertEqual(references[319]["tables"][0]["status"], "fallback_review")
+            self.assertTrue((root / "tables" / "page-0313-table-02.tsv").exists())
 
 
 if __name__ == "__main__":
