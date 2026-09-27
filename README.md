@@ -133,6 +133,14 @@ RTF подсвечивает жёлтым фрагменты исходного 
 разногласие с Vision. Он не подменяет их текстом Vision; несовпадения, которые
 невозможно точно связать с фрагментом, остаются в `review-rtf.json`.
 
+После ручного редактирования копии RTF можно получить только предложения
+правок, не меняя OCR автоматически:
+
+```bash
+python3 tools/diff_review_rtf.py --baseline review.rtf --reviewed reviewed.rtf \
+  --output review-edit-candidates.json
+```
+
 Файлы `tools/hybrid_*` и `tools/visual_recheck_v18.py` сохранены как история
 экспериментов. Они не входят в текущую production-архитектуру и не должны
 использоваться для автоматического OCR arbitration.
