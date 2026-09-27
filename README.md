@@ -50,6 +50,36 @@ swiftc -parse-as-library vision/VisionOCR.swift -o bin/visionocr
 python3 booktext.py --ocr surya --pages 1-20 source.pdf
 ```
 
+### Выбор страниц
+
+`--pages` запускает извлечение и OCR только для указанных страниц. Поддерживаются
+одна страница, список через запятую и диапазоны; их можно сочетать:
+
+```bash
+# только страница 5
+python3 booktext.py --pages 5 source.pdf
+
+# только страницы 5, 7 и 11
+python3 booktext.py --pages 5,7,11 source.pdf
+
+# страницы 5–11 и 20
+python3 booktext.py --pages 5-11,20 source.pdf
+```
+
+`--exclude-pages` обрабатывает весь файл, кроме указанных страниц. Синтаксис тот
+же, а флаг можно сочетать с `--pages`:
+
+```bash
+# всё, кроме страниц 5, 7 и 11
+python3 booktext.py --exclude-pages 5,7,11 source.pdf
+
+# всё, кроме диапазона 5–11
+python3 booktext.py --exclude-pages 5-11 source.pdf
+
+# из диапазона 1–20 пропустить 5, 7 и 11
+python3 booktext.py --pages 1-20 --exclude-pages 5,7,11 source.pdf
+```
+
 Отключить независимую проверку Vision можно флагом `--no-qa`. Полный список
 параметров:
 
@@ -139,6 +169,14 @@ RTF подсвечивает жёлтым фрагменты исходного 
 ```bash
 python3 tools/diff_review_rtf.py --baseline review.rtf --reviewed reviewed.rtf \
   --output review-edit-candidates.json
+```
+
+Когда `reviewed.rtf` является завершённой human review, импорт создаёт новую
+версию текста и неизменяемый журнал принятых решений, не затрагивая raw OCR:
+
+```bash
+python3 tools/import_reviewed_rtf.py --baseline review.rtf --reviewed reviewed.rtf \
+  --text-output human-reviewed.txt --log-output human-review-import.json
 ```
 
 Файлы `tools/hybrid_*` и `tools/visual_recheck_v18.py` сохранены как история

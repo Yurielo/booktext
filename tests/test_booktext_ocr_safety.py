@@ -22,6 +22,21 @@ class SuryaTextConversionTests(unittest.TestCase):
         self.assertEqual(text, "352.05 353.50")
 
 
+class PageSelectionTests(unittest.TestCase):
+    def test_accepts_one_page_a_list_and_mixed_ranges(self):
+        self.assertEqual(booktext.choose_pages(20, "5", None), [5])
+        self.assertEqual(booktext.choose_pages(20, "5,7,11", None), [5, 7, 11])
+        self.assertEqual(booktext.choose_pages(20, "5-7,11,15-16", None), [5, 6, 7, 11, 15, 16])
+
+    def test_processes_every_page_except_explicit_list_or_range(self):
+        self.assertEqual(booktext.choose_pages(8, None, "5"), [1, 2, 3, 4, 6, 7, 8])
+        self.assertEqual(booktext.choose_pages(8, None, "2,5,7"), [1, 3, 4, 6, 8])
+        self.assertEqual(booktext.choose_pages(8, None, "2-4,7"), [1, 5, 6, 8])
+
+    def test_can_exclude_from_an_explicit_subset(self):
+        self.assertEqual(booktext.choose_pages(20, "5-11", "7,9-10"), [5, 6, 8, 11])
+
+
 class VisionQATests(unittest.TestCase):
     def _compare(self, surya, vision):
         payload = {
