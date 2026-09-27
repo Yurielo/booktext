@@ -26,6 +26,7 @@ VISUAL_TYPES = {"figure", "photo", "diagram", "chart", "map", "table", "illustra
 EXCLUDED_OCR_REGION_TYPES = {
     "handwriting", "figure", "photo", "diagram", "chart", "map", "illustration",
 }
+MAX_AUTOMATIC_HANDWRITING_AREA_PERCENT = 20.0
 
 
 def run(command, check=True, capture=False, quiet=False):
@@ -399,6 +400,15 @@ y1 = нижняя.
 
         area = (x1 - x0) * (y1 - y0)
         if area < 1.0:
+            continue
+
+        # A handwritten annotation can be substantial, but cannot credibly
+        # occupy most of a page that also contains printed body text.  This is
+        # a fail-safe: a broad false positive would otherwise erase the page.
+        if (
+            region_type == "handwriting"
+            and area > MAX_AUTOMATIC_HANDWRITING_AREA_PERCENT * 100
+        ):
             continue
 
         confidence = item.get("confidence", 0.5)

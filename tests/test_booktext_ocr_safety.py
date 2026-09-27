@@ -38,6 +38,14 @@ class PageSelectionTests(unittest.TestCase):
 
 
 class RegionExclusionTests(unittest.TestCase):
+    def test_rejects_automatic_handwriting_region_that_covers_most_of_page(self):
+        response = json.dumps({"regions": [{
+            "type": "handwriting", "bbox": [5, 5, 95, 95], "confidence": 0.99,
+        }]})
+        with patch.object(booktext, "ollama_request", return_value=response):
+            regions = booktext.detect_visual_regions(Path("page.png"), "model")
+        self.assertEqual(regions, [])
+
     def test_manual_region_map_is_validated_and_marks_exclusion(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "regions.json"
