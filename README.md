@@ -80,6 +80,35 @@ PDF создаётся только когда он не нарушит поли
 Идентификатор привязан к evidence, а не к позиции в файле, поэтому пригоден как
 ключ будущего correction workflow. Версии схем не следует менять задним числом.
 
+### Решения human review и финальная книга
+
+`tools/review_decisions.py` добавляет отдельный, обратимый слой решений. Он
+никогда не меняет `book_clean.txt`, `book.md`, `review.json`, `review.txt` или
+OCR/table evidence. Поддерживаются `keep_surya`, `accept_vision`, `manual`,
+`ignore` и `defer`; для table fallback допустимы только `ignore` и `defer`, без
+создания ячеек. Решение привязано к fingerprint review item и raw-текста
+страницы: при изменившемся источнике оно не применяется.
+
+```bash
+# Найти идентификатор кандидата и записать решение.
+python3 tools/review_decisions.py list --priority output/review_priority.json --page 42
+python3 tools/review_decisions.py record \
+  --priority output/review_priority.json --book output/book.json \
+  --decisions output/review_decisions.json --item qa-p0042-... \
+  --action manual --replacement "Проверенный текст"
+
+# Пересобрать отдельную финальную редакцию исключительно из raw OCR + decisions.
+python3 tools/review_decisions.py build \
+  --priority output/review_priority.json --book output/book.json \
+  --decisions output/review_decisions.json --output-dir output
+```
+
+Build не запускает Surya, Vision, Tesseract, Ollama или другую модель. Он пишет
+`book_final.txt`, `book_final.md` и `final_build.json`; последний содержит
+fingerprints входов, статусы решений, unresolved HIGH/MEDIUM и stale/conflict
+counts. v1 Markdown воспроизводится из authoritative `book.json`, сохраняя
+безопасные ссылки на visuals и tables, а не патчит старый Markdown по позиции.
+
 Ограничения: локальные OCR-ошибки возможны; disagreement двух движков — повод
 для review, а не доказательство ошибки; image-only и ambiguous tables требуют
 human review и никогда не становятся подтверждёнными ячейками автоматически.
