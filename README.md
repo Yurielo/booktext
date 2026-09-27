@@ -183,6 +183,15 @@ python3 tools/import_reviewed_rtf.py --baseline review.rtf --reviewed reviewed.r
   --text-output human-reviewed.txt --log-output human-review-import.json
 ```
 
+Чтобы связать завершённую human review с новой ревизией `document.json`, не
+переписывая raw OCR, используйте:
+
+```bash
+python3 tools/apply_human_review_to_document.py \
+  --document document.json --reviewed-text human-reviewed.txt \
+  --review-import human-review-import.json --output document-reviewed.json
+```
+
 Файлы `tools/hybrid_*` и `tools/visual_recheck_v18.py` сохранены как история
 экспериментов. Они не входят в текущую production-архитектуру и не должны
 использоваться для автоматического OCR arbitration.

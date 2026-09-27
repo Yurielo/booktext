@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import re
 import subprocess
 from pathlib import Path
 
@@ -15,8 +16,9 @@ def rtf_text(path: Path) -> str:
 def pages(text: str) -> dict[int, str]:
     result, current = {}, None
     for line in text.splitlines():
-        if line.startswith("PAGE ") and line[5:].isdigit():
-            current = int(line[5:])
+        match = re.fullmatch(r"(?:===== )?PAGE (\d+)(?: =====)?", line.strip())
+        if match:
+            current = int(match.group(1))
             result[current] = ""
         elif current is not None:
             result[current] += line + "\n"

@@ -15,3 +15,6 @@ class ReviewRtfDiffTests(unittest.TestCase):
         self.assertEqual(report["changes"][0]["status"], "PENDING_HUMAN_CONFIRMATION")
         self.assertEqual(report["changes"][0]["baseline"], "Emporors")
         self.assertEqual(report["changes"][0]["reviewed"], "Emperors")
+
+    def test_parses_exported_human_review_page_markers(self):
+        self.assertEqual(MODULE.pages("===== PAGE 5 =====\n\nReviewed"), {5: "Reviewed"})
