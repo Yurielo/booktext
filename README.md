@@ -58,12 +58,27 @@ swiftc -parse-as-library vision/VisionOCR.swift -o bin/visionocr
 
 `book_clean.txt` и `book.md` — выбранный основной OCR-текст и читаемое
 представление. `book.json` — машинный page-level manifest и ссылки на assets.
-`review.json`/`review.txt` при включённом QA содержат только evidence
-разногласий Surya/Vision, не автоматические исправления. `tables/` хранит
+`review.json`/`review.txt` при включённом QA содержат только raw evidence
+разногласий Surya/Vision, не автоматические исправления. `review_priority.json`
+и `review_priority.txt` — отдельная versioned очередь human review: причины,
+сигналы, стабильные идентификаторы и уровни HIGH/MEDIUM/LOW/INFO. Она не меняет
+raw review или основной OCR. `run_summary.json` — versioned итог конкретного
+запуска: страницы, время, QA, таблицы, предупреждения и counts очереди.
+`tables/` хранит
 authoritative структурированные артефакты только для native Surya HTML tables;
 `table_review/` и `fallback_review` — evidence для человека, не verified cells.
 `images/` и `descriptions/` содержат выделенные визуальные области; searchable
 PDF создаётся только когда он не нарушит политику исключений.
+
+### Схемы итогов запуска
+
+У `run_summary.json` и `review_priority.json` сейчас `schema_version: "1.0"`.
+Первый содержит ключи `pages`, `qa`, `review_priority`, `tables`, `visuals`,
+`outputs` и `warnings`; второй — `counts` и упорядоченные `items`. Каждый item
+имеет стабильный детерминированный `item_id`, `page`, `priority`, `reasons` и
+`signals`; OCR-items также сохраняют отображаемые фрагменты Surya и Vision.
+Идентификатор привязан к evidence, а не к позиции в файле, поэтому пригоден как
+ключ будущего correction workflow. Версии схем не следует менять задним числом.
 
 Ограничения: локальные OCR-ошибки возможны; disagreement двух движков — повод
 для review, а не доказательство ошибки; image-only и ambiguous tables требуют
