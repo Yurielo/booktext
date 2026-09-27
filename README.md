@@ -87,6 +87,38 @@ python3 booktext.py --pages 1-20 --exclude-pages 5,7,11 source.pdf
 python3 booktext.py --help
 ```
 
+### Исключение рукописи и текста внутри иллюстраций
+
+Booktext маскирует рукописные пометки и выбранные иллюстрации **до** Surya,
+Apple Vision QA и Tesseract. Автоматическое обнаружение помогает построить
+карту, но для исправления границ можно передать проверяемый JSON. Наличие
+записи страницы (даже с пустым `regions`) заменяет автоматическое решение для
+этой страницы.
+
+```json
+{
+  "schema_version": 1,
+  "pages": [{
+    "page": 5,
+    "regions": [{
+      "type": "handwriting",
+      "action": "exclude",
+      "bbox_percent": [70, 4, 95, 15]
+    }]
+  }]
+}
+```
+
+```bash
+python3 booktext.py --region-map reviewed-regions.json source.pdf
+```
+
+Допустимы типы `handwriting`, `figure`, `photo`, `diagram`, `chart`, `map` и
+`illustration`. Исключённые фрагменты сохраняются как визуальные вложения, но
+не отправляются в OCR или LLM-описание. Пока поисковый PDF не умеет создавать
+текстовый слой из той же карты, он при таких исключениях не выпускается — это
+предотвращает возвращение исключённого текста независимым OCRmyPDF.
+
 ### Извлечение уже существующего текста
 
 Для TXT, Markdown, RTF, DOCX и цифрового PDF сначала используйте native
