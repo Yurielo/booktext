@@ -122,6 +122,17 @@ python3 tools/inspect_photo_set.py --source IMG_1275.JPG --source IMG_1276.JPG \
 Manifest сохраняет хеши, исходную геометрию, EXIF-ориентацию и результат
 `imagemagick:auto-orient`; повёрнутые снимки получают `review_required: true`.
 
+## RTF для human review
+
+```bash
+python3 tools/build_review_rtf.py --book-json /path/to/book.json \
+  --review-json /path/to/review.json --output review.rtf --report review-rtf.json
+```
+
+RTF подсвечивает жёлтым фрагменты исходного Surya OCR, для которых есть
+разногласие с Vision. Он не подменяет их текстом Vision; несовпадения, которые
+невозможно точно связать с фрагментом, остаются в `review-rtf.json`.
+
 Файлы `tools/hybrid_*` и `tools/visual_recheck_v18.py` сохранены как история
 экспериментов. Они не входят в текущую production-архитектуру и не должны
 использоваться для автоматического OCR arbitration.
