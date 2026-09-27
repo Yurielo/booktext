@@ -15,7 +15,7 @@ class ReviewRtfTests(unittest.TestCase):
             {"pages": [{"page": 1, "text": "The Emporors rule."}]},
             {"review": [{"page": 1, "kind": "replace", "surya": "Emporors", "vision": "Emperors"}]},
         )
-        self.assertIn(r"\highlight1 Emporors\highlight0", rtf)
+        self.assertIn(r"{\highlight1\cb1 Emporors\highlight0\cb0}", rtf)
         self.assertNotIn("Emperors", rtf)
         self.assertEqual(report["pages"][0]["highlighted_spans"], 1)
 

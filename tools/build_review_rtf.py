@@ -50,7 +50,10 @@ def highlighted_rtf(text: str, spans: list[tuple[int, int]]) -> str:
         if start < cursor:
             continue
         output.append(rtf_escape(text[cursor:start]))
-        output.append("\\highlight1 " + rtf_escape(text[start:end]) + "\\highlight0 ")
+        # ``\\highlight`` alone is ignored by some macOS RTF readers.  ``\\cb``
+        # is the broadly supported character-background control; retain both
+        # so Word and TextEdit render the same yellow review marker.
+        output.append("{\\highlight1\\cb1 " + rtf_escape(text[start:end]) + "\\highlight0\\cb0}")
         cursor = end
     output.append(rtf_escape(text[cursor:]))
     return "".join(output)
