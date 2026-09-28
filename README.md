@@ -109,6 +109,24 @@ fingerprints входов, статусы решений, unresolved HIGH/MEDIUM
 counts. v1 Markdown воспроизводится из authoritative `book.json`, сохраняя
 безопасные ссылки на visuals и tables, а не патчит старый Markdown по позиции.
 
+### Локальное review workspace
+
+Для большой очереди не нужно открывать JSON вручную. Запустите только на
+локальном компьютере:
+
+```bash
+python3 booktext.py review /path/to/book_output
+```
+
+Команда требует `book.json` и `review_priority.json`, слушает только
+`127.0.0.1` и печатает URL. Workspace лениво загружает один item и его страницу,
+показывает Surya/Vision evidence, причины, QA-сигналы, current decision и
+progress. Фильтры и навигация по умолчанию ставят unresolved HIGH перед MEDIUM,
+LOW и INFO. Решения autosave в атомарный `review_decisions.json` через тот же
+validated decision layer; browser restart их не теряет. В интерфейсе есть
+безопасная кнопка final build, использующая тот же локальный #33 workflow и не
+запускающая OCR/LLM. Никакие данные не отправляются по сети.
+
 Ограничения: локальные OCR-ошибки возможны; disagreement двух движков — повод
 для review, а не доказательство ошибки; image-only и ambiguous tables требуют
 human review и никогда не становятся подтверждёнными ячейками автоматически.
