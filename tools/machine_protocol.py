@@ -146,7 +146,7 @@ def preflight(operation="status"):
     elif operation == "export":
         required = [] ; optional = [_dependency("pandoc"), _dependency("pdfinfo")]
     elif operation == "native-text":
-        required = [_dependency("pdftotext"), _dependency("pdfinfo")]
+        required = [_dependency("pdftotext"), _dependency("pdfimages"), _dependency("pdfinfo")]
     result = {"protocol_version": PROTOCOL_VERSION, "booktext_version": __version__, "operation": operation,
               "dependencies": {"required": required, "optional": optional},
               "features": {"run": True, "surya": bool(optional and optional[0]["available"] and optional[1]["available"]) if operation in {"run", "status"} else None,
@@ -167,7 +167,7 @@ def processing_preflight(sources, core_args):
         except (ValueError, IndexError): return default
     if "--native-text-only" in options:
         source = Path(sources[0])
-        required = [_dependency("pdftotext"), _dependency("pdfinfo")]
+        required = [_dependency("pdftotext"), _dependency("pdfimages"), _dependency("pdfinfo")]
         if source.suffix.lower() != ".pdf":
             required.append({"name": "PDF input", "available": False, "path": None})
         missing = [item for item in required if not item["available"]]

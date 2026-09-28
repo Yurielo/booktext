@@ -310,21 +310,33 @@ def run_native_text_pdf(source, args, started_at):
     """
     if source.suffix.lower() != ".pdf":
         raise RuntimeError("native-text-only mode supports PDF input only")
-    if shutil.which("pdftotext") is None:
-        raise RuntimeError("native-text-only mode requires pdftotext (Poppler)")
+    if shutil.which("pdftotext") is None or shutil.which("pdfimages") is None:
+        raise RuntimeError("native-text-only mode requires pdftotext and pdfimages (Poppler)")
     total = get_pdf_page_count(source)
     selected = choose_pages(total, args.pages, args.exclude_pages)
     output_dir = source.parent / f"{source.stem}_book"
     output_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = output_dir / "images"
+    images_dir.mkdir(exist_ok=True)
     records = []
     for ordinal, page_number in enumerate(selected, start=1):
         result = run(["pdftotext", "-f", str(page_number), "-l", str(page_number), "-layout", source, "-"], capture=True, quiet=True)
         text = (result.stdout or "").strip()
+        prefix = images_dir / f"page-{page_number:04d}-embedded"
+        run(["pdfimages", "-png", "-f", str(page_number), "-l", str(page_number), source, prefix], quiet=True)
+        visuals = []
+        for index, image in enumerate(sorted(images_dir.glob(f"{prefix.name}-*")), start=1):
+            visuals.append({
+                "index": index, "type": "embedded_pdf_image",
+                "image": str(image.relative_to(output_dir)),
+                "description": "Embedded PDF image preserved without OCR or interpretation.",
+                "source_provenance": {"kind": "pdf_embedded_image", "ocr_performed": False},
+            })
         print(f"Нативный текст PDF: страница {ordinal}/{len(selected)}")
         records.append({
             "page": page_number,
             "text": text,
-            "visuals": [],
+            "visuals": visuals,
             "ocr_exclusions": [],
             "tables": {"status": "NOT_ANALYSED_NATIVE_TEXT_ONLY", "tables": []},
             "source_provenance": {"kind": "pdf_embedded_text", "ocr_performed": False},
@@ -337,7 +349,7 @@ def run_native_text_pdf(source, args, started_at):
     json_path.write_text(json.dumps({
         "sources": [str(source)], "ocr_engine": "native_pdf_text", "ocr_performed": False,
         "native_text_only": True,
-        "limitations": ["Text inside images, scans, and figures was intentionally not extracted."],
+        "limitations": ["Text inside images, scans, and figures was intentionally not extracted; embedded PDF images are preserved without OCR."],
         "qa_enabled": False, "qa_pages": [], "pages_filter": args.pages,
         "excluded_pages": args.exclude_pages, "pages": records,
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -345,7 +357,7 @@ def run_native_text_pdf(source, args, started_at):
     clusters = build_clusters(priority)
     (output_dir / "review_clusters.json").write_text(json.dumps(clusters, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     summary = build_run_summary(records, total, time.monotonic() - started_at, [], [], priority, clusters, ocr_engine="native_pdf_text", qa_enabled=False)
-    summary["native_text_only"] = {"enabled": True, "ocr_processes_started": [], "limitation": "Images and figures were intentionally not OCR-processed."}
+    summary["native_text_only"] = {"enabled": True, "ocr_processes_started": [], "limitation": "Images and figures were not OCR-processed; extractable embedded PDF images were preserved as source assets."}
     (output_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Папка результата: {output_dir}")
     return output_dir
