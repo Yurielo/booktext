@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tools import canonical_document, export_document, review_decisions
+from tools import canonical_document, export_document, review_decisions, review_workspace, review_recovery
 from tools.process_lifecycle import ManagedProcess
 
 
@@ -30,7 +30,7 @@ JOB_FILENAME = ".booktext_job.json"
 PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "export")
 EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled")
 EXIT_CODES = {"success": 0, "invalid_input": 2, "preflight_failure": 3, "processing_failure": 4, "validation_failure": 5, "cancelled": 130, "stale_conflict": 6}
-COMMAND_PHASE = {"run": "ocr", "decision": "review", "review": "review", "final-build": "final_build", "cdm": "cdm", "export": "export", "inspect": None}
+COMMAND_PHASE = {"run": "ocr", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "final-build": "final_build", "cdm": "cdm", "export": "export", "inspect": None}
 
 
 class MachineError(RuntimeError):
@@ -264,6 +264,8 @@ def _handle(args):
         args.output_dir = source.parent / f"{source.stem}_book" if source else None
         return _run_existing(Emitter("pending"), args.sources, args.core_args)
     state = ensure_job(root); emitter = Emitter(state["job_id"])
+    if args.command == "recover":
+        return _invoke(emitter, root, "review", "offline review recovery", lambda: review_recovery.recover(root, surya_results=args.surya_results))
     if args.command == "cdm":
         return _invoke(emitter, root, "cdm", "CDM build", lambda: {"path": str(canonical_document.write_document(canonical_document.build_document(root), root))})
     if args.command == "export":
@@ -281,9 +283,48 @@ def _handle(args):
     if args.command == "decision":
         return _invoke(emitter, root, "review", "review decision", lambda: review_decisions.record_decision(decisions_path=Path(root)/"review_decisions.json", priority_path=Path(root)/"review_priority.json", book_path=Path(root)/"book.json", item_id=args.item, action=args.action, replacement_text=args.replacement, note=args.note, replace=args.replace))
     if args.command == "review":
-        priority = _load(Path(root)/"review_priority.json", {}) or {}; items = priority.get("items", [])
-        if args.page: items = [item for item in items if item.get("page") == args.page]
-        emitter.emit("job_completed", phase="review", message="Review items listed", details={"items": items, "count": len(items)}); return 0
+        workspace = review_workspace.ReviewWorkspace(root)
+        filters = {"priority": args.priority, "status": args.status, "page": args.page}
+        ids = workspace.filtered_ids(filters)
+        emitter.emit("job_completed", phase="review", message="Review queue queried", details={
+            "filters": {key: value for key, value in filters.items() if value is not None},
+            "count": len(ids), "item_ids": ids, "progress": workspace.progress(),
+        }); return 0
+    if args.command == "review-item":
+        workspace = review_workspace.ReviewWorkspace(root)
+        filters = {"priority": args.priority, "status": args.status, "page": args.page}
+        ids = workspace.filtered_ids(filters)
+        if args.item:
+            if args.item not in ids: raise MachineError("invalid_input", "review item is not in the requested queue", details={"item_id": args.item})
+            index = ids.index(args.item)
+        else:
+            index = min(max(args.index, 0), max(0, len(ids) - 1))
+        payload = {"filters": {key: value for key, value in filters.items() if value is not None}, "count": len(ids), "index": index, "progress": workspace.progress()}
+        if ids: payload["item"] = workspace.item_payload(ids[index])
+        emitter.emit("job_completed", phase="review", message="Review item queried", details=payload); return 0
+    if args.command == "review-clusters":
+        workspace = review_workspace.ReviewWorkspace(root)
+        filters = {"priority": args.priority, "status": args.status, "category": args.category}
+        clusters = workspace.filtered_clusters(filters)
+        if args.cluster:
+            if args.cluster not in {value["cluster_id"] for value in clusters}:
+                raise MachineError("invalid_input", "cluster is not in the requested queue", details={"cluster_id": args.cluster})
+            cluster = workspace.cluster_payload(args.cluster)
+            index = [value["cluster_id"] for value in clusters].index(args.cluster)
+        else:
+            index = min(max(args.index, 0), max(0, len(clusters) - 1))
+            cluster = workspace.cluster_payload(clusters[index]["cluster_id"]) if clusters else None
+        emitter.emit("job_completed", phase="review", message="Review clusters queried", details={
+            "filters": {key: value for key, value in filters.items() if value is not None}, "count": len(clusters), "index": index,
+            "clusters": [{key: cluster.get(key) for key in ("cluster_id", "category", "member_count", "batch_eligible", "priority_distribution")} for cluster in clusters],
+            "cluster": cluster, "progress": workspace.progress(),
+        }); return 0
+    if args.command in {"batch-preview", "batch-confirm", "batch-revert"}:
+        workspace = review_workspace.ReviewWorkspace(root)
+        if args.command == "batch-preview": result = workspace.batch_preview(args.cluster, args.action, args.exclude)
+        elif args.command == "batch-confirm": result = workspace.batch_confirm(args.cluster, args.action, args.exclude, args.confirmed)
+        else: result = workspace.batch_revert(args.batch_id)
+        emitter.emit("job_completed", phase="review", message=f"{args.command} completed", details={"result": result, "progress": workspace.progress()}); return 0
     raise MachineError("invalid_input", "unsupported machine operation")
 
 
@@ -295,10 +336,20 @@ def main(argv=None):
     p = sub.add_parser("inspect"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
+    p = sub.add_parser("recover"); p.add_argument("output_dir", type=Path); p.add_argument("--surya-results")
     p = sub.add_parser("export"); p.add_argument("output_dir", type=Path); p.add_argument("--format", action="append", choices=[*export_document.FORMATS, "all"])
     p = sub.add_parser("final-build"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("decision"); p.add_argument("output_dir", type=Path); p.add_argument("--item", required=True); p.add_argument("--action", choices=sorted(review_decisions.TEXT_ACTIONS), required=True); p.add_argument("--replacement"); p.add_argument("--note"); p.add_argument("--replace", action="store_true")
-    p = sub.add_parser("review"); p.add_argument("output_dir", type=Path); p.add_argument("--page", type=int)
+    def review_filters(p, *, page=True):
+        p.add_argument("--priority", choices=("HIGH", "MEDIUM", "LOW", "INFO")); p.add_argument("--status", choices=("unresolved", "resolved_changed", "resolved_no_change", "deferred", "stale", "conflict", "invalid"))
+        if page: p.add_argument("--page", type=int)
+    p = sub.add_parser("review"); p.add_argument("output_dir", type=Path); review_filters(p)
+    p = sub.add_parser("review-item"); p.add_argument("output_dir", type=Path); review_filters(p); p.add_argument("--item"); p.add_argument("--index", type=int, default=0)
+    p = sub.add_parser("review-clusters"); p.add_argument("output_dir", type=Path); review_filters(p, page=False); p.add_argument("--category"); p.add_argument("--cluster"); p.add_argument("--index", type=int, default=0)
+    for command in ("batch-preview", "batch-confirm"):
+        p = sub.add_parser(command); p.add_argument("output_dir", type=Path); p.add_argument("--cluster", required=True); p.add_argument("--action", required=True); p.add_argument("--exclude", action="append", default=[])
+        if command == "batch-confirm": p.add_argument("--confirmed", action="store_true")
+    p = sub.add_parser("batch-revert"); p.add_argument("output_dir", type=Path); p.add_argument("--batch-id", required=True)
     args = parser.parse_args(argv)
     def _cancel_signal(_signum, _frame):
         raise KeyboardInterrupt

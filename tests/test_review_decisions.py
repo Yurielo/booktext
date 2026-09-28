@@ -114,6 +114,15 @@ class ReviewDecisionTests(unittest.TestCase):
         self.assertEqual(report["decisions"][0]["status"], "stale")
         self.assertEqual(report["decisions"][0]["reason"], "source_output_identity_changed")
 
+    def test_optional_location_geometry_does_not_stale_a_decision(self):
+        self.record("numeric", "accept_vision")
+        priority = decisions.load_json(self.priority_path)
+        priority["items"][0].setdefault("signals", {})["vision_bbox"] = [0.1, 0.2, 0.3, 0.4]
+        write_json(self.priority_path, priority)
+        text, _, report = self.build()
+        self.assertIn("1/3", text)
+        self.assertEqual(report["stale_or_conflict_count"], 0)
+
     def test_rebuild_is_idempotent_and_raw_artifacts_unchanged(self):
         self.record("numeric", "accept_vision")
         before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in (self.book_path, self.priority_path, self.decisions_path)}

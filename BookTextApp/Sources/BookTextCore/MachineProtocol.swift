@@ -30,6 +30,7 @@ public enum JSONValue: Codable, Sendable, Equatable {
         switch self { case .string(let x): try box.encode(x); case .number(let x): try box.encode(x); case .bool(let x): try box.encode(x); case .object(let x): try box.encode(x); case .array(let x): try box.encode(x); case .null: try box.encodeNil() }
     }
     public var object: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
+    public var values: [JSONValue]? { if case .array(let value) = self { value } else { nil } }
     public var string: String? { if case .string(let value) = self { value } else { nil } }
     public var integer: Int? { if case .number(let value) = self { Int(value) } else { nil } }
     public var bool: Bool? { if case .bool(let value) = self { value } else { nil } }
@@ -109,12 +110,14 @@ public final class CoreProcessBridge: @unchecked Sendable {
         environment["PATH"] = Array(Set(standardPath + inherited)).sorted().joined(separator: ":")
         process.executableURL = command.0; process.arguments = command.1; process.environment = environment; process.standardOutput = output; process.standardError = errors
         let decoder = JSONDecoder(); let buffer = JSONLBuffer()
-        output.fileHandleForReading.readabilityHandler = { handle in
-            let received = handle.availableData
+        let consumeOutput: @Sendable (Data) -> Void = { received in
             guard !received.isEmpty else { return }
             for line in buffer.append(received) {
                 if let decoded = try? decoder.decode(MachineEvent.self, from: line) { event(decoded) }
             }
+        }
+        output.fileHandleForReading.readabilityHandler = { handle in
+            consumeOutput(handle.availableData)
         }
         errors.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -122,6 +125,13 @@ public final class CoreProcessBridge: @unchecked Sendable {
         }
         process.terminationHandler = { task in
             output.fileHandleForReading.readabilityHandler = nil; errors.fileHandleForReading.readabilityHandler = nil
+            // A fast machine operation can terminate between pipe delivery and
+            // its readability callback. Drain both closed pipes before telling
+            // the UI it is finished, otherwise a final job_completed JSONL
+            // event (notably `inspect`) is intermittently lost.
+            consumeOutput(output.fileHandleForReading.readDataToEndOfFile())
+            let finalErrors = errors.fileHandleForReading.readDataToEndOfFile()
+            if !finalErrors.isEmpty, let text = String(data: finalErrors, encoding: .utf8) { stderr(text) }
             finished(task.terminationStatus)
         }
         self.process = process

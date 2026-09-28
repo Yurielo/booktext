@@ -84,6 +84,14 @@ def prioritise_review(qa_pages, review_items, page_records):
             "qa_kind": raw.get("kind", ""),
             "qa_category": raw.get("category", "text"),
             "vision_confidence": raw.get("vision_confidence"),
+            # Coordinates are evidence only: they identify what was seen by
+            # an engine on the source page, never text to apply automatically.
+            "vision_bbox": raw.get("vision_bbox"),
+            "vision_bbox_coordinate_space": raw.get(
+                "vision_bbox_coordinate_space", "vision_normalized_bottom_left"
+            ),
+            "surya_bbox": raw.get("surya_bbox"),
+            "surya_bbox_provenance": raw.get("surya_bbox_provenance"),
             "page_agreement": page_metric.get("agreement"),
             "page_word_gap": abs(
                 int(page_metric.get("surya_words", 0) or 0)

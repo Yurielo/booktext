@@ -20,6 +20,7 @@ import BookTextCore
     @Published private(set) var diagnostics = ""
     @Published var result: [String: JSONValue] = [:]
     @Published var outputURL: URL?
+    @Published var reviewPresented = false
     @Published var useTesseract = true
     @Published var includePDF = false
     @Published var nativeTextOnly = false
@@ -69,6 +70,7 @@ import BookTextCore
     }
     func cancel() { guard bridge?.isRunning == true else { return }; presentation.state = .cancelling; bridge?.cancel() }
     func inspect(_ url: URL) {
+        outputURL = url; UserDefaults.standard.set(url.path, forKey: "booktext.last.output")
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
         do { try client.start(arguments: ["inspect", url.path], event: { [weak self] event in Task { @MainActor in
             self?.presentation.consume(event); if event.eventType == .jobCompleted { self?.result = event.details.object ?? [:]; self?.presentation.state = .completed }
@@ -92,7 +94,7 @@ import BookTextCore
     }
     func reveal() { if let outputURL { NSWorkspace.shared.activateFileViewerSelecting([outputURL]) } }
     func openPrimary() { guard let outputURL, let artifacts = result["artifacts"]?.object else { return }; let key = artifacts["clean_text"]?.object?["exists"]?.bool == true ? "clean_text" : "markdown"; if let relative = artifacts[key]?.object?["path"]?.string { NSWorkspace.shared.open(outputURL.appendingPathComponent(relative)) } }
-    func openReview() { guard let outputURL else { return }; let config = CoreConfiguration(scriptPath: corePath); let command = config.command(["review", outputURL.path]); let process = Process(); process.executableURL = command.0; process.arguments = ["python3", corePath, "review", outputURL.path]; try? process.run() }
+    func openReview() { guard outputURL != nil else { return }; reviewPresented = true }
 }
 
 struct ContentView: View {
@@ -104,14 +106,14 @@ struct ContentView: View {
         GroupBox("BookText Core") { TextField("Path to booktext.py", text: $model.corePath).textFieldStyle(.roundedBorder); Button("Check Preflight") { model.preflight() }.disabled(model.presentation.state == .running) }
         GroupBox("Source") { VStack(alignment: .leading) {
             Text(model.sourceURLs.isEmpty ? "Drop a PDF, DjVu, or image here, or choose files." : model.sourceURLs.map(\.lastPathComponent).joined(separator: ", "))
-            HStack { Button("Choose File(s)") { chooseFiles() }; Toggle("Use Tesseract (quick local run)", isOn: $model.useTesseract).disabled(model.nativeTextOnly); Toggle("Create searchable PDF", isOn: $model.includePDF).disabled(model.nativeTextOnly) }
+            HStack { Button("Choose File(s)") { chooseFiles() }; Button("Open Existing Output") { chooseOutput() }; Toggle("Use Tesseract (quick local run)", isOn: $model.useTesseract).disabled(model.nativeTextOnly); Toggle("Create searchable PDF", isOn: $model.includePDF).disabled(model.nativeTextOnly) }
             Toggle("Native PDF text only → DOCX (do not OCR images or figures)", isOn: $model.nativeTextOnly).onChange(of: model.nativeTextOnly) { _, _ in model.preflight() }
         }.padding(10).frame(maxWidth: .infinity).background(dragging ? Color.accentColor.opacity(0.15) : .clear).onDrop(of: [.fileURL], isTargeted: $dragging) { providers in
             guard let provider = providers.first else { return false }; provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) { Task { @MainActor in model.addFiles([url]) } } }; return true
         } }
         status
         Spacer()
-    }.padding(24) }
+    }.padding(24).sheet(isPresented: $model.reviewPresented) { if let output = model.outputURL { NativeReviewView(outputURL: output, configuration: CoreConfiguration(scriptPath: model.corePath)) } } }
     @ViewBuilder var status: some View {
         switch model.presentation.state {
         case .idle: Text("Choose an input to begin.")
@@ -133,4 +135,5 @@ struct ContentView: View {
         Text("CDM: \(cdm ? "available" : "not built") · Exports: \(exports ? "available" : "not built")").foregroundStyle(.secondary)
     }
     private func chooseFiles() { let panel = NSOpenPanel(); panel.allowsMultipleSelection = true; panel.canChooseDirectories = false; panel.allowedContentTypes = [.pdf, .image, UTType(filenameExtension: "djvu") ?? .data, UTType(filenameExtension: "djv") ?? .data]; if panel.runModal() == .OK { model.addFiles(panel.urls) } }
+    private func chooseOutput() { let panel = NSOpenPanel(); panel.allowsMultipleSelection = false; panel.canChooseFiles = false; panel.canChooseDirectories = true; if panel.runModal() == .OK, let url = panel.url { model.inspect(url) } }
 }
