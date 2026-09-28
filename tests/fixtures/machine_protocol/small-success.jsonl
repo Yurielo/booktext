@@ -1,0 +1,4 @@
+{"code":"ok","current":null,"details":{},"event_type":"job_started","job_id":"job-example","message":"Processing job started","page":null,"phase":"preflight","protocol_version":"1.0","timestamp":"2026-01-01T00:00:00Z","total":null}
+{"code":"ok","current":1,"details":{},"event_type":"progress","job_id":"job-example","message":"Page preparation progress","page":1,"phase":"prepare","protocol_version":"1.0","timestamp":"2026-01-01T00:00:01Z","total":1}
+{"code":"ok","current":null,"details":{},"event_type":"artifact_created","job_id":"job-example","message":"Artifact available: run_summary","page":null,"phase":"review","protocol_version":"1.0","timestamp":"2026-01-01T00:00:02Z","total":null}
+{"code":"ok","current":null,"details":{},"event_type":"job_completed","job_id":"job-example","message":"Processing completed","page":null,"phase":"review","protocol_version":"1.0","timestamp":"2026-01-01T00:00:03Z","total":null}

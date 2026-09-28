@@ -1860,6 +1860,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "machine":
+        from tools.machine_protocol import main as machine_protocol_main
+        sys.exit(machine_protocol_main(sys.argv[2:]))
+
     if len(sys.argv) > 1 and sys.argv[1] == "review":
         from tools.review_workspace import main as review_workspace_main
         review_workspace_main(sys.argv[2:])

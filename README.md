@@ -180,6 +180,20 @@ python3 booktext.py export /path/to/book_output --format all
 unresolved review и fallback/unknown counts. Подробный contract и локальные
 зависимости: [`docs/architecture/PUBLICATION_EXPORTS.md`](docs/architecture/PUBLICATION_EXPORTS.md).
 
+### Machine protocol for the future native app
+
+The future macOS app uses the versioned JSONL contract, never terminal prose:
+
+```bash
+python3 booktext.py machine preflight --operation export
+python3 booktext.py machine inspect /path/to/book_output
+python3 booktext.py machine export /path/to/book_output --format html
+```
+
+Commands, stable events, exit codes, cancellation, and logical artifact
+discovery are documented in
+[`docs/architecture/MACHINE_PROTOCOL.md`](docs/architecture/MACHINE_PROTOCOL.md).
+
 ```bash
 python3 booktext.py --ocr surya --pages 1-20 source.pdf
 ```
