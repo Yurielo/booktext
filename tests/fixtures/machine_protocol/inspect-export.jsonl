@@ -1,0 +1,1 @@
+{"code":"ok","current":null,"details":{"artifacts":{"cdm":{"exists":true},"exports":{"exists":true}}},"event_type":"job_completed","job_id":"job-existing","message":"Existing job inspected","page":null,"phase":"export","protocol_version":"1.0","timestamp":"2026-01-01T00:00:00Z","total":null}

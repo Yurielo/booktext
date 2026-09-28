@@ -1,0 +1,3 @@
+{"code":"vision_qa_failure","current":null,"details":{},"event_type":"warning","job_id":"job-example","message":"Vision QA failed","page":2,"phase":"qa","protocol_version":"1.0","timestamp":"2026-01-01T00:00:00Z","total":null}
+{"code":"processing_failure","current":null,"details":{},"event_type":"job_failed","job_id":"job-failed","message":"Processing failed","page":null,"phase":"ocr","protocol_version":"1.0","timestamp":"2026-01-01T00:00:01Z","total":null}
+{"code":"cancelled","current":null,"details":{},"event_type":"job_cancelled","job_id":"job-cancelled","message":"Processing cancelled","page":null,"phase":"ocr","protocol_version":"1.0","timestamp":"2026-01-01T00:00:02Z","total":null}
