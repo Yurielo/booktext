@@ -100,7 +100,14 @@ public final class CoreProcessBridge: @unchecked Sendable {
     public func start(arguments: [String], event: @escaping @Sendable (MachineEvent) -> Void, stderr: @escaping @Sendable (String) -> Void, finished: @escaping @Sendable (Int32) -> Void) throws {
         guard FileManager.default.isReadableFile(atPath: configuration.scriptPath) else { throw NSError(domain: "BookText", code: 2, userInfo: [NSLocalizedDescriptionKey: "BookText Core script is unavailable at \(configuration.scriptPath)"]) }
         let process = Process(); let output = Pipe(); let errors = Pipe(); let command = configuration.command(arguments)
-        process.executableURL = command.0; process.arguments = command.1; process.standardOutput = output; process.standardError = errors
+        // LaunchServices does not inherit the interactive shell PATH.  Keep
+        // Homebrew's standard locations available to the local Core without
+        // consulting a shell command or accepting an arbitrary executable.
+        var environment = ProcessInfo.processInfo.environment
+        let standardPath = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        let inherited = (environment["PATH"] ?? "").split(separator: ":").map(String.init)
+        environment["PATH"] = Array(Set(standardPath + inherited)).sorted().joined(separator: ":")
+        process.executableURL = command.0; process.arguments = command.1; process.environment = environment; process.standardOutput = output; process.standardError = errors
         let decoder = JSONDecoder(); let buffer = JSONLBuffer()
         output.fileHandleForReading.readabilityHandler = { handle in
             let received = handle.availableData
