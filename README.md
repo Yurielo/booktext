@@ -134,6 +134,16 @@ validated decision layer; browser restart их не теряет. В интер�
 остаются отдельными. В workspace переключатель Items/Clusters показывает
 members и их независимые decision statuses.
 
+Для очень узкого набора кластеров workspace также показывает batch review. Он
+доступен только для multi-member `repeated_lexical_pair` с точно одинаковой
+Cyrillic Surya→Vision парой, priority и reasons; numeric/Latin, structural,
+table и неоднозначные случаи исключены. Reviewer видит полный список участников,
+может исключить отдельных участников, затем обязан отдельно подтвердить preview.
+Batch создаёт обычное решение для каждого оставшегося item в атомарной записи
+`review_decisions.json` с provenance; это не «apply to all». Допустимы только
+`keep_surya`, `accept_vision` и `ignore`; batch можно безопасно откатить по его
+provenance.
+
 Ограничения: локальные OCR-ошибки возможны; disagreement двух движков — повод
 для review, а не доказательство ошибки; image-only и ambiguous tables требуют
 human review и никогда не становятся подтверждёнными ячейками автоматически.

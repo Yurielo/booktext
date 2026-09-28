@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from tools import review_decisions
 from tools.review_clusters import build_clusters
+from tools import review_batches
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -44,7 +45,10 @@ class ReviewWorkspace:
             self.pages = review_decisions._page_index(self.book)
             self.decisions = review_decisions.load_json(self.decisions_path) if self.decisions_path.exists() else review_decisions.empty_decisions(self.priority_path, self.book_path)
             self.statuses = self._statuses()
-            self.clusters = (review_decisions.load_json(self.clusters_path).get("clusters", []) if self.clusters_path.exists() else build_clusters(self.priority)["clusters"])
+            stored_clusters = review_decisions.load_json(self.clusters_path).get("clusters", []) if self.clusters_path.exists() else []
+            # Older #37 artifacts predate strict batch metadata; rebuild their
+            # deterministic organizational view rather than weakening safety.
+            self.clusters = stored_clusters if stored_clusters and all("batch_eligible" in cluster for cluster in stored_clusters) else build_clusters(self.priority)["clusters"]
 
     def _statuses(self):
         entries = self.decisions.get("decisions", [])
@@ -106,12 +110,20 @@ class ReviewWorkspace:
     def progress(self):
         states = Counter(self.status_for(item_id)["status"] for item_id in self.items)
         unresolved = [item for item in self.items.values() if self.status_for(item["item_id"])["status"] == "unresolved"]
+        eligible_clusters = [cluster for cluster in self.clusters if cluster.get("batch_eligible")]
+        eligible_unresolved = [item_id for cluster in eligible_clusters for item_id in cluster.get("eligible_member_ids", []) if self.status_for(item_id)["status"] == "unresolved"]
+        batch_decisions = [entry for entry in self.decisions.get("decisions", []) if isinstance(entry, dict) and entry.get("batch_provenance")]
         return {
             "total": len(self.items), "unresolved": states["unresolved"],
             "resolved_changed": states["resolved_changed"], "resolved_no_change": states["resolved_no_change"],
             "deferred": states["deferred"], "stale_conflict": states["stale"] + states["conflict"] + states["invalid"],
             "unresolved_high": sum(item["priority"] == "HIGH" for item in unresolved),
             "unresolved_medium": sum(item["priority"] == "MEDIUM" for item in unresolved),
+            "batch_eligible_clusters": len(eligible_clusters),
+            "batch_eligible_unresolved_items": len(eligible_unresolved),
+            "batch_potential_decision_units_saved": sum(max(0, sum(self.status_for(item_id)["status"] == "unresolved" for item_id in cluster["eligible_member_ids"]) - 1) for cluster in eligible_clusters),
+            "confirmed_batch_operations": len({entry["batch_provenance"]["batch_id"] for entry in batch_decisions}),
+            "items_resolved_via_batch": len(batch_decisions),
         }
 
     def filtered_clusters(self, filters):
@@ -178,6 +190,28 @@ class ReviewWorkspace:
         review_decisions.write_final(self.root, final_text, final_markdown, report)
         return report
 
+    def batch_preview(self, cluster_id, action, excluded_ids=()):
+        with self.lock:
+            cluster = next(cluster for cluster in self.clusters if cluster["cluster_id"] == cluster_id)
+            plan = review_batches.preview(cluster, self.items, action, excluded_ids)
+            resolved = [item_id for item_id in plan["member_ids"] if self.status_for(item_id)["status"] != "unresolved"]
+            if resolved:
+                raise ValueError("batch members must all be unresolved")
+            return plan
+
+    def batch_confirm(self, cluster_id, action, excluded_ids=(), confirmed=False):
+        with self.lock:
+            # Re-run the preview in the same lock: no workspace request can
+            # interleave an individual decision between confirmation and write.
+            self.batch_preview(cluster_id, action, excluded_ids)
+            cluster = next(cluster for cluster in self.clusters if cluster["cluster_id"] == cluster_id)
+            result = review_batches.apply_batch(cluster=cluster, priority_path=self.priority_path, book_path=self.book_path, decisions_path=self.decisions_path, action=action, excluded_ids=excluded_ids, confirmed=confirmed)
+            if result["applied"]: self.refresh()
+            return result
+
+    def batch_revert(self, batch_id):
+        result = review_batches.revert_batch(decisions_path=self.decisions_path, batch_id=batch_id); self.refresh(); return result
+
 
 class WorkspaceHandler(BaseHTTPRequestHandler):
     workspace = None
@@ -240,17 +274,30 @@ class WorkspaceHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(size).decode("utf-8"))
             if parsed.path == "/api/decision": return self._json({"status": self.workspace.record(payload), "progress": self.workspace.progress()})
             if parsed.path == "/api/build": return self._json(self.workspace.build_final())
+            if parsed.path == "/api/batch/preview": return self._json(self.workspace.batch_preview(payload["cluster_id"], payload["action"], payload.get("excluded_member_ids", [])))
+            if parsed.path == "/api/batch/confirm": return self._json(self.workspace.batch_confirm(payload["cluster_id"], payload["action"], payload.get("excluded_member_ids", []), payload.get("confirmed") is True))
+            if parsed.path == "/api/batch/revert": return self._json(self.workspace.batch_revert(payload["batch_id"]))
             return self._error("not found", HTTPStatus.NOT_FOUND)
         except (ValueError, json.JSONDecodeError) as error:
             return self._error(str(error))
 
 
 PAGE = """<!doctype html><meta charset=utf-8><title>BookText review</title>
-<style>body{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem}button,select,input,textarea{font:inherit;margin:.2rem}pre{white-space:pre-wrap;background:#f5f5f5;padding:.8rem}img{max-width:100%;max-height:600px}#priority{font-weight:bold}</style>
+<style>body{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem}button,select,input,textarea{font:inherit;margin:.2rem}pre{white-space:pre-wrap;background:#f5f5f5;padding:.8rem}img{max-width:100%;max-height:600px}.members label{display:block}</style>
 <h1>BookText local review</h1><p>Surya is primary OCR; Vision is evidence, never automatic replacement.</p>
 <div><select id=mode><option value=item>Items</option><option value=cluster>Clusters</option></select><select id=pfilter><option value=''>All priorities</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option><option>INFO</option></select><select id=sfilter><option value=''>All statuses</option><option value=unresolved>Unresolved</option><option value=resolved_changed>Resolved changed</option><option value=resolved_no_change>Resolved no-change</option><option value=deferred>Deferred</option><option value=stale>Stale</option><option value=conflict>Conflict</option></select><input id=page placeholder=Page><button onclick='go(0)'>Filter</button></div>
 <p id=progress></p><button onclick='go(-1)'>Previous</button><button onclick='go(1)'>Next</button><button onclick='nextUnresolved()'>Next unresolved</button><button onclick='build()'>Build final book</button><p id=message></p><section id=item></section>
-<script>let n=0,total=0,current='';const q=()=>new URLSearchParams({index:n,priority:pfilter.value,status:sfilter.value,page:page.value});function show(x){progress.textContent=Object.entries(x.progress).map(([k,v])=>k+': '+v).join(' | ');total=x.total||0;n=x.index||0;item.replaceChildren();if(x.cluster){let c=x.cluster,h=document.createElement('h2'),p=document.createElement('pre');h.textContent=`Cluster ${c.category} · ${c.member_count} members`;p.textContent=JSON.stringify({pages:c.pages,members:c.members,decisions:c.decision_statistics},null,2);item.append(h,p);return}if(!x.item){item.textContent='No matching review items.';return}let i=x.item;current=i.item_id;let h=document.createElement('h2');h.textContent=`${i.priority} · page ${i.page} · ${i.status.status}`;item.append(h);for(let [k,v] of [['Item ID',i.item_id],['Reasons',i.reasons.join(', ')],['Signals',JSON.stringify(i.signals)],['Surya',i.surya],['Vision alternative',i.vision||'—']]){let e=document.createElement('pre');e.textContent=k+'\n'+v;item.append(e)}if(i.page_image_url){let im=document.createElement('img');im.src=i.page_image_url;im.alt='Source page '+i.page;item.append(im)}for(let a of ['keep_surya','accept_vision','ignore','defer']){let b=document.createElement('button');b.textContent=a;b.disabled=a==='accept_vision'&&!i.vision;b.onclick=()=>decide(a);item.append(b)}let ta=document.createElement('textarea');ta.id='manual';ta.placeholder='Manual replacement';item.append(ta);let mb=document.createElement('button');mb.textContent='manual';mb.onclick=()=>decide('manual');item.append(mb)}async function go(d){n=Math.max(0,n+d);let path=mode.value==='cluster'?'/api/cluster?':'/api/item?';let r=await fetch(path+q());show(await r.json())}async function nextUnresolved(){mode.value='item';sfilter.value='unresolved';go(0)}async function decide(action){let body={item_id:current,action,replacement_text:manual.value};let r=await fetch('/api/decision',{method:'POST',body:JSON.stringify(body)});let x=await r.json();message.textContent=x.error||'Saved immediately.';go(0)}async function build(){let r=await fetch('/api/build',{method:'POST',body:'{}'});message.textContent=JSON.stringify(await r.json())}go(0)</script>"""
+<script>
+let n=0,current='',batch=null;const q=()=>new URLSearchParams({index:n,priority:pfilter.value,status:sfilter.value,page:page.value});
+async function post(path,body){return await (await fetch(path,{method:'POST',body:JSON.stringify(body)})).json()}
+function append(tag,text){let e=document.createElement(tag);e.textContent=text;item.append(e);return e}
+function exclusions(){return [...document.querySelectorAll('.member-exclude:checked')].map(x=>x.value)}
+function show(x){progress.textContent=Object.entries(x.progress).map(([k,v])=>k+': '+v).join(' | ');n=x.index||0;item.replaceChildren();
+ if(x.cluster){let c=x.cluster;append('h2',`Cluster ${c.category} · ${c.member_count} members`);append('pre',JSON.stringify({pages:c.pages,decisions:c.decision_statistics,eligibility:c.eligibility_reasons,rejected:c.rejection_reasons},null,2));let members=document.createElement('div');members.className='members';for(let m of c.members){let l=document.createElement('label'),box=document.createElement('input');box.type='checkbox';box.className='member-exclude';box.value=m.item_id;box.disabled=!c.eligible_member_ids.includes(m.item_id);l.append(box,document.createTextNode(` Exclude ${m.item_id} · page ${m.page} · ${m.priority} · ${m.status}`));members.append(l)}item.append(members);
+ if(c.batch_eligible){let s=document.createElement('select');for(let a of c.allowed_batch_actions){let o=document.createElement('option');o.value=a;o.textContent=a;s.append(o)}let b=document.createElement('button');b.textContent='Preview exact batch';b.onclick=async()=>{batch=await post('/api/batch/preview',{cluster_id:c.cluster_id,action:s.value,excluded_member_ids:exclusions()});message.textContent='Preview: '+JSON.stringify(batch)+' — inspect every listed member, then confirm.';let ok=document.createElement('button');ok.textContent='Confirm batch';ok.onclick=async()=>{message.textContent=JSON.stringify(await post('/api/batch/confirm',{cluster_id:c.cluster_id,action:s.value,excluded_member_ids:batch.excluded_member_ids,confirmed:true}));go(0)};item.append(ok)};item.append(s,b)}return}
+ if(!x.item){append('p','No matching review items.');return}let i=x.item;current=i.item_id;append('h2',`${i.priority} · page ${i.page} · ${i.status.status}`);for(let [k,v] of [['Item ID',i.item_id],['Reasons',i.reasons.join(', ')],['Signals',JSON.stringify(i.signals)],['Surya',i.surya],['Vision alternative',i.vision||'—']])append('pre',k+'\\n'+v);if(i.page_image_url){let im=document.createElement('img');im.src=i.page_image_url;im.alt='Source page '+i.page;item.append(im)}for(let a of ['keep_surya','accept_vision','ignore','defer']){let b=document.createElement('button');b.textContent=a;b.disabled=a==='accept_vision'&&!i.vision;b.onclick=()=>decide(a);item.append(b)}let ta=document.createElement('textarea');ta.id='manual';ta.placeholder='Manual replacement';item.append(ta);let mb=document.createElement('button');mb.textContent='manual';mb.onclick=()=>decide('manual');item.append(mb)}
+async function go(d){n=Math.max(0,n+d);let path=mode.value==='cluster'?'/api/cluster?':'/api/item?';show(await (await fetch(path+q())).json())}async function nextUnresolved(){mode.value='item';sfilter.value='unresolved';go(0)}async function decide(action){let x=await post('/api/decision',{item_id:current,action,replacement_text:manual.value});message.textContent=x.error||'Saved immediately.';go(0)}async function build(){message.textContent=JSON.stringify(await post('/api/build',{}))}go(0)
+</script>"""
 
 
 def create_server(output_dir, host=LOOPBACK_HOST, port=0):
