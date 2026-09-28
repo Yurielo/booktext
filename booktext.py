@@ -1870,6 +1870,11 @@ if __name__ == "__main__":
         canonical_document_main(sys.argv[2:])
         sys.exit(0)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "export":
+        from tools.export_document import main as export_document_main
+        export_document_main(sys.argv[2:])
+        sys.exit(0)
+
     def _cleanup_signal(_signum, _frame):
         OWNED_CHILDREN.handle_signal(_signum, _frame)
 

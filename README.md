@@ -166,6 +166,20 @@ python3 booktext.py document validate /path/to/book_output/book_document.json \
 Неуверенная структура сохраняется как `unknown`, а fallback tables не содержат
 придуманных ячеек.
 
+### Publication exports from CDM
+
+Экспорт создаёт human-facing formats только из `book_document.json`; CDM
+остаётся machine source для будущей Integra Evidence/Knowledge цепочки:
+
+```bash
+python3 booktext.py export /path/to/book_output --format all
+```
+
+Он создаёт Markdown, local HTML, DOCX, EPUB, publication PDF и
+`exports/export_manifest.json`. В manifest записаны hash/size/validation,
+unresolved review и fallback/unknown counts. Подробный contract и локальные
+зависимости: [`docs/architecture/PUBLICATION_EXPORTS.md`](docs/architecture/PUBLICATION_EXPORTS.md).
+
 ```bash
 python3 booktext.py --ocr surya --pages 1-20 source.pdf
 ```
