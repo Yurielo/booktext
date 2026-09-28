@@ -18,6 +18,7 @@ from pathlib import Path
 
 from tools.process_lifecycle import LifecycleRegistry
 from tools.review_priority import PRIORITIES, prioritise_review, priority_text
+from tools.review_clusters import build_clusters
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -1219,6 +1220,7 @@ def build_run_summary(
     qa_pages,
     review_items,
     priority_artifact,
+    cluster_artifact=None,
     ocr_engine="surya",
     qa_enabled=True,
     input_source_count=1,
@@ -1263,6 +1265,7 @@ def build_run_summary(
             "raw_difference_count": len(review_items),
         },
         "review_priority": priority_artifact["counts"],
+        "review_clusters": (cluster_artifact.get("metrics") if cluster_artifact else None),
         "tables": {
             "structured": structured_tables,
             "fallback_review": fallback_tables,
@@ -1278,6 +1281,7 @@ def build_run_summary(
             "raw_review": "review.json" if qa_enabled else None,
             "prioritised_review": "review_priority.json",
             "prioritised_review_text": "review_priority.txt",
+            "review_clusters": "review_clusters.json",
             "run_summary": "run_summary.json",
         },
         "warnings": warnings,
@@ -1481,6 +1485,7 @@ def main():
     review_text_path = output_dir / "review.txt"
     review_priority_json_path = output_dir / "review_priority.json"
     review_priority_text_path = output_dir / "review_priority.txt"
+    review_clusters_path = output_dir / "review_clusters.json"
     run_summary_path = output_dir / "run_summary.json"
     searchable_pdf = output_dir / "book_ocr.pdf"
 
@@ -1796,6 +1801,10 @@ def main():
         review_items,
         records,
     )
+    cluster_artifact = build_clusters(priority_artifact)
+    review_clusters_path.write_text(
+        json.dumps(cluster_artifact, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     run_summary = build_run_summary(
         records,
         total_pages,
@@ -1803,6 +1812,7 @@ def main():
         qa_pages,
         review_items,
         priority_artifact,
+        cluster_artifact,
         ocr_engine=args.ocr,
         qa_enabled=args.ocr == "surya" and not args.no_qa,
         input_source_count=len(sources),
@@ -1827,6 +1837,7 @@ def main():
     print("Описания:", descriptions_dir)
     print("Run summary:", run_summary_path)
     print("Prioritised review:", review_priority_text_path)
+    print("Review clusters:", review_clusters_path)
 
     if args.ocr == "surya" and surya_dir.exists():
         print("Surya raw output:", surya_dir)

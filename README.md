@@ -127,6 +127,13 @@ validated decision layer; browser restart их не теряет. В интер�
 безопасная кнопка final build, использующая тот же локальный #33 workflow и не
 запускающая OCR/LLM. Никакие данные не отправляются по сети.
 
+`review_clusters.json` — отдельный versioned organizational view очереди. Он
+сохраняет каждый item ровно один раз и помогает раскрывать повторяющиеся
+безопасные patterns, но не создаёт решений и не имеет «apply to all». Числа,
+дроби, единицы, Latin/scientific terms, completeness и table fallback намеренно
+остаются отдельными. В workspace переключатель Items/Clusters показывает
+members и их независимые decision statuses.
+
 Ограничения: локальные OCR-ошибки возможны; disagreement двух движков — повод
 для review, а не доказательство ошибки; image-only и ambiguous tables требуют
 human review и никогда не становятся подтверждёнными ячейками автоматически.
