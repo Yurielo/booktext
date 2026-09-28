@@ -1,6 +1,13 @@
 import Foundation
 import BookTextCore
 
+private final class EventCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [MachineEvent] = []
+    func append(_ value: MachineEvent) { lock.lock(); values.append(value); lock.unlock() }
+    func snapshot() -> [MachineEvent] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
 private func event(_ type: String, code: String = "ok", phase: String? = "ocr") throws -> MachineEvent {
         try JSONDecoder().decode(MachineEvent.self, from: Data("{\"protocol_version\":\"1.0\",\"job_id\":\"job-1\",\"event_type\":\"\(type)\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"phase\":\"\(phase ?? "")\",\"current\":1,\"total\":2,\"page\":1,\"code\":\"\(code)\",\"message\":\"message\",\"details\":{}}".utf8))
 }
@@ -41,12 +48,27 @@ func reviewPayloadFixtureDecodesWithoutTerminalParsing() throws {
     try check(object["reasons"]?.values?.first?.string == "not_verified_structured_data", "review reasons are structured")
 }
 
+func shortLivedCoreDeliversItsFinalJSONLEvent() throws {
+    let folder = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("booktext-bridge-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let script = folder.appendingPathComponent("core.py")
+    let line = "{\\\"protocol_version\\\":\\\"1.0\\\",\\\"job_id\\\":\\\"fast-job\\\",\\\"event_type\\\":\\\"job_completed\\\",\\\"timestamp\\\":\\\"2026-01-01T00:00:00Z\\\",\\\"phase\\\":\\\"review\\\",\\\"current\\\":null,\\\"total\\\":null,\\\"page\\\":null,\\\"code\\\":\\\"ok\\\",\\\"message\\\":\\\"done\\\",\\\"details\\\":{}}"
+    try "import os\nos.write(1, b'\(line)\\n')\n".write(to: script, atomically: true, encoding: .utf8)
+    let finished = DispatchSemaphore(value: 0)
+    let events = EventCollector()
+    let bridge = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: script.path))
+    try bridge.start(arguments: ["inspect", folder.path], event: { value in events.append(value) }, stderr: { _ in }, finished: { _ in finished.signal() })
+    try check(finished.wait(timeout: .now() + 5) == .success, "short-lived Core must finish")
+    try check(events.snapshot().contains(where: { $0.eventType == .jobCompleted && $0.jobID == "fast-job" }), "final JSONL event must reach the UI")
+}
+
 func unwrap<T>(_ value: T?, _ message: String) throws -> T {
     guard let value else { throw NSError(domain: "BookTextProtocolTests", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
     return value
 }
 
 do {
-    try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping(); try reviewPayloadFixtureDecodesWithoutTerminalParsing()
+    try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping(); try reviewPayloadFixtureDecodesWithoutTerminalParsing(); try shortLivedCoreDeliversItsFinalJSONLEvent()
     print("BookTextProtocolTests: PASS")
 } catch { fputs("BookTextProtocolTests: FAIL \(error.localizedDescription)\n", stderr); exit(1) }
