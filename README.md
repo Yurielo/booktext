@@ -150,6 +150,22 @@ human review и никогда не становятся подтверждён�
 
 ## Основной CLI
 
+### Canonical Document Model
+
+После OCR и human decisions можно детерминированно собрать каноническую
+структуру для будущих exporters и BookText.app, не запуская OCR или LLM:
+
+```bash
+python3 booktext.py document build /path/to/book_output
+python3 booktext.py document validate /path/to/book_output/book_document.json \
+  --output-dir /path/to/book_output
+```
+
+Результат — versioned `book_document.json`; правила и поля описаны в
+[`docs/architecture/CANONICAL_DOCUMENT_MODEL.md`](docs/architecture/CANONICAL_DOCUMENT_MODEL.md).
+Неуверенная структура сохраняется как `unknown`, а fallback tables не содержат
+придуманных ячеек.
+
 ```bash
 python3 booktext.py --ocr surya --pages 1-20 source.pdf
 ```
