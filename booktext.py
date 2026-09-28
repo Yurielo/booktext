@@ -301,6 +301,56 @@ def prepare_pages(sources, pages_dir, temp_dir, include_spec, exclude_spec):
     raise RuntimeError(f"Формат {extension} пока не поддерживается.")
 
 
+def run_native_text_pdf(source, args, started_at):
+    """Create a BookText output from an embedded PDF text layer only.
+
+    This is intentionally not an OCR fallback: no page image is rendered and
+    no text inside figures or scans is inferred.  The resulting manifest keeps
+    per-page source provenance so CDM/export remain the normal production path.
+    """
+    if source.suffix.lower() != ".pdf":
+        raise RuntimeError("native-text-only mode supports PDF input only")
+    if shutil.which("pdftotext") is None:
+        raise RuntimeError("native-text-only mode requires pdftotext (Poppler)")
+    total = get_pdf_page_count(source)
+    selected = choose_pages(total, args.pages, args.exclude_pages)
+    output_dir = source.parent / f"{source.stem}_book"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    for ordinal, page_number in enumerate(selected, start=1):
+        result = run(["pdftotext", "-f", str(page_number), "-l", str(page_number), "-layout", source, "-"], capture=True, quiet=True)
+        text = (result.stdout or "").strip()
+        print(f"Нативный текст PDF: страница {ordinal}/{len(selected)}")
+        records.append({
+            "page": page_number,
+            "text": text,
+            "visuals": [],
+            "ocr_exclusions": [],
+            "tables": {"status": "NOT_ANALYSED_NATIVE_TEXT_ONLY", "tables": []},
+            "source_provenance": {"kind": "pdf_embedded_text", "ocr_performed": False},
+        })
+    if not any(record["text"] for record in records):
+        raise RuntimeError("PDF has no usable embedded text; native-text-only mode refuses to silently fall back to OCR")
+    text_path, markdown_path, json_path = output_dir / "book_clean.txt", output_dir / "book.md", output_dir / "book.json"
+    text_path.write_text("".join(f"\n\n===== СТРАНИЦА {record['page']} =====\n\n{record['text']}" for record in records).strip() + "\n", encoding="utf-8")
+    markdown_path.write_text("# " + source.stem + "\n\nNative PDF text only. Images and figures were not OCR-processed.\n" + "".join(f"\n## Страница {record['page']}\n\n{record['text'] or '_Embedded text not found on this page._'}\n" for record in records), encoding="utf-8")
+    json_path.write_text(json.dumps({
+        "sources": [str(source)], "ocr_engine": "native_pdf_text", "ocr_performed": False,
+        "native_text_only": True,
+        "limitations": ["Text inside images, scans, and figures was intentionally not extracted."],
+        "qa_enabled": False, "qa_pages": [], "pages_filter": args.pages,
+        "excluded_pages": args.exclude_pages, "pages": records,
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    priority = write_review_priority_outputs(output_dir / "review_priority.json", output_dir / "review_priority.txt", [], [], records)
+    clusters = build_clusters(priority)
+    (output_dir / "review_clusters.json").write_text(json.dumps(clusters, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    summary = build_run_summary(records, total, time.monotonic() - started_at, [], [], priority, clusters, ocr_engine="native_pdf_text", qa_enabled=False)
+    summary["native_text_only"] = {"enabled": True, "ocr_processes_started": [], "limitation": "Images and figures were intentionally not OCR-processed."}
+    (output_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Папка результата: {output_dir}")
+    return output_dir
+
+
 def ollama_request(model, prompt, image_path, json_mode=False, timeout=600):
     image_base64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
 
@@ -1507,6 +1557,12 @@ def main():
     )
 
     parser.add_argument(
+        "--native-text-only",
+        action="store_true",
+        help="Извлечь только встроенный текст PDF; не рендерить и не OCR-ить изображения или рисунки",
+    )
+
+    parser.add_argument(
         "--no-descriptions",
         action="store_true",
         help="Не создавать подробные описания найденных изображений"
@@ -1546,6 +1602,14 @@ def main():
         sys.exit(1)
 
     source = sources[0]
+
+    if args.native_text_only:
+        try:
+            run_native_text_pdf(source, args, started_at)
+        except RuntimeError as error:
+            print(f"Ошибка native-text-only: {error}")
+            sys.exit(1)
+        return
 
     manual_regions = {}
     if args.region_map:

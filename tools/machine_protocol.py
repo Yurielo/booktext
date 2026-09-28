@@ -145,10 +145,13 @@ def preflight(operation="status"):
         optional = [_dependency("surya_ocr", path=SURYA_CLI), _dependency("llama-server"), _dependency("visionocr", path=VISION_OCR), _dependency("tesseract"), _dependency("ocrmypdf")]
     elif operation == "export":
         required = [] ; optional = [_dependency("pandoc"), _dependency("pdfinfo")]
+    elif operation == "native-text":
+        required = [_dependency("pdftotext"), _dependency("pdfinfo")]
     result = {"protocol_version": PROTOCOL_VERSION, "booktext_version": __version__, "operation": operation,
               "dependencies": {"required": required, "optional": optional},
               "features": {"run": True, "surya": bool(optional and optional[0]["available"] and optional[1]["available"]) if operation in {"run", "status"} else None,
                            "vision_qa": bool(len(optional) > 2 and optional[2]["available"]) if operation in {"run", "status"} else None,
+                           "native_pdf_text": operation == "native-text" and all(item["available"] for item in required),
                            "review": True, "final_build": True, "cdm": True, "export": True},
               "errors": [{"code": "missing_required_dependency", "dependency": item["name"], "message": f"Missing required dependency: {item['name']}"} for item in required if not item["available"]]}
     result["ok"] = not result["errors"]
@@ -162,6 +165,13 @@ def processing_preflight(sources, core_args):
     def selected(name, default=None):
         try: return options[options.index(name) + 1]
         except (ValueError, IndexError): return default
+    if "--native-text-only" in options:
+        source = Path(sources[0])
+        required = [_dependency("pdftotext"), _dependency("pdfinfo")]
+        if source.suffix.lower() != ".pdf":
+            required.append({"name": "PDF input", "available": False, "path": None})
+        missing = [item for item in required if not item["available"]]
+        return {"required": required, "missing": missing, "ocr": "native_pdf_text", "qa_enabled": False, "pdf_enabled": False}
     ocr, no_qa, no_pdf = selected("--ocr", "surya"), "--no-qa" in options, "--no-pdf" in options
     required = [_dependency("magick")]
     if ocr == "surya": required.extend([_dependency("surya_ocr", path=SURYA_CLI), _dependency("llama-server")])
@@ -281,7 +291,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol-version", action="version", version=PROTOCOL_VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("preflight"); p.add_argument("--operation", choices=("status", "run", "export", "cdm", "final-build", "review"), default="status")
+    p = sub.add_parser("preflight"); p.add_argument("--operation", choices=("status", "run", "native-text", "export", "cdm", "final-build", "review"), default="status")
     p = sub.add_parser("inspect"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
