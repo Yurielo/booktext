@@ -22,6 +22,7 @@ import BookTextCore
     @Published var outputURL: URL?
     @Published var useTesseract = true
     @Published var includePDF = false
+    @Published var nativeTextOnly = false
     private var bridge: CoreProcessBridge?
     private var startedAt: Date?
 
@@ -30,7 +31,8 @@ import BookTextCore
     func preflight() {
         presentation.state = .preflighting; errorText = ""; ready = false
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
-        do { try client.start(arguments: ["preflight", "--operation", "run"], event: { [weak self] event in Task { @MainActor in self?.receivePreflight(event) } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in if status != 0 && self?.errorText.isEmpty == true { self?.errorText = "Preflight failed (exit \(status))." } } }) }
+        let operation = nativeTextOnly ? "native-text" : "run"
+        do { try client.start(arguments: ["preflight", "--operation", operation], event: { [weak self] event in Task { @MainActor in self?.receivePreflight(event) } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in if status != 0 && self?.errorText.isEmpty == true { self?.errorText = "Preflight failed (exit \(status))." } } }) }
         catch { errorText = error.localizedDescription; presentation.state = .failed }
     }
     private func receivePreflight(_ event: MachineEvent) { Task { @MainActor in
@@ -41,7 +43,8 @@ import BookTextCore
     func start() {
         guard !sourceURLs.isEmpty, ready else { return }
         presentation = JobPresentation(state: .running); errorText = ""; warningText = ""; startedAt = Date()
-        let options = ["run"] + sourceURLs.map(\.path) + ["--"] + (useTesseract ? ["--ocr", "tesseract"] : []) + ["--no-qa"] + (includePDF ? [] : ["--no-pdf"]) + ["--raw-ocr"]
+        let coreOptions = nativeTextOnly ? ["--native-text-only"] : ((useTesseract ? ["--ocr", "tesseract"] : []) + ["--no-qa"] + (includePDF ? [] : ["--no-pdf"]) + ["--raw-ocr"])
+        let options = ["run"] + sourceURLs.map(\.path) + ["--"] + coreOptions
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
         do { try client.start(arguments: options, event: { [weak self] event in Task { @MainActor in self?.receiveRun(event) } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in self?.finishRun(status) } }) }
         catch { errorText = error.localizedDescription; presentation.state = .failed }
@@ -56,7 +59,9 @@ import BookTextCore
     private func receiveStderr(_ text: String) { Task { @MainActor in if !text.isEmpty { diagnostics += text } } }
     private func finishRun(_ status: Int32) {
         guard presentation.state != .cancelled else { return }
-        if status == 0, let outputURL { inspect(outputURL) } else if presentation.state != .failed { presentation.state = .failed; errorText = "processing_failure: Core exited with \(status)." }
+        if status == 0, let outputURL {
+            nativeTextOnly ? buildNativeDocx(outputURL) : inspect(outputURL)
+        } else if presentation.state != .failed { presentation.state = .failed; errorText = "processing_failure: Core exited with \(status)." }
     }
     func cancel() { guard bridge?.isRunning == true else { return }; presentation.state = .cancelling; bridge?.cancel() }
     func inspect(_ url: URL) {
@@ -64,6 +69,22 @@ import BookTextCore
         do { try client.start(arguments: ["inspect", url.path], event: { [weak self] event in Task { @MainActor in
             self?.presentation.consume(event); if event.eventType == .jobCompleted { self?.result = event.details.object ?? [:]; self?.presentation.state = .completed }
         } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { errorText = error.localizedDescription }
+    }
+    private func buildNativeDocx(_ url: URL) {
+        let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
+        do { try client.start(arguments: ["cdm", url.path], event: { [weak self] event in Task { @MainActor in
+            guard let self else { return }
+            if event.eventType == .jobCompleted { self.exportNativeDocx(url) }
+            if event.eventType == .jobFailed { self.presentation.state = .failed; self.errorText = "cdm_failure: \(event.message)" }
+        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { presentation.state = .failed; errorText = error.localizedDescription }
+    }
+    private func exportNativeDocx(_ url: URL) {
+        let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
+        do { try client.start(arguments: ["export", url.path, "--format", "docx"], event: { [weak self] event in Task { @MainActor in
+            guard let self else { return }
+            if event.eventType == .jobCompleted { self.inspect(url) }
+            if event.eventType == .jobFailed { self.presentation.state = .failed; self.errorText = "export_failure: \(event.message)" }
+        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { presentation.state = .failed; errorText = error.localizedDescription }
     }
     func reveal() { if let outputURL { NSWorkspace.shared.activateFileViewerSelecting([outputURL]) } }
     func openPrimary() { guard let outputURL, let artifacts = result["artifacts"]?.object else { return }; let key = artifacts["clean_text"]?.object?["exists"]?.bool == true ? "clean_text" : "markdown"; if let relative = artifacts[key]?.object?["path"]?.string { NSWorkspace.shared.open(outputURL.appendingPathComponent(relative)) } }
@@ -79,7 +100,8 @@ struct ContentView: View {
         GroupBox("BookText Core") { TextField("Path to booktext.py", text: $model.corePath).textFieldStyle(.roundedBorder); Button("Check Preflight") { model.preflight() }.disabled(model.presentation.state == .running) }
         GroupBox("Source") { VStack(alignment: .leading) {
             Text(model.sourceURLs.isEmpty ? "Drop a PDF, DjVu, or image here, or choose files." : model.sourceURLs.map(\.lastPathComponent).joined(separator: ", "))
-            HStack { Button("Choose File(s)") { chooseFiles() }; Toggle("Use Tesseract (quick local run)", isOn: $model.useTesseract); Toggle("Create searchable PDF", isOn: $model.includePDF) }
+            HStack { Button("Choose File(s)") { chooseFiles() }; Toggle("Use Tesseract (quick local run)", isOn: $model.useTesseract).disabled(model.nativeTextOnly); Toggle("Create searchable PDF", isOn: $model.includePDF).disabled(model.nativeTextOnly) }
+            Toggle("Native PDF text only → DOCX (do not OCR images or figures)", isOn: $model.nativeTextOnly).onChange(of: model.nativeTextOnly) { _, _ in model.preflight() }
         }.padding(10).frame(maxWidth: .infinity).background(dragging ? Color.accentColor.opacity(0.15) : .clear).onDrop(of: [.fileURL], isTargeted: $dragging) { providers in
             guard let provider = providers.first else { return false }; provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) { Task { @MainActor in model.addFiles([url]) } } }; return true
         } }
