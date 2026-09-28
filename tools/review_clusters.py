@@ -43,6 +43,28 @@ def classify(item):
     return "repeated_lexical_pair", ("lexical_pair", surya, vision)
 
 
+def batch_metadata(category, members):
+    """Batch is stricter than clustering: exact, same-semantics pair only."""
+    rejected = []
+    if len(members) < 2: rejected.append("not_multi_member")
+    if category != "repeated_lexical_pair": rejected.append("not_exact_repeated_lexical_pair")
+    pairs = {(_compact(x.get("surya")), _compact(x.get("vision"))) for x in members}
+    if len(pairs) != 1: rejected.append("mixed_surya_vision_evidence")
+    if any(not pair[0] or not pair[1] for pair in pairs): rejected.append("missing_vision_evidence")
+    if any(_UNSAFE.search(part) or _LATIN.search(part) for pair in pairs for part in pair): rejected.append("protected_numeric_or_latin_content")
+    if len({x.get("priority") for x in members}) != 1: rejected.append("mixed_priority")
+    if len({tuple(x.get("reasons") or []) for x in members}) != 1: rejected.append("mixed_review_reasons")
+    eligible = not rejected
+    return {
+        "batch_eligible": eligible, "eligibility_version": "1.0",
+        "equivalence_signature": list(next(iter(pairs))) if eligible else None,
+        "eligibility_reasons": ["exact_identical_cyrillic_surya_vision_pair"] if eligible else [],
+        "rejection_reasons": rejected,
+        "eligible_member_ids": [x["item_id"] for x in members] if eligible else [],
+        "allowed_batch_actions": ["keep_surya", "accept_vision", "ignore"] if eligible else [],
+    }
+
+
 def build_clusters(priority):
     if priority.get("artifact_type") != "booktext.review_priority" or priority.get("schema_version") != "1.0":
         raise ValueError("unsupported review priority artifact")
@@ -65,6 +87,7 @@ def build_clusters(priority):
             "member_count": len(members), "representative": {key: representative.get(key) for key in ("item_id", "page", "priority", "surya", "vision", "reasons")},
             "signature": list(signature) if signature else None, "safety_flags": ["organizational_only", "no_bulk_decision"] + (["intentionally_singleton"] if len(members) == 1 else []),
             "priority_distribution": distribution, "pages": sorted({x["page"] for x in members}), "grouping_eligible": signature is not None,
+            **batch_metadata(category, members),
         })
     clusters.sort(key=lambda value: (min(PRIORITIES.index(p) for p, n in value["priority_distribution"].items() if n), -value["member_count"], value["cluster_id"]))
     multi = [cluster for cluster in clusters if cluster["member_count"] > 1]
@@ -72,7 +95,7 @@ def build_clusters(priority):
         "schema_version": SCHEMA_VERSION, "artifact_type": ARTIFACT_TYPE,
         "policy": "Clusters are organizational evidence only. Item IDs and item decisions remain source of truth; no decision propagates.",
         "source_item_count": len(items), "cluster_count": len(clusters),
-        "metrics": {"singleton_clusters": len(clusters) - len(multi), "multi_item_clusters": len(multi), "items_in_multi_item_clusters": sum(x["member_count"] for x in multi), "estimated_reviewer_units": len(clusters)},
+        "metrics": {"singleton_clusters": len(clusters) - len(multi), "multi_item_clusters": len(multi), "items_in_multi_item_clusters": sum(x["member_count"] for x in multi), "estimated_reviewer_units": len(clusters), "batch_eligible_clusters": sum(x["batch_eligible"] for x in clusters), "batch_eligible_items": sum(len(x["eligible_member_ids"]) for x in clusters if x["batch_eligible"])},
         "clusters": clusters,
     }
 
