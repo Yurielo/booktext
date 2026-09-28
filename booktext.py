@@ -1865,6 +1865,11 @@ if __name__ == "__main__":
         review_workspace_main(sys.argv[2:])
         sys.exit(0)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "document":
+        from tools.canonical_document import main as canonical_document_main
+        canonical_document_main(sys.argv[2:])
+        sys.exit(0)
+
     def _cleanup_signal(_signum, _frame):
         OWNED_CHILDREN.handle_signal(_signum, _frame)
 
