@@ -154,16 +154,68 @@ class ReviewWorkspace:
             # A native client receives a logical, root-relative reference only.
             # It must not infer or browse arbitrary local paths.
             image_reference = str(image_path.relative_to(self.root))
+        signals = item.get("signals", {})
+        # Prefer exact Vision word geometry. Vision uses a bottom-left origin,
+        # whereas every BookText page asset (and native view) uses top-left.
+        # Convert only for display; raw review.json and priority evidence remain
+        # immutable. A Surya block is intentionally an *approximate* fallback,
+        # not a claim that the disputed word was located.
+        vision_bbox = signals.get("vision_bbox")
+        if vision_bbox:
+            bbox = self._source_page_bbox(
+                vision_bbox,
+                signals.get("vision_bbox_coordinate_space", "vision_normalized_bottom_left"),
+            )
+            location_kind, location_accuracy = "vision_word", "exact"
+        else:
+            bbox = signals.get("surya_bbox")
+            location_kind = "surya_text_block" if bbox else None
+            location_accuracy = "block" if bbox else "unavailable"
+        valid_bbox = (
+            isinstance(bbox, list) and len(bbox) == 4
+            and all(isinstance(value, (int, float)) and 0 <= value <= 1 for value in bbox)
+            and bbox[2] > bbox[0] and bbox[3] > bbox[1]
+        )
         return {
             "item_id": item_id, "page": item["page"], "priority": item["priority"],
             "item_type": item["item_type"], "reasons": item.get("reasons", []), "signals": item.get("signals", {}),
             "surya": item.get("surya", ""), "vision": item.get("vision", ""),
             "status": self.status_for(item_id), "image_available": image_path is not None,
             "page_image": image_reference,
-            "source_asset": {"page_image": image_reference, "crop": None, "crop_available": False},
+            "source_asset": {
+                "page_image": image_reference,
+                "crop": bbox if valid_bbox else None,
+                "crop_available": bool(valid_bbox and image_path),
+                "coordinate_space": "source_page_normalized_top_left" if valid_bbox else None,
+                "location_kind": location_kind,
+                "location_accuracy": location_accuracy if valid_bbox else "unavailable",
+            },
             "page_image_url": f"/asset/page/{item['page']}" if image_path else None,
             "page_context": {"text_length": len(str(page.get("text", "")))},
         }
+
+    @staticmethod
+    def _source_page_bbox(bbox, coordinate_space):
+        """Return a valid top-left-normalised rectangle or None.
+
+        The legacy default is deliberate: all stored Apple Vision word
+        rectangles prior to this metadata used Vision's bottom-left system.
+        Unknown coordinate systems fail closed rather than creating a visibly
+        misleading highlight.
+        """
+        if not (isinstance(bbox, list) and len(bbox) == 4):
+            return None
+        try:
+            x0, y0, x1, y1 = (float(value) for value in bbox)
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+            return None
+        if coordinate_space == "vision_normalized_bottom_left":
+            return [x0, 1 - y1, x1, 1 - y0]
+        if coordinate_space == "source_page_normalized_top_left":
+            return [x0, y0, x1, y1]
+        return None
 
     def page_image_path(self, page_number):
         page = self.pages.get(page_number, {})

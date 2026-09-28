@@ -1216,6 +1216,10 @@ def vision_qa_page(page, page_number, surya_text, vision_dir):
             "vision": " ".join(vision_part),
             "vision_confidence": confidence,
             "vision_bbox": _vision_union_bbox(vision_part_items),
+            # Vision's normalised rectangles use a bottom-left origin.  Keep
+            # that provenance with the raw QA evidence; review clients convert
+            # it explicitly to the source-page (top-left) coordinate space.
+            "vision_bbox_coordinate_space": "vision_normalized_bottom_left",
         }
 
         # Very large mismatches matter mainly as completeness warnings.
@@ -2073,9 +2077,12 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "recover":
         from tools.review_recovery import recover
-        if len(sys.argv) != 3:
-            raise SystemExit("Usage: booktext recover <legacy-output-dir>")
-        print(json.dumps(recover(sys.argv[2]), ensure_ascii=False, indent=2))
+        import argparse
+        parser = argparse.ArgumentParser(prog="booktext recover")
+        parser.add_argument("output_dir")
+        parser.add_argument("--surya-results", help="preserved Surya results.json used only for source-location evidence")
+        options = parser.parse_args(sys.argv[2:])
+        print(json.dumps(recover(options.output_dir, surya_results=options.surya_results), ensure_ascii=False, indent=2))
         sys.exit(0)
 
     if len(sys.argv) > 1 and sys.argv[1] == "document":

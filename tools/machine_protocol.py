@@ -265,7 +265,7 @@ def _handle(args):
         return _run_existing(Emitter("pending"), args.sources, args.core_args)
     state = ensure_job(root); emitter = Emitter(state["job_id"])
     if args.command == "recover":
-        return _invoke(emitter, root, "review", "offline review recovery", lambda: review_recovery.recover(root))
+        return _invoke(emitter, root, "review", "offline review recovery", lambda: review_recovery.recover(root, surya_results=args.surya_results))
     if args.command == "cdm":
         return _invoke(emitter, root, "cdm", "CDM build", lambda: {"path": str(canonical_document.write_document(canonical_document.build_document(root), root))})
     if args.command == "export":
@@ -336,7 +336,7 @@ def main(argv=None):
     p = sub.add_parser("inspect"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
-    p = sub.add_parser("recover"); p.add_argument("output_dir", type=Path)
+    p = sub.add_parser("recover"); p.add_argument("output_dir", type=Path); p.add_argument("--surya-results")
     p = sub.add_parser("export"); p.add_argument("output_dir", type=Path); p.add_argument("--format", action="append", choices=[*export_document.FORMATS, "all"])
     p = sub.add_parser("final-build"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("decision"); p.add_argument("output_dir", type=Path); p.add_argument("--item", required=True); p.add_argument("--action", choices=sorted(review_decisions.TEXT_ACTIONS), required=True); p.add_argument("--replacement"); p.add_argument("--note"); p.add_argument("--replace", action="store_true")

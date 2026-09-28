@@ -94,6 +94,20 @@ import BookTextCore
         guard url.path.hasPrefix(outputURL.standardizedFileURL.path + "/") else { return nil }
         return NSImage(contentsOf: url)
     }
+    func sourceEvidence() -> (bbox: [Double]?, label: String, isExact: Bool) {
+        let asset = item["source_asset"]?.object ?? [:]
+        let values = asset["crop"]?.values?.compactMap { value in
+                if case .number(let number) = value { return number }
+                return nil
+        }
+        guard let values, values.count == 4 else {
+            return (nil, "No trustworthy source coordinates were preserved for this item. The full page is shown; no approximate mark is invented.", false)
+        }
+        if asset["location_accuracy"]?.string == "exact" {
+            return (values, "Yellow frame: exact saved Vision word evidence region.", true)
+        }
+        return (values, "Orange frame: saved Surya text-block context, not an exact word location.", false)
+    }
 }
 
 struct NativeReviewView: View {
@@ -123,7 +137,7 @@ struct NativeReviewView: View {
     @ViewBuilder private var itemView: some View {
         if model.item.isEmpty { ContentUnavailableView("No matching review items", systemImage: "checkmark.circle") }
         else { HSplitView {
-            ScrollView { if let image = model.localPageImage() { Image(nsImage: image).resizable().scaledToFit().accessibilityLabel("Source page \(model.item["page"]?.integer ?? 0)") } else { ContentUnavailableView("Source page unavailable", systemImage: "doc") } }.frame(minWidth: 360)
+            ScrollView { if let image = model.localPageImage() { let source = model.sourceEvidence(); SourcePageEvidenceView(image: image, bbox: source.bbox, label: source.label, isExact: source.isExact) } else { ContentUnavailableView("Source page unavailable", systemImage: "doc") } }.frame(minWidth: 360)
             ScrollView { VStack(alignment: .leading, spacing: 10) {
                 Text("\(model.item["priority"]?.string ?? "") · page \(model.item["page"]?.integer ?? 0)").font(.title3.bold())
                 detail("Item ID", model.item["item_id"]?.string ?? ""); detail("Status", model.item["status"]?.object?["status"]?.string ?? "unresolved"); detail("Reasons", model.item["reasons"]?.values?.compactMap { $0.string }.joined(separator: ", ") ?? "—"); detail("Signals / QA", String(describing: model.item["signals"] ?? .null)); detail("Surya", model.item["surya"]?.string ?? "—"); detail("Vision alternative", model.item["vision"]?.string ?? "—")
@@ -145,4 +159,28 @@ struct NativeReviewView: View {
     }
     private var manualSheet: some View { VStack(alignment: .leading, spacing: 12) { Text("Manual correction").font(.headline); Text("Surya: \(model.item["surya"]?.string ?? "—")"); Text("Vision: \(model.item["vision"]?.string ?? "—")"); TextEditor(text: $model.manualText).frame(minHeight: 160).autocorrectionDisabled(); HStack { Spacer(); Button("Cancel") { model.manualSheet = false }; Button("Save manual decision") { model.decide("manual", replacement: model.manualText); model.manualSheet = false }.buttonStyle(.borderedProminent) } }.padding().frame(width: 600) }
     private func detail(_ title: String, _ value: String) -> some View { VStack(alignment: .leading, spacing: 2) { Text(title).font(.caption.bold()); Text(value).textSelection(.enabled) } }
+}
+
+private struct SourcePageEvidenceView: View {
+    let image: NSImage
+    let bbox: [Double]?
+    let label: String
+    let isExact: Bool
+    var body: some View {
+        let ratio = max(image.size.width, 1) / max(image.size.height, 1)
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            let height = width / ratio
+            ZStack(alignment: .topLeading) {
+                Image(nsImage: image).resizable().frame(width: width, height: height)
+                if let bbox, bbox.count == 4 {
+                    Rectangle().stroke(isExact ? .yellow : .orange, lineWidth: 4).background((isExact ? Color.yellow : Color.orange).opacity(0.18))
+                        .frame(width: width * (bbox[2] - bbox[0]), height: height * (bbox[3] - bbox[1]))
+                        .offset(x: width * bbox[0], y: height * bbox[1])
+                        .accessibilityLabel(isExact ? "Highlighted exact Vision evidence region" : "Highlighted approximate Surya text block")
+                }
+            }.frame(width: width, height: height)
+        }.aspectRatio(ratio, contentMode: .fit)
+        Text(label + " It is not an automatic correction.").font(.caption).foregroundStyle(.secondary)
+    }
 }

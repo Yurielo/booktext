@@ -101,6 +101,13 @@ class VisionQATests(unittest.TestCase):
             with self.subTest(surya=surya, vision=vision):
                 self.assertTrue(self._compare(surya, vision)["differences"])
 
+    def test_records_vision_bottom_left_coordinate_provenance(self):
+        result = self._compare("alpha", "beta")
+        self.assertEqual(
+            result["differences"][0]["vision_bbox_coordinate_space"],
+            "vision_normalized_bottom_left",
+        )
+
     def test_ignores_only_alphabetic_word_segmentation(self):
         self.assertFalse(self._compare("treatment", "treat ment")["differences"])
         self.assertTrue(self._compare("1.5", "1 5")["differences"])

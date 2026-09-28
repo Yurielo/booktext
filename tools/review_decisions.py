@@ -34,7 +34,18 @@ def sha256_file(path):
 
 
 def item_fingerprint(item):
-    return _sha256_bytes(_canonical(item).encode("utf-8"))
+    """Fingerprint decision-relevant evidence, not optional presentation geometry.
+
+    A saved rectangle helps a reviewer find text on the source image but cannot
+    change what a human accepted.  Keeping it out of the anchor lets a legacy
+    output gain trustworthy location evidence without invalidating decisions.
+    """
+    canonical_item = json.loads(_canonical(item))
+    signals = canonical_item.get("signals")
+    if isinstance(signals, dict):
+        for key in ("vision_bbox", "surya_bbox", "surya_bbox_provenance"):
+            signals.pop(key, None)
+    return _sha256_bytes(_canonical(canonical_item).encode("utf-8"))
 
 
 def page_fingerprint(page):
@@ -211,13 +222,11 @@ def build_final(book, priority, decisions_document, *, book_path, priority_path,
     decisions = decisions_document.get("decisions")
     if not isinstance(decisions, list):
         raise ValueError("review decisions must be a list")
-    expected_priority = decisions_document.get("priority_source", {}).get("sha256")
     expected_book = decisions_document.get("book_source", {}).get("sha256")
-    source_identity_matches = (
-        expected_priority == sha256_file(priority_path)
-        and expected_book == sha256_file(book_path)
-    )
-    if source_identity_matches:
+    # Individual anchors fail closed on semantic review-evidence changes.
+    # A whole priority-file hash may legitimately change when optional visual
+    # locator geometry is added, so it is provenance rather than a global veto.
+    if expected_book == sha256_file(book_path):
         statuses = _decision_statuses(decisions, priority_items, pages)
     else:
         statuses = [
