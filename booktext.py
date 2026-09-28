@@ -2071,6 +2071,13 @@ if __name__ == "__main__":
         review_workspace_main(sys.argv[2:])
         sys.exit(0)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "recover":
+        from tools.review_recovery import recover
+        if len(sys.argv) != 3:
+            raise SystemExit("Usage: booktext recover <legacy-output-dir>")
+        print(json.dumps(recover(sys.argv[2]), ensure_ascii=False, indent=2))
+        sys.exit(0)
+
     if len(sys.argv) > 1 and sys.argv[1] == "document":
         from tools.canonical_document import main as canonical_document_main
         canonical_document_main(sys.argv[2:])

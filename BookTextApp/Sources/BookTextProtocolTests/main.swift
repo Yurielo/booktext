@@ -33,7 +33,20 @@ func safeArgumentArrayAndArtifactMapping() throws {
         try check(command.1 == ["python3", "/tmp/a path/booktext.py", "machine", "inspect", "/tmp/out;not-shell"], "arguments must remain separate argv values")
 }
 
+func reviewPayloadFixtureDecodesWithoutTerminalParsing() throws {
+    let payload = try JSONDecoder().decode(JSONValue.self, from: Data("{\"item_id\":\"p319-fallback\",\"source_asset\":{\"page_image\":\"pages/page-319.png\",\"crop\":null},\"reasons\":[\"not_verified_structured_data\"],\"status\":{\"status\":\"unresolved\"}}".utf8))
+    let object = try unwrap(payload.object, "review object")
+    try check(object["item_id"]?.string == "p319-fallback", "stable review item ID")
+    try check(object["source_asset"]?.object?["crop"] == .null, "fallback uses no fabricated crop")
+    try check(object["reasons"]?.values?.first?.string == "not_verified_structured_data", "review reasons are structured")
+}
+
+func unwrap<T>(_ value: T?, _ message: String) throws -> T {
+    guard let value else { throw NSError(domain: "BookTextProtocolTests", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    return value
+}
+
 do {
-    try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping()
+    try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping(); try reviewPayloadFixtureDecodesWithoutTerminalParsing()
     print("BookTextProtocolTests: PASS")
 } catch { fputs("BookTextProtocolTests: FAIL \(error.localizedDescription)\n", stderr); exit(1) }

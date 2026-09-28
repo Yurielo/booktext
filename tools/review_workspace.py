@@ -148,12 +148,20 @@ class ReviewWorkspace:
     def item_payload(self, item_id):
         item = self.items[item_id]
         page = self.pages.get(item["page"], {})
+        image_path = self.page_image_path(item["page"])
+        image_reference = None
+        if image_path is not None:
+            # A native client receives a logical, root-relative reference only.
+            # It must not infer or browse arbitrary local paths.
+            image_reference = str(image_path.relative_to(self.root))
         return {
             "item_id": item_id, "page": item["page"], "priority": item["priority"],
             "item_type": item["item_type"], "reasons": item.get("reasons", []), "signals": item.get("signals", {}),
             "surya": item.get("surya", ""), "vision": item.get("vision", ""),
-            "status": self.status_for(item_id), "image_available": self.page_image_path(item["page"]) is not None,
-            "page_image_url": f"/asset/page/{item['page']}" if self.page_image_path(item["page"]) else None,
+            "status": self.status_for(item_id), "image_available": image_path is not None,
+            "page_image": image_reference,
+            "source_asset": {"page_image": image_reference, "crop": None, "crop_available": False},
+            "page_image_url": f"/asset/page/{item['page']}" if image_path else None,
             "page_context": {"text_length": len(str(page.get("text", "")))},
         }
 
@@ -197,6 +205,15 @@ class ReviewWorkspace:
             resolved = [item_id for item_id in plan["member_ids"] if self.status_for(item_id)["status"] != "unresolved"]
             if resolved:
                 raise ValueError("batch members must all be unresolved")
+            # The confirmation UI needs inspectable evidence, not just opaque
+            # IDs.  This remains a preview: no decision is persisted here.
+            plan["members"] = [{
+                "item_id": item_id, "page": self.items[item_id]["page"],
+                "priority": self.items[item_id]["priority"],
+                "reasons": self.items[item_id].get("reasons", []),
+                "surya": self.items[item_id].get("surya", ""),
+                "vision": self.items[item_id].get("vision", ""),
+            } for item_id in plan["member_ids"]]
             return plan
 
     def batch_confirm(self, cluster_id, action, excluded_ids=(), confirmed=False):

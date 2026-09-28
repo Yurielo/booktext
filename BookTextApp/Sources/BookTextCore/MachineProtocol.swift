@@ -30,6 +30,7 @@ public enum JSONValue: Codable, Sendable, Equatable {
         switch self { case .string(let x): try box.encode(x); case .number(let x): try box.encode(x); case .bool(let x): try box.encode(x); case .object(let x): try box.encode(x); case .array(let x): try box.encode(x); case .null: try box.encodeNil() }
     }
     public var object: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
+    public var values: [JSONValue]? { if case .array(let value) = self { value } else { nil } }
     public var string: String? { if case .string(let value) = self { value } else { nil } }
     public var integer: Int? { if case .number(let value) = self { Int(value) } else { nil } }
     public var bool: Bool? { if case .bool(let value) = self { value } else { nil } }
