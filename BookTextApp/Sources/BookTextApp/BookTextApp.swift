@@ -25,17 +25,21 @@ import BookTextCore
     @Published var nativeTextOnly = false
     private var bridge: CoreProcessBridge?
     private var startedAt: Date?
+    private var preflightGeneration = 0
 
     var elapsed: String { guard let startedAt else { return "" }; return "Elapsed \(Int(Date().timeIntervalSince(startedAt)))s" }
     func addFiles(_ urls: [URL]) { sourceURLs = urls; ready = false; result = [:]; errorText = ""; preflight() }
     func preflight() {
+        preflightGeneration += 1
+        let generation = preflightGeneration
         presentation.state = .preflighting; errorText = ""; ready = false
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
         let operation = nativeTextOnly ? "native-text" : "run"
-        do { try client.start(arguments: ["preflight", "--operation", operation], event: { [weak self] event in Task { @MainActor in self?.receivePreflight(event) } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in if status != 0 && self?.errorText.isEmpty == true { self?.errorText = "Preflight failed (exit \(status))." } } }) }
+        do { try client.start(arguments: ["preflight", "--operation", operation], event: { [weak self] event in Task { @MainActor in self?.receivePreflight(event, generation: generation) } }, stderr: { [weak self] text in Task { @MainActor in guard self?.preflightGeneration == generation else { return }; self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in guard let self, self.preflightGeneration == generation else { return }; if status != 0 && self.errorText.isEmpty { self.errorText = "Preflight failed (exit \(status))." } } }) }
         catch { errorText = error.localizedDescription; presentation.state = .failed }
     }
-    private func receivePreflight(_ event: MachineEvent) { Task { @MainActor in
+    private func receivePreflight(_ event: MachineEvent, generation: Int) { Task { @MainActor in
+        guard preflightGeneration == generation else { return }
         presentation.consume(event)
         if event.eventType == .jobCompleted { ready = event.details.object?["ok"]?.bool == true; presentation.state = ready ? .ready : .failed }
         if event.eventType == .jobFailed { errorText = "\(event.code): \(event.message)" }
