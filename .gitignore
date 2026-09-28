@@ -15,6 +15,7 @@ venv/
 output/
 dist/
 build/
+.build/
 
 # Local editor files
 .idea/
