@@ -720,7 +720,7 @@ def _surya_page_text(page_result):
     return ""
 
 
-def recognize_pages_surya(pages, output_dir, temp_dir):
+def _recognize_pages_surya_batch(pages, output_dir, temp_dir):
     """
     Run Surya once for all selected page images.
 
@@ -829,6 +829,125 @@ def recognize_pages_surya(pages, output_dir, temp_dir):
             shutil.rmtree(previous_dir)
 
     print(f"Surya OCR получен для страниц: {len(texts)}")
+    return texts
+
+
+def _atomic_json(path, value):
+    """Write a recoverable checkpoint without exposing partial JSON."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _load_json_object(path, default):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+    return value if isinstance(value, dict) else default
+
+
+def _batch_size_for_pages(page_count):
+    """Conservative automatic start; no user-selected batch parameter exists."""
+    if page_count <= 0:
+        return 1
+    # Small jobs should remain a single light-weight invocation.  Larger jobs
+    # start at ten source pages and can only downshift automatically.
+    return min(10, page_count)
+
+
+def _is_resource_failure(error):
+    text = str(error).casefold()
+    return any(marker in text for marker in ("memory", "out of memory", "timeout", "timed out", "killed", "resource"))
+
+
+def _surya_payload_from_dir(directory):
+    merged = {}
+    for result_file in directory.rglob("results.json"):
+        value = _load_json_object(result_file, {})
+        for key, record in value.items():
+            if key in merged:
+                raise RuntimeError(f"Surya returned duplicate page payload: {key}")
+            merged[key] = record
+    return merged
+
+
+def recognize_pages_surya(pages, output_dir, temp_dir):
+    """Run Surya in adaptive, checkpointed page batches and merge raw evidence.
+
+    The logical book is never split: page identities and raw payloads are
+    merged into one results.json.  A later invocation resumes only pages with
+    no completed, readable payload.
+    """
+    if not pages:
+        return {}
+    require_surya()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = output_dir / "surya-input"
+    raw_dir.mkdir(exist_ok=True)
+    results_path, checkpoint_path = raw_dir / "results.json", raw_dir / "batch_checkpoint.json"
+    merged = _load_json_object(results_path, {})
+    checkpoint = _load_json_object(checkpoint_path, {"schema_version": "1.0", "artifact_type": "booktext.adaptive_batch_checkpoint", "completed_pages": [], "events": []})
+    completed = set(checkpoint.get("completed_pages", []))
+    selected = [number for number, _page in pages]
+    # A checkpoint alone is insufficient: raw page evidence must exist too.
+    completed = {number for number in completed if f"page-{number:04d}" in merged}
+    pending = [(number, page) for number, page in pages if number not in completed]
+    batch_size = _batch_size_for_pages(len(pending))
+    checkpoint["initial_batch_size"] = batch_size
+    checkpoint["events"] = checkpoint.get("events", [])
+    texts = {}
+    for number, _page in pages:
+        data = merged.get(f"page-{number:04d}")
+        result = data[0] if isinstance(data, list) and data else data
+        text = _surya_page_text(result if isinstance(result, dict) else {})
+        if number in completed and text:
+            texts[number] = text
+    position = 0
+    while position < len(pending):
+        batch = pending[position:position + batch_size]
+        batch_pages = [number for number, _page in batch]
+        batch_dir = temp_dir / f"surya-batch-{batch_pages[0]:04d}-{batch_pages[-1]:04d}-{uuid.uuid4().hex}"
+        try:
+            # Isolate staged input as well as the Surya child output; otherwise
+            # a later batch could accidentally see image files from an earlier
+            # batch in the shared temporary directory.
+            batch_texts = _recognize_pages_surya_batch(batch, batch_dir, batch_dir)
+            batch_payload = _surya_payload_from_dir(batch_dir)
+            expected = {f"page-{number:04d}" for number in batch_pages}
+            if set(batch_payload) != expected:
+                raise RuntimeError("Surya batch payload is incomplete or contains unexpected pages")
+        except Exception as error:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            if batch_size > 1 and _is_resource_failure(error):
+                reduced = max(1, min(5, batch_size // 2))
+                checkpoint["events"].append({"kind": "automatic_batch_downshift", "from": batch_size, "to": reduced, "pages": batch_pages, "reason": str(error)})
+                batch_size = reduced
+                _atomic_json(checkpoint_path, checkpoint)
+                continue
+            checkpoint["last_failure"] = {"pages": batch_pages, "reason": str(error)}
+            _atomic_json(checkpoint_path, checkpoint)
+            raise
+        finally:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+        for key, value in batch_payload.items():
+            if key in merged:
+                raise RuntimeError(f"duplicate completed page in adaptive batch merge: {key}")
+            merged[key] = value
+        texts.update(batch_texts)
+        completed.update(batch_pages)
+        checkpoint["completed_pages"] = sorted(completed)
+        checkpoint["last_completed_batch"] = batch_pages
+        checkpoint["current_batch_size"] = batch_size
+        _atomic_json(results_path, {key: merged[key] for key in sorted(merged)})
+        _atomic_json(checkpoint_path, checkpoint)
+        position += len(batch)
+    if set(texts) != set(selected):
+        missing = sorted(set(selected) - set(texts))
+        raise RuntimeError("missing completed Surya pages after adaptive batching: " + ", ".join(map(str, missing)))
+    checkpoint["status"] = "complete"
+    checkpoint["completed_pages"] = sorted(completed)
+    _atomic_json(checkpoint_path, checkpoint)
     return texts
 
 
@@ -1224,6 +1343,7 @@ def build_run_summary(
     ocr_engine="surya",
     qa_enabled=True,
     input_source_count=1,
+    adaptive_batching=None,
 ):
     """Build the stable, machine-readable completion result for one run."""
     qa_failures = [item for item in qa_pages if item.get("error")]
@@ -1257,6 +1377,7 @@ def build_run_summary(
         },
         "input_source_count": input_source_count,
         "ocr_engine": ocr_engine,
+        "adaptive_batching": adaptive_batching,
         "qa_enabled": qa_enabled,
         "elapsed_seconds": round(elapsed_seconds, 3),
         "qa": {
@@ -1575,6 +1696,7 @@ def main():
             }
 
         surya_texts = {}
+        adaptive_batching = None
 
         if args.ocr == "surya":
             try:
@@ -1583,6 +1705,9 @@ def main():
                      for page_number, _page in pages],
                     surya_dir,
                     temp_dir,
+                )
+                adaptive_batching = _load_json_object(
+                    surya_dir / "surya-input" / "batch_checkpoint.json", None
                 )
             except RuntimeError as error:
                 print(f"Ошибка Surya OCR: {error}")
@@ -1816,6 +1941,7 @@ def main():
         ocr_engine=args.ocr,
         qa_enabled=args.ocr == "surya" and not args.no_qa,
         input_source_count=len(sources),
+        adaptive_batching=adaptive_batching,
     )
     run_summary_path.write_text(
         json.dumps(run_summary, ensure_ascii=False, indent=2) + "\n",
