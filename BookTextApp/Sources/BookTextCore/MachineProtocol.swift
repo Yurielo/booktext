@@ -1,0 +1,134 @@
+import Foundation
+
+public let machineProtocolVersion = "1.0"
+
+public enum MachineEventType: String, Codable, CaseIterable, Sendable {
+    case jobStarted = "job_started", phaseStarted = "phase_started", progress, warning
+    case artifactCreated = "artifact_created", reviewSummary = "review_summary"
+    case phaseCompleted = "phase_completed", jobCompleted = "job_completed"
+    case jobFailed = "job_failed", jobCancelled = "job_cancelled", unknown
+
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = MachineEventType(rawValue: value) ?? .unknown
+    }
+}
+
+public enum JSONValue: Codable, Sendable, Equatable {
+    case string(String), number(Double), bool(Bool), object([String: JSONValue]), array([JSONValue]), null
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.singleValueContainer()
+        if box.decodeNil() { self = .null }
+        else if let value = try? box.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? box.decode(Double.self) { self = .number(value) }
+        else if let value = try? box.decode(String.self) { self = .string(value) }
+        else if let value = try? box.decode([String: JSONValue].self) { self = .object(value) }
+        else { self = .array(try box.decode([JSONValue].self)) }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var box = encoder.singleValueContainer()
+        switch self { case .string(let x): try box.encode(x); case .number(let x): try box.encode(x); case .bool(let x): try box.encode(x); case .object(let x): try box.encode(x); case .array(let x): try box.encode(x); case .null: try box.encodeNil() }
+    }
+    public var object: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
+    public var string: String? { if case .string(let value) = self { value } else { nil } }
+    public var integer: Int? { if case .number(let value) = self { Int(value) } else { nil } }
+    public var bool: Bool? { if case .bool(let value) = self { value } else { nil } }
+}
+
+public struct MachineEvent: Codable, Sendable, Equatable {
+    public let protocolVersion: String
+    public let jobID: String
+    public let eventType: MachineEventType
+    public let timestamp: String
+    public let phase: String?
+    public let current: Int?
+    public let total: Int?
+    public let page: Int?
+    public let code: String
+    public let message: String
+    public let details: JSONValue
+    enum CodingKeys: String, CodingKey { case protocolVersion = "protocol_version", jobID = "job_id", eventType = "event_type", timestamp, phase, current, total, page, code, message, details }
+    public var supported: Bool { protocolVersion.split(separator: ".").first == machineProtocolVersion.split(separator: ".").first }
+}
+
+public enum JobPresentationState: Equatable, Sendable { case idle, preflighting, ready, running, cancelling, cancelled, completed, failed }
+
+public struct JobPresentation: Sendable, Equatable {
+    public var state: JobPresentationState = .idle
+    public var jobID: String?
+    public var phase: String?
+    public var current: Int?
+    public var total: Int?
+    public var page: Int?
+    public var warnings: [String] = []
+    public var errorCode: String?
+    public init(state: JobPresentationState = .idle, jobID: String? = nil, phase: String? = nil, current: Int? = nil, total: Int? = nil, page: Int? = nil, warnings: [String] = [], errorCode: String? = nil) {
+        self.state = state; self.jobID = jobID; self.phase = phase; self.current = current; self.total = total; self.page = page; self.warnings = warnings; self.errorCode = errorCode
+    }
+    public mutating func consume(_ event: MachineEvent) {
+        guard event.supported else { state = .failed; errorCode = "unsupported_protocol"; return }
+        jobID = event.jobID; phase = event.phase ?? phase; current = event.current ?? current; total = event.total ?? total; page = event.page ?? page
+        switch event.eventType {
+        case .jobStarted: state = .running
+        case .warning: warnings.append(event.message)
+        case .jobCompleted: state = .completed
+        case .jobFailed: state = .failed; errorCode = event.code
+        case .jobCancelled: state = .cancelled
+        default: break
+        }
+    }
+}
+
+public struct CoreConfiguration: Sendable, Equatable {
+    public var scriptPath: String
+    public init(scriptPath: String) { self.scriptPath = scriptPath }
+    public static var defaultValue: CoreConfiguration {
+        let preferred = ProcessInfo.processInfo.environment["BOOKTEXT_CORE_PATH"]
+        let home = FileManager.default.homeDirectoryForCurrentUser.path + "/AITools/booktext/booktext.py"
+        return CoreConfiguration(scriptPath: preferred ?? home)
+    }
+    public func command(_ machineArguments: [String]) -> (URL, [String]) {
+        // Process receives an executable plus argv; never a shell string.
+        (URL(fileURLWithPath: "/usr/bin/env"), ["python3", scriptPath, "machine"] + machineArguments)
+    }
+}
+
+public final class CoreProcessBridge: @unchecked Sendable {
+    private var process: Process?
+    public let configuration: CoreConfiguration
+    public init(configuration: CoreConfiguration) { self.configuration = configuration }
+    public func start(arguments: [String], event: @escaping @Sendable (MachineEvent) -> Void, stderr: @escaping @Sendable (String) -> Void, finished: @escaping @Sendable (Int32) -> Void) throws {
+        guard FileManager.default.isReadableFile(atPath: configuration.scriptPath) else { throw NSError(domain: "BookText", code: 2, userInfo: [NSLocalizedDescriptionKey: "BookText Core script is unavailable at \(configuration.scriptPath)"]) }
+        let process = Process(); let output = Pipe(); let errors = Pipe(); let command = configuration.command(arguments)
+        process.executableURL = command.0; process.arguments = command.1; process.standardOutput = output; process.standardError = errors
+        let decoder = JSONDecoder(); let buffer = JSONLBuffer()
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let received = handle.availableData
+            guard !received.isEmpty else { return }
+            for line in buffer.append(received) {
+                if let decoded = try? decoder.decode(MachineEvent.self, from: line) { event(decoded) }
+            }
+        }
+        errors.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty, let text = String(data: data, encoding: .utf8) { stderr(text) }
+        }
+        process.terminationHandler = { task in
+            output.fileHandleForReading.readabilityHandler = nil; errors.fileHandleForReading.readabilityHandler = nil
+            finished(task.terminationStatus)
+        }
+        self.process = process
+        try process.run()
+    }
+    public func cancel() { process?.interrupt() }
+    public var isRunning: Bool { process?.isRunning == true }
+}
+
+private final class JSONLBuffer: @unchecked Sendable {
+    private let lock = NSLock(); private var value = Data()
+    func append(_ data: Data) -> [Data] {
+        lock.lock(); defer { lock.unlock() }; value.append(data); var lines: [Data] = []
+        while let newline = value.firstIndex(of: 10) { lines.append(value.prefix(upTo: newline)); value.removeSubrange(...newline) }
+        return lines
+    }
+}
