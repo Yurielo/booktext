@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from tools import review_decisions
+from tools.review_clusters import build_clusters
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -29,6 +30,7 @@ class ReviewWorkspace:
         self.priority_path = self.root / "review_priority.json"
         self.book_path = self.root / "book.json"
         self.decisions_path = self.root / "review_decisions.json"
+        self.clusters_path = self.root / "review_clusters.json"
         if not self.root.is_dir() or not self.priority_path.is_file() or not self.book_path.is_file():
             raise ValueError("review workspace requires book.json and review_priority.json in one BookText output directory")
         self.lock = threading.RLock()
@@ -42,6 +44,7 @@ class ReviewWorkspace:
             self.pages = review_decisions._page_index(self.book)
             self.decisions = review_decisions.load_json(self.decisions_path) if self.decisions_path.exists() else review_decisions.empty_decisions(self.priority_path, self.book_path)
             self.statuses = self._statuses()
+            self.clusters = (review_decisions.load_json(self.clusters_path).get("clusters", []) if self.clusters_path.exists() else build_clusters(self.priority)["clusters"])
 
     def _statuses(self):
         entries = self.decisions.get("decisions", [])
@@ -110,6 +113,25 @@ class ReviewWorkspace:
             "unresolved_high": sum(item["priority"] == "HIGH" for item in unresolved),
             "unresolved_medium": sum(item["priority"] == "MEDIUM" for item in unresolved),
         }
+
+    def filtered_clusters(self, filters):
+        priority, category, status = filters.get("priority"), filters.get("category"), filters.get("status")
+        values = []
+        for cluster in self.clusters:
+            member_states = [self.status_for(item_id)["status"] for item_id in cluster["member_item_ids"]]
+            if priority and not cluster.get("priority_distribution", {}).get(priority): continue
+            if category and cluster.get("category") != category: continue
+            if status and status not in member_states: continue
+            values.append(cluster)
+        return sorted(values, key=lambda cluster: (
+            0 if "unresolved" in [self.status_for(item_id)["status"] for item_id in cluster["member_item_ids"]] else 1,
+            -cluster["member_count"], cluster["cluster_id"],
+        ))
+
+    def cluster_payload(self, cluster_id):
+        cluster = next(cluster for cluster in self.clusters if cluster["cluster_id"] == cluster_id)
+        members = [{"item_id": item_id, "page": self.items[item_id]["page"], "priority": self.items[item_id]["priority"], "status": self.status_for(item_id)["status"]} for item_id in cluster["member_item_ids"]]
+        return {**cluster, "members": members, "decision_statistics": dict(Counter(member["status"] for member in members))}
 
     def item_payload(self, item_id):
         item = self.items[item_id]
@@ -188,6 +210,15 @@ class WorkspaceHandler(BaseHTTPRequestHandler):
                 return self._json({"total": len(ids), "index": index, "item": self.workspace.item_payload(ids[index]), "progress": self.workspace.progress()})
             except (ValueError, KeyError) as error:
                 return self._error(str(error))
+        if parsed.path == "/api/cluster":
+            try:
+                query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+                clusters = self.workspace.filtered_clusters(query); index = max(0, int(query.get("index", "0")))
+                if not clusters: return self._json({"total": 0, "progress": self.workspace.progress()})
+                index = min(index, len(clusters) - 1)
+                return self._json({"total": len(clusters), "index": index, "cluster": self.workspace.cluster_payload(clusters[index]["cluster_id"]), "progress": self.workspace.progress()})
+            except (ValueError, KeyError, StopIteration) as error:
+                return self._error(str(error))
         if parsed.path.startswith("/asset/page/"):
             try:
                 number = int(parsed.path.removeprefix("/asset/page/"))
@@ -217,9 +248,9 @@ class WorkspaceHandler(BaseHTTPRequestHandler):
 PAGE = """<!doctype html><meta charset=utf-8><title>BookText review</title>
 <style>body{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem}button,select,input,textarea{font:inherit;margin:.2rem}pre{white-space:pre-wrap;background:#f5f5f5;padding:.8rem}img{max-width:100%;max-height:600px}#priority{font-weight:bold}</style>
 <h1>BookText local review</h1><p>Surya is primary OCR; Vision is evidence, never automatic replacement.</p>
-<div><select id=pfilter><option value=''>All priorities</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option><option>INFO</option></select><select id=sfilter><option value=''>All statuses</option><option value=unresolved>Unresolved</option><option value=resolved_changed>Resolved changed</option><option value=resolved_no_change>Resolved no-change</option><option value=deferred>Deferred</option><option value=stale>Stale</option><option value=conflict>Conflict</option></select><input id=page placeholder=Page><button onclick='go(0)'>Filter</button></div>
+<div><select id=mode><option value=item>Items</option><option value=cluster>Clusters</option></select><select id=pfilter><option value=''>All priorities</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option><option>INFO</option></select><select id=sfilter><option value=''>All statuses</option><option value=unresolved>Unresolved</option><option value=resolved_changed>Resolved changed</option><option value=resolved_no_change>Resolved no-change</option><option value=deferred>Deferred</option><option value=stale>Stale</option><option value=conflict>Conflict</option></select><input id=page placeholder=Page><button onclick='go(0)'>Filter</button></div>
 <p id=progress></p><button onclick='go(-1)'>Previous</button><button onclick='go(1)'>Next</button><button onclick='nextUnresolved()'>Next unresolved</button><button onclick='build()'>Build final book</button><p id=message></p><section id=item></section>
-<script>let n=0,total=0;const q=()=>new URLSearchParams({index:n,priority:pfilter.value,status:sfilter.value,page:page.value});function esc(x){return String(x??'')}function show(x){progress.textContent=Object.entries(x.progress).map(([k,v])=>k+': '+v).join(' | ');total=x.total||0;n=x.index||0;if(!x.item){item.textContent='No matching review items.';return}let i=x.item;item.replaceChildren();let h=document.createElement('h2');h.textContent=`${i.priority} · page ${i.page} · ${i.status.status}`;item.append(h);for(let [k,v] of [['Item ID',i.item_id],['Reasons',i.reasons.join(', ')],['Signals',JSON.stringify(i.signals)],['Surya',i.surya],['Vision alternative',i.vision||'—']]){let e=document.createElement('pre');e.textContent=k+'\n'+v;item.append(e)}if(i.page_image_url){let im=document.createElement('img');im.src=i.page_image_url;im.alt='Source page '+i.page;item.append(im)}for(let a of ['keep_surya','accept_vision','ignore','defer']){let b=document.createElement('button');b.textContent=a;b.disabled=a==='accept_vision'&&!i.vision;b.onclick=()=>decide(a);item.append(b)}let ta=document.createElement('textarea');ta.id='manual';ta.placeholder='Manual replacement';item.append(ta);let mb=document.createElement('button');mb.textContent='manual';mb.onclick=()=>decide('manual');item.append(mb)}async function go(d){n=Math.max(0,n+d);let r=await fetch('/api/item?'+q());show(await r.json())}async function nextUnresolved(){sfilter.value='unresolved';go(0)}async function decide(action){let body={item_id:document.querySelector('pre').textContent.split('\n')[1],action,replacement_text:manual.value};let r=await fetch('/api/decision',{method:'POST',body:JSON.stringify(body)});let x=await r.json();message.textContent=x.error||'Saved immediately.';go(0)}async function build(){let r=await fetch('/api/build',{method:'POST',body:'{}'});message.textContent=JSON.stringify(await r.json())}go(0)</script>"""
+<script>let n=0,total=0,current='';const q=()=>new URLSearchParams({index:n,priority:pfilter.value,status:sfilter.value,page:page.value});function show(x){progress.textContent=Object.entries(x.progress).map(([k,v])=>k+': '+v).join(' | ');total=x.total||0;n=x.index||0;item.replaceChildren();if(x.cluster){let c=x.cluster,h=document.createElement('h2'),p=document.createElement('pre');h.textContent=`Cluster ${c.category} · ${c.member_count} members`;p.textContent=JSON.stringify({pages:c.pages,members:c.members,decisions:c.decision_statistics},null,2);item.append(h,p);return}if(!x.item){item.textContent='No matching review items.';return}let i=x.item;current=i.item_id;let h=document.createElement('h2');h.textContent=`${i.priority} · page ${i.page} · ${i.status.status}`;item.append(h);for(let [k,v] of [['Item ID',i.item_id],['Reasons',i.reasons.join(', ')],['Signals',JSON.stringify(i.signals)],['Surya',i.surya],['Vision alternative',i.vision||'—']]){let e=document.createElement('pre');e.textContent=k+'\n'+v;item.append(e)}if(i.page_image_url){let im=document.createElement('img');im.src=i.page_image_url;im.alt='Source page '+i.page;item.append(im)}for(let a of ['keep_surya','accept_vision','ignore','defer']){let b=document.createElement('button');b.textContent=a;b.disabled=a==='accept_vision'&&!i.vision;b.onclick=()=>decide(a);item.append(b)}let ta=document.createElement('textarea');ta.id='manual';ta.placeholder='Manual replacement';item.append(ta);let mb=document.createElement('button');mb.textContent='manual';mb.onclick=()=>decide('manual');item.append(mb)}async function go(d){n=Math.max(0,n+d);let path=mode.value==='cluster'?'/api/cluster?':'/api/item?';let r=await fetch(path+q());show(await r.json())}async function nextUnresolved(){mode.value='item';sfilter.value='unresolved';go(0)}async function decide(action){let body={item_id:current,action,replacement_text:manual.value};let r=await fetch('/api/decision',{method:'POST',body:JSON.stringify(body)});let x=await r.json();message.textContent=x.error||'Saved immediately.';go(0)}async function build(){let r=await fetch('/api/build',{method:'POST',body:'{}'});message.textContent=JSON.stringify(await r.json())}go(0)</script>"""
 
 
 def create_server(output_dir, host=LOOPBACK_HOST, port=0):
