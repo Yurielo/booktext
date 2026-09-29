@@ -19,6 +19,7 @@ DECISIONS_TYPE = "booktext.review_decisions"
 FINAL_BUILD_TYPE = "booktext.final_build"
 TEXT_ACTIONS = {"keep_surya", "accept_vision", "manual", "ignore", "defer"}
 TABLE_ACTIONS = {"ignore", "defer"}
+BASELINE_ACTION = "accept_raw_surya"
 
 
 def _canonical(value):
@@ -366,6 +367,154 @@ def record_decision(*, decisions_path, priority_path, book_path, item_id, action
     existing.sort(key=lambda entry: entry["item_id"])
     atomic_write_json(path, document)
     return decision
+
+
+def _digest(value):
+    return _sha256_bytes(_canonical(value).encode("utf-8"))
+
+
+def _baseline_candidates(priority_items, pages, baseline_id):
+    """Create anchored, item-level raw-OCR decisions without changing OCR.
+
+    A fallback table has no authoritative cells to keep.  It remains explicitly
+    deferred evidence instead of being silently accepted as structured data.
+    """
+    candidates = []
+    for item_id in sorted(priority_items):
+        item = priority_items[item_id]
+        action = "defer" if item.get("item_type") == "table_fallback_review" else "keep_surya"
+        candidate = {
+            "decision_id": _digest({"item_id": item_id, "action": action, "baseline_id": baseline_id})[:20],
+            "item_id": item_id,
+            "page": item["page"],
+            "action": action,
+            "source_anchor": {
+                "priority_item_sha256": item_fingerprint(item),
+                "page_text_sha256": page_fingerprint(pages[item["page"]]),
+            },
+            "baseline_provenance": {
+                "baseline_id": baseline_id,
+                "action": BASELINE_ACTION,
+                "policy": "Authoritative Surya raw OCR accepted; no automatic correction was applied.",
+            },
+        }
+        status, reason, _ = validate_decision(candidate, priority_items, pages)
+        if status in {"invalid", "stale", "conflict"}:
+            raise ValueError(f"cannot build raw Surya baseline for {item_id}: {reason}")
+        candidates.append(candidate)
+    return candidates
+
+
+def raw_surya_baseline_plan(*, decisions_path, priority_path, book_path):
+    """Describe the whole-output baseline operation without writing anything."""
+    priority = load_json(priority_path)
+    book = load_json(book_path)
+    items, pages = _priority_index(priority), _page_index(book)
+    path = Path(decisions_path)
+    document = load_json(path) if path.exists() else empty_decisions(priority_path, book_path)
+    if document.get("artifact_type") != DECISIONS_TYPE or document.get("schema_version") != "1.0":
+        raise ValueError("unsupported review decisions artifact")
+    source = {
+        "priority_sha256": sha256_file(priority_path),
+        "book_sha256": sha256_file(book_path),
+    }
+    baseline_id = "surya-baseline-" + _digest({"source": source, "items": sorted(items)})[:20]
+    candidates = _baseline_candidates(items, pages, baseline_id)
+    existing = document.get("decisions", [])
+    if not isinstance(existing, list):
+        raise ValueError("review decisions must be a list")
+    return {
+        "baseline_id": baseline_id,
+        "action": BASELINE_ACTION,
+        "requires_confirmation": True,
+        "source": source,
+        "item_count": len(candidates),
+        "keep_surya_count": sum(entry["action"] == "keep_surya" for entry in candidates),
+        "deferred_table_fallback_count": sum(entry["action"] == "defer" for entry in candidates),
+        "replaced_existing_decision_count": len(existing),
+        "generated_decisions_sha256": _digest(candidates),
+        "policy": "Raw OCR and QA evidence remain unchanged. Fallback tables stay deferred evidence without verified cells.",
+    }
+
+
+def apply_raw_surya_baseline(*, decisions_path, priority_path, book_path, confirmed=False):
+    """Atomically replace review choices with an explicitly confirmed baseline.
+
+    The previous item-level decisions are journalled so a later safe revert can
+    restore them.  The operation deliberately does not invoke OCR, Vision, an
+    LLM, or any external process.
+    """
+    if confirmed is not True:
+        raise ValueError("explicit baseline confirmation is required")
+    plan = raw_surya_baseline_plan(
+        decisions_path=decisions_path, priority_path=priority_path, book_path=book_path,
+    )
+    priority = load_json(priority_path)
+    book = load_json(book_path)
+    items, pages = _priority_index(priority), _page_index(book)
+    path = Path(decisions_path)
+    document = load_json(path) if path.exists() else empty_decisions(priority_path, book_path)
+    candidates = _baseline_candidates(items, pages, plan["baseline_id"])
+    candidate_hash = _digest(candidates)
+    operations = document.setdefault("baseline_operations", [])
+    if not isinstance(operations, list):
+        raise ValueError("baseline operation journal must be a list")
+    for operation in operations:
+        if operation.get("baseline_id") == plan["baseline_id"] and operation.get("status") == "applied":
+            if _digest(document.get("decisions", [])) == candidate_hash:
+                return {**plan, "applied": False, "already_applied": True}
+            raise ValueError("an active baseline operation was modified; safe revert is unavailable")
+
+    previous = document.get("decisions", [])
+    if not isinstance(previous, list):
+        raise ValueError("review decisions must be a list")
+    operation = {
+        **plan,
+        "status": "applied",
+        "previous_decisions": previous,
+        "previous_decisions_sha256": _digest(previous),
+        "previous_sources": {
+            "priority_source": document.get("priority_source"),
+            "book_source": document.get("book_source"),
+        },
+    }
+    document["priority_source"] = {"filename": Path(priority_path).name, "sha256": plan["source"]["priority_sha256"]}
+    document["book_source"] = {"filename": Path(book_path).name, "sha256": plan["source"]["book_sha256"]}
+    document["decisions"] = candidates
+    document["raw_ocr_baseline"] = {
+        "schema_version": "1.0", "baseline_id": plan["baseline_id"], "action": BASELINE_ACTION,
+        "policy": plan["policy"], "item_count": plan["item_count"],
+    }
+    operations.append(operation)
+    atomic_write_json(path, document)
+    return {**plan, "applied": True, "already_applied": False}
+
+
+def revert_raw_surya_baseline(*, decisions_path, baseline_id):
+    """Restore pre-baseline decisions only if no later item edit intervened."""
+    path = Path(decisions_path)
+    document = load_json(path)
+    operations = document.get("baseline_operations")
+    if not isinstance(operations, list):
+        raise ValueError("no raw Surya baseline operation was recorded")
+    operation = next((entry for entry in reversed(operations) if entry.get("baseline_id") == baseline_id and entry.get("status") == "applied"), None)
+    if operation is None:
+        raise ValueError("active raw Surya baseline operation was not found")
+    expected = operation.get("generated_decisions_sha256")
+    if expected != _digest(document.get("decisions", [])):
+        raise ValueError("baseline decisions changed after confirmation; refusing unsafe revert")
+    previous = operation.get("previous_decisions")
+    if not isinstance(previous, list):
+        raise ValueError("baseline journal is incomplete")
+    document["decisions"] = previous
+    previous_sources = operation.get("previous_sources", {})
+    for field in ("priority_source", "book_source"):
+        if field in previous_sources:
+            document[field] = previous_sources[field]
+    operation["status"] = "reverted"
+    document["raw_ocr_baseline"] = {"schema_version": "1.0", "status": "reverted", "baseline_id": baseline_id}
+    atomic_write_json(path, document)
+    return {"baseline_id": baseline_id, "reverted": True, "restored_decision_count": len(previous)}
 
 
 def main():

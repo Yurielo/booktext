@@ -160,6 +160,61 @@ class ReviewDecisionTests(unittest.TestCase):
         self.assertTrue((output / "book_final.md").exists())
         self.assertTrue((output / "final_build.json").exists())
 
+    def test_confirmed_raw_surya_baseline_replaces_stale_choices_without_changing_raw_evidence(self):
+        self.record("numeric", "accept_vision")
+        # Simulate an old decision whose anchor can no longer be accepted.
+        document = decisions.load_json(self.decisions_path)
+        document["decisions"][0]["source_anchor"]["page_text_sha256"] = "stale"
+        write_json(self.decisions_path, document)
+        before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in (self.book_path, self.priority_path)}
+        plan = decisions.raw_surya_baseline_plan(
+            decisions_path=self.decisions_path, priority_path=self.priority_path, book_path=self.book_path,
+        )
+        self.assertTrue(plan["requires_confirmation"])
+        self.assertEqual(plan["keep_surya_count"], 5)
+        self.assertEqual(plan["deferred_table_fallback_count"], 1)
+        with self.assertRaisesRegex(ValueError, "explicit baseline confirmation"):
+            decisions.apply_raw_surya_baseline(
+                decisions_path=self.decisions_path, priority_path=self.priority_path, book_path=self.book_path,
+            )
+        result = decisions.apply_raw_surya_baseline(
+            decisions_path=self.decisions_path, priority_path=self.priority_path, book_path=self.book_path, confirmed=True,
+        )
+        self.assertTrue(result["applied"])
+        document = decisions.load_json(self.decisions_path)
+        self.assertEqual(len(document["decisions"]), 6)
+        self.assertEqual(document["decisions"][-1]["action"], "defer")
+        self.assertTrue(all("baseline_provenance" in entry for entry in document["decisions"]))
+        _, _, report = self.build()
+        self.assertEqual(report["stale_or_conflict_count"], 0)
+        self.assertEqual(report["applied_text_changes"], 0)
+        self.assertEqual(before, {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in before})
+        # Calling a confirmed operation again is idempotent, rather than
+        # duplicating item decisions.
+        repeat = decisions.apply_raw_surya_baseline(
+            decisions_path=self.decisions_path, priority_path=self.priority_path, book_path=self.book_path, confirmed=True,
+        )
+        self.assertTrue(repeat["already_applied"])
+
+    def test_raw_surya_baseline_revert_fails_after_later_edit_and_is_safe_otherwise(self):
+        result = decisions.apply_raw_surya_baseline(
+            decisions_path=self.decisions_path, priority_path=self.priority_path, book_path=self.book_path, confirmed=True,
+        )
+        baseline_id = result["baseline_id"]
+        # An intervening change must not be silently deleted by a revert.
+        self.record("numeric", "manual", "one half", replace=True)
+        with self.assertRaisesRegex(ValueError, "changed after confirmation"):
+            decisions.revert_raw_surya_baseline(decisions_path=self.decisions_path, baseline_id=baseline_id)
+
+        # A fresh baseline can safely restore an empty pre-baseline document.
+        self.decisions_path.unlink()
+        fresh = decisions.apply_raw_surya_baseline(
+            decisions_path=self.decisions_path, priority_path=self.priority_path, book_path=self.book_path, confirmed=True,
+        )
+        reverted = decisions.revert_raw_surya_baseline(decisions_path=self.decisions_path, baseline_id=fresh["baseline_id"])
+        self.assertTrue(reverted["reverted"])
+        self.assertEqual(decisions.load_json(self.decisions_path)["decisions"], [])
+
 
 def _canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
