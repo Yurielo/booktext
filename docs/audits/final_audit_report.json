@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "booktext.final_audit_report",
+  "audit_issue": 105,
+  "audited_code_sha": "fa98c3c1570d7c9bd3f463d7f09df66c0f90696e",
+  "audited_at": "2026-09-30",
+  "environment": {
+    "booktext_version": "0.1.0",
+    "machine_protocol_version": "1.0",
+    "platform": "macOS 26.5.2 arm64"
+  },
+  "decision": "PASS",
+  "open_p0_p1_blockers": [],
+  "tests": {
+    "command": "python3 -m unittest discover -s tests -v",
+    "passed": 150,
+    "status": "PASS"
+  },
+  "native_app": {
+    "build": "PASS",
+    "protocol_tests": "PASS",
+    "codesign_strict": "PASS",
+    "launchservices_launch": "PASS"
+  },
+  "gates": {
+    "gate_1_build_regression": "PASS",
+    "gate_2_normal_workflow": {
+      "status": "PASS",
+      "source_pages": 7,
+      "cdm_blocks": 87,
+      "exports": ["markdown", "html", "docx", "epub", "pdf"]
+    },
+    "gate_3_difficult_document": {
+      "status": "PASS",
+      "source_pages": 2,
+      "blocking_fix": {"issue": 106, "pr": 107},
+      "figure_only_page_safe": true,
+      "review_decisions_exercised": ["keep_surya", "accept_vision", "manual"]
+    },
+    "gate_4_resumable_long_run": {
+      "status": "PASS",
+      "source_pages": 28,
+      "processed_pages": 28,
+      "failed_pages": 0,
+      "chunks": 4,
+      "chunk_ranges": [[1, 8], [9, 16], [17, 24], [25, 28]],
+      "resumed_after_controlled_interruption": true,
+      "ordered_raw_pages": 28,
+      "cdm_blocks": 211,
+      "checkpoint_compaction": "PASS",
+      "lifecycle_fix": {"issue": 108, "pr": 109},
+      "owned_orphan_descendants_after_interrupt_or_completion": 0
+    }
+  },
+  "post_audit_cleanup_issue": 104
+}
