@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from tools.review_priority import PRIORITIES, prioritise_review, priority_text
 from tools.review_clusters import build_clusters
 from tools import document_identity
 from tools.owned_workspace import OwnedWorkspace
+from tools import chunk_lifecycle
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -241,7 +243,7 @@ def render_djvu_page(source, page_number, destination, temp_dir):
     preprocess_image(raw, destination)
 
 
-def prepare_pages(sources, pages_dir, temp_dir, include_spec, exclude_spec):
+def prepare_pages(sources, pages_dir, temp_dir, include_spec, exclude_spec, *, reuse_existing=False):
     first = sources[0]
 
     if len(sources) > 1:
@@ -256,8 +258,11 @@ def prepare_pages(sources, pages_dir, temp_dir, include_spec, exclude_spec):
         for position in selected:
             image_source = sources[position - 1]
             destination = pages_dir / f"page-{position:04d}.png"
-            print(f"Подготовка изображения {position}: {image_source.name}")
-            preprocess_image(image_source, destination)
+            if reuse_existing and destination.is_file() and destination.stat().st_size:
+                print(f"Повторное использование подготовленного изображения {position}: {image_source.name}")
+            else:
+                print(f"Подготовка изображения {position}: {image_source.name}")
+                preprocess_image(image_source, destination)
             pages.append((position, destination))
 
         return pages, len(sources)
@@ -271,8 +276,11 @@ def prepare_pages(sources, pages_dir, temp_dir, include_spec, exclude_spec):
 
         for page_number in selected:
             destination = pages_dir / f"page-{page_number:04d}.png"
-            print(f"Подготовка PDF-страницы {page_number}/{total}")
-            render_pdf_page(first, page_number, destination, temp_dir)
+            if reuse_existing and destination.is_file() and destination.stat().st_size:
+                print(f"Повторное использование подготовленной PDF-страницы {page_number}/{total}")
+            else:
+                print(f"Подготовка PDF-страницы {page_number}/{total}")
+                render_pdf_page(first, page_number, destination, temp_dir)
             pages.append((page_number, destination))
 
         return pages, total
@@ -284,8 +292,11 @@ def prepare_pages(sources, pages_dir, temp_dir, include_spec, exclude_spec):
 
         for page_number in selected:
             destination = pages_dir / f"page-{page_number:04d}.png"
-            print(f"Подготовка DjVu-страницы {page_number}/{total}")
-            render_djvu_page(first, page_number, destination, temp_dir)
+            if reuse_existing and destination.is_file() and destination.stat().st_size:
+                print(f"Повторное использование подготовленной DjVu-страницы {page_number}/{total}")
+            else:
+                print(f"Подготовка DjVu-страницы {page_number}/{total}")
+                render_djvu_page(first, page_number, destination, temp_dir)
             pages.append((page_number, destination))
 
         return pages, total
@@ -296,7 +307,8 @@ def prepare_pages(sources, pages_dir, temp_dir, include_spec, exclude_spec):
             raise RuntimeError("Для одиночного изображения доступна только страница 1.")
 
         destination = pages_dir / "page-0001.png"
-        preprocess_image(first, destination)
+        if not (reuse_existing and destination.is_file() and destination.stat().st_size):
+            preprocess_image(first, destination)
         return [(1, destination)], 1
 
     raise RuntimeError(f"Формат {extension} пока не поддерживается.")
@@ -914,13 +926,11 @@ def _load_json_object(path, default):
     return value if isinstance(value, dict) else default
 
 
-def _batch_size_for_pages(page_count):
-    """Conservative automatic start; no user-selected batch parameter exists."""
-    if page_count <= 0:
-        return 1
-    # Small jobs should remain a single light-weight invocation.  Larger jobs
-    # start at ten source pages and can only downshift automatically.
-    return min(10, page_count)
+def _batch_size_for_pages(page_count, explicit_size=None):
+    """Compatibility wrapper for the persisted AUTO chunk planning policy."""
+    if explicit_size is not None:
+        return int(explicit_size)
+    return chunk_lifecycle.auto_chunk_size(page_count, operation="surya_ocr")
 
 
 def _is_resource_failure(error):
@@ -939,12 +949,13 @@ def _surya_payload_from_dir(directory):
     return merged
 
 
-def recognize_pages_surya(pages, output_dir, temp_dir):
-    """Run Surya in adaptive, checkpointed page batches and merge raw evidence.
+def recognize_pages_surya(pages, output_dir, temp_dir, *, chunk_size=None,
+                          source_fingerprint=None, event_callback=None):
+    """Run Surya in sequential, resumable persisted processing chunks.
 
-    The logical book is never split: page identities and raw payloads are
-    merged into one results.json.  A later invocation resumes only pages with
-    no completed, readable payload.
+    The chunk plan controls computation and lifecycle only.  Raw Surya evidence
+    remains a single canonical page-keyed artifact, so chunks never become a
+    semantic or publication boundary.
     """
     if not pages:
         return {}
@@ -954,66 +965,130 @@ def recognize_pages_surya(pages, output_dir, temp_dir):
     raw_dir.mkdir(exist_ok=True)
     results_path, checkpoint_path = raw_dir / "results.json", raw_dir / "batch_checkpoint.json"
     merged = _load_json_object(results_path, {})
-    checkpoint = _load_json_object(checkpoint_path, {"schema_version": "1.0", "artifact_type": "booktext.adaptive_batch_checkpoint", "completed_pages": [], "events": []})
-    completed = set(checkpoint.get("completed_pages", []))
     selected = [number for number, _page in pages]
-    # A checkpoint alone is insufficient: raw page evidence must exist too.
-    completed = {number for number in completed if f"page-{number:04d}" in merged}
-    pending = [(number, page) for number, page in pages if number not in completed]
-    batch_size = _batch_size_for_pages(len(pending))
-    checkpoint["initial_batch_size"] = batch_size
+    root = output_dir.parent
+    fingerprint = source_fingerprint or hashlib.sha256(
+        ",".join(str(number) for number in selected).encode("ascii")
+    ).hexdigest()
+    job_id = "ocr-" + fingerprint[:20]
+    plan = chunk_lifecycle.create_or_load_plan(
+        root, job_id=job_id, source_fp=fingerprint, operation="surya_ocr",
+        page_numbers=selected, options={"engine": "surya", "raw_schema": "page-keyed-v1"},
+        chunk_size=chunk_size,
+    )
+    # A staged OCR input plus its result can be substantially larger than the
+    # source page.  The estimate is conservative and scoped to this managed
+    # job; it prevents beginning a chunk that is likely to fill the volume.
+    budget = chunk_lifecycle.disk_budget(root, estimated_transient_bytes=plan["chunk_size"] * 50 * 1024 * 1024)
+    if not budget["ok"]:
+        if event_callback:
+            event_callback("cleanup_warning", {"kind": "disk_budget", **budget})
+        raise RuntimeError("insufficient managed-workspace disk budget for the next OCR chunk")
+    checkpoint = _load_json_object(checkpoint_path, {
+        "schema_version": "1.0", "artifact_type": "booktext.adaptive_batch_checkpoint", "completed_pages": [], "events": []
+    })
+    checkpoint["chunk_plan"] = str(chunk_lifecycle.plan_path(root).resolve().relative_to(root.resolve()))
+    checkpoint["initial_batch_size"] = plan["chunk_size"]
     checkpoint["events"] = checkpoint.get("events", [])
+    if event_callback:
+        event_callback("chunk_plan_created", {"chunks": len(plan["chunks"]), "pages": len(selected), "chunk_size": plan["chunk_size"], "mode": plan["mode"]})
+        if any(chunk.get("status") == "complete" for chunk in plan["chunks"]):
+            event_callback("job_resumed", {"completed_chunks": sum(chunk.get("status") == "complete" for chunk in plan["chunks"]), "total_chunks": len(plan["chunks"])})
     texts = {}
-    for number, _page in pages:
-        data = merged.get(f"page-{number:04d}")
-        result = data[0] if isinstance(data, list) and data else data
-        text = _surya_page_text(result if isinstance(result, dict) else {})
-        if number in completed and text:
-            texts[number] = text
-    position = 0
-    while position < len(pending):
-        batch = pending[position:position + batch_size]
-        batch_pages = [number for number, _page in batch]
-        batch_dir = temp_dir / f"surya-batch-{batch_pages[0]:04d}-{batch_pages[-1]:04d}-{uuid.uuid4().hex}"
-        try:
-            # Isolate staged input as well as the Surya child output; otherwise
-            # a later batch could accidentally see image files from an earlier
-            # batch in the shared temporary directory.
-            batch_texts = _recognize_pages_surya_batch(batch, batch_dir, batch_dir)
-            batch_payload = _surya_payload_from_dir(batch_dir)
-            expected = {f"page-{number:04d}" for number in batch_pages}
-            if set(batch_payload) != expected:
-                raise RuntimeError("Surya batch payload is incomplete or contains unexpected pages")
-        except Exception as error:
-            shutil.rmtree(batch_dir, ignore_errors=True)
-            if batch_size > 1 and _is_resource_failure(error):
-                reduced = max(1, min(5, batch_size // 2))
-                checkpoint["events"].append({"kind": "automatic_batch_downshift", "from": batch_size, "to": reduced, "pages": batch_pages, "reason": str(error)})
-                batch_size = reduced
+    page_map = dict(pages)
+    for chunk in plan["chunks"]:
+        batch_pages = chunk["owned_pages"]
+        checkpoint_payload = (
+            chunk_lifecycle.valid_checkpoint(root, chunk)
+            or chunk_lifecycle.valid_compacted_checkpoint(merged, chunk)
+        )
+        if checkpoint_payload is not None:
+            merged.update(checkpoint_payload)
+            for number in batch_pages:
+                result = checkpoint_payload[f"page-{number:04d}"]
+                result = result[0] if isinstance(result, list) and result else result
+                texts[number] = _surya_page_text(result if isinstance(result, dict) else {})
+            if event_callback:
+                event_callback("chunk_completed", {"chunk_id": chunk["chunk_id"], "pages": batch_pages, "resumed": True})
+            continue
+        chunk_lifecycle.begin_attempt(root, plan, chunk)
+        if event_callback:
+            event_callback("chunk_started", {"chunk_id": chunk["chunk_id"], "pages": batch_pages, "current": len(texts), "total": len(selected)})
+        batch = [(number, page_map[number]) for number in batch_pages]
+        batch_size = len(batch)
+        batch_payload = {}
+        chunk_texts = {}
+        started = time.monotonic()
+        position = 0
+        while position < len(batch):
+            attempt = batch[position:position + batch_size]
+            attempt_pages = [number for number, _page in attempt]
+            batch_dir = temp_dir / f"surya-batch-{attempt_pages[0]:04d}-{attempt_pages[-1]:04d}-{uuid.uuid4().hex}"
+            if event_callback:
+                event_callback("chunk_progress", {"chunk_id": chunk["chunk_id"], "pages": attempt_pages, "current": position, "total": len(batch)})
+            try:
+                # Isolate staged input as well as the Surya child output.
+                attempt_texts = _recognize_pages_surya_batch(attempt, batch_dir, batch_dir)
+                attempt_payload = _surya_payload_from_dir(batch_dir)
+                expected = {f"page-{number:04d}" for number in attempt_pages}
+                if set(attempt_payload) != expected:
+                    raise RuntimeError("Surya batch payload is incomplete or contains unexpected pages")
+            except Exception as error:
+                shutil.rmtree(batch_dir, ignore_errors=True)
+                if batch_size > 1 and _is_resource_failure(error):
+                    reduced = max(1, min(5, batch_size // 2))
+                    checkpoint["events"].append({"kind": "automatic_batch_downshift", "from": batch_size, "to": reduced, "pages": attempt_pages, "reason": str(error)})
+                    batch_size = reduced
+                    _atomic_json(checkpoint_path, checkpoint)
+                    if event_callback:
+                        event_callback("chunk_retry", {"chunk_id": chunk["chunk_id"], "pages": attempt_pages, "reason": str(error), "next_batch_size": reduced})
+                    continue
+                chunk_lifecycle.fail_attempt(root, plan, chunk, error)
+                checkpoint["last_failure"] = {"pages": attempt_pages, "reason": str(error)}
                 _atomic_json(checkpoint_path, checkpoint)
-                continue
-            checkpoint["last_failure"] = {"pages": batch_pages, "reason": str(error)}
-            _atomic_json(checkpoint_path, checkpoint)
+                if event_callback:
+                    event_callback("chunk_failed", {"chunk_id": chunk["chunk_id"], "pages": attempt_pages, "reason": str(error)})
+                raise
+            finally:
+                shutil.rmtree(batch_dir, ignore_errors=True)
+            batch_payload.update(attempt_payload)
+            chunk_texts.update(attempt_texts)
+            position += len(attempt)
+        try:
+            manifest = chunk_lifecycle.commit_checkpoint(
+                root, plan, chunk, batch_payload,
+                duration_seconds=round(time.monotonic() - started, 3),
+                diagnostics={"attempts": chunk["attempts"]},
+            )
+        except Exception as error:
+            chunk_lifecycle.fail_attempt(root, plan, chunk, error)
             raise
-        finally:
-            shutil.rmtree(batch_dir, ignore_errors=True)
         for key, value in batch_payload.items():
             if key in merged:
-                raise RuntimeError(f"duplicate completed page in adaptive batch merge: {key}")
+                # An already-merged raw page can only be reused if byte-for-byte
+                # equivalent. This prevents silent duplicate canonical pages.
+                if chunk_lifecycle.result_fingerprint({key: merged[key]}) != chunk_lifecycle.result_fingerprint({key: value}):
+                    raise RuntimeError(f"duplicate completed page in chunk merge: {key}")
             merged[key] = value
-        texts.update(batch_texts)
-        completed.update(batch_pages)
-        checkpoint["completed_pages"] = sorted(completed)
+        texts.update(chunk_texts)
+        checkpoint["completed_pages"] = sorted(texts)
         checkpoint["last_completed_batch"] = batch_pages
-        checkpoint["current_batch_size"] = batch_size
+        checkpoint["current_batch_size"] = plan["chunk_size"]
         _atomic_json(results_path, {key: merged[key] for key in sorted(merged)})
         _atomic_json(checkpoint_path, checkpoint)
-        position += len(batch)
+        if event_callback:
+            event_callback("chunk_completed", {"chunk_id": chunk["chunk_id"], "pages": batch_pages, "duration_seconds": manifest["duration_seconds"], "resumed": False})
     if set(texts) != set(selected):
         missing = sorted(set(selected) - set(texts))
         raise RuntimeError("missing completed Surya pages after adaptive batching: " + ", ".join(map(str, missing)))
+    validation = {"expected_pages": selected, "completed_pages": sorted(texts), "unique": len(merged) == len(set(merged))}
+    if event_callback:
+        event_callback("assembly_started", {"pages": len(selected)})
+    chunk_lifecycle.mark_assembly(root, plan, complete=True, validation=validation)
+    if event_callback:
+        event_callback("assembly_completed", validation)
     checkpoint["status"] = "complete"
-    checkpoint["completed_pages"] = sorted(completed)
+    checkpoint["completed_pages"] = sorted(texts)
     _atomic_json(checkpoint_path, checkpoint)
     return texts
 
@@ -1554,6 +1629,19 @@ def main():
     )
 
     parser.add_argument(
+        "--chunk-size",
+        type=int,
+        help=(
+            "Размер persisted processing chunk в страницах (1–100). "
+            "По умолчанию AUTO: обычно 8, меньше для тяжёлых страниц."
+        ),
+    )
+
+    # Used only by the versioned machine adapter.  Human CLI output remains
+    # readable; machine mode converts these records to protocol JSONL.
+    parser.add_argument("--machine-events", action="store_true", help=argparse.SUPPRESS)
+
+    parser.add_argument(
         "--region-map",
         type=Path,
         help=(
@@ -1605,6 +1693,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.chunk_size is not None and not 1 <= args.chunk_size <= 100:
+        parser.error("--chunk-size должен быть в диапазоне от 1 до 100")
 
     sources = [Path(x).expanduser().resolve() for x in args.sources]
 
@@ -1685,6 +1776,23 @@ def main():
     work_dir.mkdir(exist_ok=True)
     tables_dir.mkdir(exist_ok=True)
 
+    source_chunk_fingerprint = None
+    reuse_prepared_pages = False
+    if args.ocr == "surya":
+        # Reuse only images bound to an existing plan for exactly this source.
+        # This avoids repeated page rendering/file-provider churn during resume,
+        # while a changed source always renders fresh pages and fails stale.
+        source_chunk_fingerprint = chunk_lifecycle.source_fingerprint(sources)
+        try:
+            existing_plan = json.loads(chunk_lifecycle.plan_path(output_dir).read_text(encoding="utf-8"))
+            reuse_prepared_pages = (
+                isinstance(existing_plan, dict)
+                and existing_plan.get("source_fingerprint") == source_chunk_fingerprint
+                and existing_plan.get("operation") == "surya_ocr"
+            )
+        except (OSError, json.JSONDecodeError):
+            pass
+
     markdown_path = output_dir / "book.md"
     text_path = output_dir / "book_clean.txt"
     json_path = output_dir / "book.json"
@@ -1727,6 +1835,7 @@ def main():
                 temp_dir,
                 args.pages,
                 args.exclude_pages,
+                reuse_existing=reuse_prepared_pages,
             )
         except RuntimeError as error:
             print(f"Ошибка: {error}")
@@ -1787,11 +1896,18 @@ def main():
 
         if args.ocr == "surya":
             try:
+                def emit_chunk_event(kind, details):
+                    if args.machine_events:
+                        print("BOOKTEXT_CHUNK_EVENT " + json.dumps({"kind": kind, "details": details}, ensure_ascii=False, sort_keys=True), flush=True)
+
                 surya_texts = recognize_pages_surya(
                     [(page_number, page_work[page_number]["ocr_page"])
                      for page_number, _page in pages],
                     surya_dir,
                     temp_dir,
+                    chunk_size=args.chunk_size,
+                    source_fingerprint=source_chunk_fingerprint,
+                    event_callback=emit_chunk_event,
                 )
                 adaptive_batching = _load_json_object(
                     surya_dir / "surya-input" / "batch_checkpoint.json", None
@@ -2037,6 +2153,20 @@ def main():
     )
     document_identity.register_deliverable(output_dir, "book_clean.txt", "OCR text")
     document_identity.register_deliverable(output_dir, "book.md", "OCR Markdown")
+
+    # The final raw Surya result is now canonical evidence and all BookText
+    # artifacts have been committed.  Compact only verified per-chunk payloads;
+    # manifests and canonical raw evidence remain available for audit.
+    chunk_cleanup = None
+    if args.ocr == "surya":
+        try:
+            if args.machine_events:
+                print("BOOKTEXT_CHUNK_EVENT " + json.dumps({"kind": "cleanup_started", "details": {}}, ensure_ascii=False, sort_keys=True), flush=True)
+            chunk_cleanup = chunk_lifecycle.compact(output_dir)
+            if args.machine_events:
+                print("BOOKTEXT_CHUNK_EVENT " + json.dumps({"kind": "cleanup_completed", "details": chunk_cleanup}, ensure_ascii=False, sort_keys=True), flush=True)
+        except chunk_lifecycle.ChunkPlanError as error:
+            print(f"Предупреждение: chunk cleanup пропущен: {error}")
 
     # Убираем временную рабочую папку.
     shutil.rmtree(work_dir, ignore_errors=True)
