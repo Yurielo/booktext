@@ -77,6 +77,17 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual("needs_numeric_review", number_entry["status"])
         self.assertEqual("FAIL", number_entry["validation"]["numeric_tokens"])
 
+    @mock.patch("tools.translation.urllib.request.urlopen")
+    def test_ollama_translation_disables_reasoning_and_records_setting(self, urlopen):
+        response = mock.MagicMock()
+        response.read.return_value = b'{"message":{"content":"{\\\"translation\\\": \\\"\\u041f\\u0440\\u0438\\u0432\\u0435\\u0442\\\"}"}}'
+        urlopen.return_value.__enter__.return_value = response
+        translated, settings = translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+        self.assertEqual("Привет", translated)
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertFalse(payload["think"])
+        self.assertFalse(settings["thinking"])
+
     def test_direction_and_glossary_validation_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "direction"):
             translation.translate_document(self.root, source_language="en", target_language="en", provider="ollama", model="test-model")

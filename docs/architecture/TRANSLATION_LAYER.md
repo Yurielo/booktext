@@ -23,6 +23,10 @@ terms to required target terms and is fingerprinted in the result.
 or another local client. `booktext machine translation-validate …` checks an
 existing result only and never contacts Ollama.
 
+BookText asks thinking-capable local models for a non-reasoning response
+(`think: false`): translation requires the rendered block, not an internal
+reasoning trace. This setting is stored in the per-block provider provenance.
+
 ## Artifacts and safety
 
 For EN→RU, BookText writes:
