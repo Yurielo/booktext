@@ -29,9 +29,25 @@ import BookTextCore
     private var bridge: CoreProcessBridge?
     private var startedAt: Date?
     private var preflightGeneration = 0
+    private var didRecoverLastOutput = false
 
     var elapsed: String { guard let startedAt else { return "" }; return "Elapsed \(Int(Date().timeIntervalSince(startedAt)))s" }
     func addFiles(_ urls: [URL]) { sourceURLs = urls; ready = false; result = [:]; errorText = ""; preflight() }
+    /// Restores only a previously completed local output.  This is deliberately
+    /// an `inspect` operation: it never resumes or repeats OCR/model work.
+    func recoverLastOutputIfNeeded() {
+        guard !didRecoverLastOutput else { return }
+        didRecoverLastOutput = true
+        guard let path = UserDefaults.standard.string(forKey: "booktext.last.output"),
+              !path.isEmpty,
+              !path.contains("\0") else { return }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              FileManager.default.fileExists(atPath: url.appendingPathComponent("book.json").path) else { return }
+        inspect(url)
+    }
     func preflight() {
         preflightGeneration += 1
         let generation = preflightGeneration
@@ -158,7 +174,7 @@ struct ContentView: View {
         } }
         status
         Spacer()
-    }.padding(24).sheet(isPresented: $model.reviewPresented) { if let output = model.outputURL { NativeReviewView(outputURL: output, configuration: CoreConfiguration(scriptPath: model.corePath)) } }.sheet(isPresented: $model.finalPresented) { if let output = model.outputURL { FinalBookView(outputURL: output, configuration: CoreConfiguration(scriptPath: model.corePath)) } } }
+    }.padding(24).task { model.recoverLastOutputIfNeeded() }.sheet(isPresented: $model.reviewPresented) { if let output = model.outputURL { NativeReviewView(outputURL: output, configuration: CoreConfiguration(scriptPath: model.corePath)) } }.sheet(isPresented: $model.finalPresented) { if let output = model.outputURL { FinalBookView(outputURL: output, configuration: CoreConfiguration(scriptPath: model.corePath)) } } }
     @ViewBuilder var status: some View {
         switch model.presentation.state {
         case .idle: Text("Choose an input to begin.")
