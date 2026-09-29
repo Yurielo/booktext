@@ -71,5 +71,25 @@ class ExportDocumentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing structured"):
             export_document(self.root, ["markdown"])
 
+    def test_docx_preserves_source_page_facsimiles_when_no_figures_were_classified(self):
+        self.document["blocks"] = [block for block in self.document["blocks"] if block["type"] != "figure"]
+        self.document["blocks"].insert(0, {"block_id": "break", "type": "page_break", "reading_order": 0, "provenance": {"source_page": 1}})
+        for order, block in enumerate(self.document["blocks"], start=1):
+            block["reading_order"] = order
+        (self.root / "pages").mkdir()
+        (self.root / "pages/page-0001.png").write_bytes(PNG)
+        for source_page in self.document["source_pages"]:
+            if source_page["source_page"] == 1:
+                source_page["prepared_page"] = "pages/page-0001.png"
+        write(self.root / "book_document.json", self.document)
+        manifest = export_document(self.root, ["docx"])
+        with zipfile.ZipFile(self.root / "exports/book.docx") as archive:
+            self.assertTrue(any(name.startswith("word/media/") for name in archive.namelist()))
+        self.assertEqual(manifest["visual_preservation"], {
+            "mode": "source_page_facsimile_fallback", "source_page_facsimile_count": 1,
+            "policy": "Source-page facsimiles are page provenance only, never inferred figures or captions.",
+        })
+        self.assertTrue((self.root / "exports/assets/source-page-0001.png").is_file())
+
 
 if __name__ == "__main__": unittest.main()
