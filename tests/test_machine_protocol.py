@@ -66,6 +66,25 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertEqual(1, len(result["blocks"]))
             self.assertEqual(before, (root / "book_document.json").read_bytes())
 
+    def test_document_preview_exposes_only_verified_structured_table_cells(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            (root / "tables").mkdir()
+            (root / "tables" / "page-0001-table-01.json").write_text(json.dumps({"grid": [["H"], ["1"]]}), encoding="utf-8")
+            (root / "tables" / "page-0001-table-01.tsv").write_text("H\n1\n", encoding="utf-8")
+            (root / "tables" / "page-0001-table-01.html").write_text("<table><tr><td>H</td></tr></table>", encoding="utf-8")
+            book = json.loads((root / "book.json").read_text(encoding="utf-8"))
+            book["pages"][0]["tables"] = {"tables": [{"index": 1, "status": "HTML_TABLE", "rows": 2, "columns": 1, "json": "page-0001-table-01.json", "tsv": "page-0001-table-01.tsv", "html": "page-0001-table-01.html"}]}
+            (root / "book.json").write_text(json.dumps(book), encoding="utf-8")
+            (root / "surya" / "surya-input").mkdir(parents=True)
+            (root / "surya" / "surya-input" / "results.json").write_text(json.dumps({"pages": [{"page": 1, "blocks": [{"label": "Table", "reading_order": 1}]}]}), encoding="utf-8")
+            code, payload = events(lambda: protocol.main(["cdm", str(root)]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            code, payload = events(lambda: protocol.main(["document-preview", str(root), "--index", "0", "--limit", "10"]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            table = next(block for block in payload[-1]["details"]["result"]["blocks"] if block["type"] == "table")
+            self.assertEqual([["H"], ["1"]], table["table_preview"])
+
     def test_decision_and_final_build_use_existing_decision_semantics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.fixture(temporary)
