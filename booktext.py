@@ -19,6 +19,7 @@ from pathlib import Path
 from tools.process_lifecycle import LifecycleRegistry
 from tools.review_priority import PRIORITIES, prioritise_review, priority_text
 from tools.review_clusters import build_clusters
+from tools import document_identity
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -316,6 +317,7 @@ def run_native_text_pdf(source, args, started_at):
     selected = choose_pages(total, args.pages, args.exclude_pages)
     output_dir = source.parent / f"{source.stem}_book"
     output_dir.mkdir(parents=True, exist_ok=True)
+    identity = document_identity.initialize(output_dir, [source])
     images_dir = output_dir / "images"
     images_dir.mkdir(exist_ok=True)
     records = []
@@ -348,6 +350,7 @@ def run_native_text_pdf(source, args, started_at):
     markdown_path.write_text("# " + source.stem + "\n\nNative PDF text only. Images and figures were not OCR-processed.\n" + "".join(f"\n## Страница {record['page']}\n\n{record['text'] or '_Embedded text not found on this page._'}\n" for record in records), encoding="utf-8")
     json_path.write_text(json.dumps({
         "sources": [str(source)], "ocr_engine": "native_pdf_text", "ocr_performed": False,
+        "document": {"title": identity["title"], "identity_artifact": document_identity.FILENAME},
         "native_text_only": True,
         "limitations": ["Text inside images, scans, and figures was intentionally not extracted; embedded PDF images are preserved without OCR."],
         "qa_enabled": False, "qa_pages": [], "pages_filter": args.pages,
@@ -359,6 +362,8 @@ def run_native_text_pdf(source, args, started_at):
     summary = build_run_summary(records, total, time.monotonic() - started_at, [], [], priority, clusters, ocr_engine="native_pdf_text", qa_enabled=False)
     summary["native_text_only"] = {"enabled": True, "ocr_processes_started": [], "limitation": "Images and figures were not OCR-processed; extractable embedded PDF images were preserved as source assets."}
     (output_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    document_identity.register_deliverable(output_dir, "book_clean.txt", "OCR text")
+    document_identity.register_deliverable(output_dir, "book.md", "OCR Markdown")
     print(f"Папка результата: {output_dir}")
     return output_dir
 
@@ -1673,6 +1678,7 @@ def main():
     work_dir = output_dir / ".work"
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    identity = document_identity.initialize(output_dir, sources)
     pages_dir.mkdir(exist_ok=True)
     images_dir.mkdir(exist_ok=True)
     descriptions_dir.mkdir(exist_ok=True)
@@ -1970,6 +1976,7 @@ def main():
         json.dumps(
             {
                 "sources": [str(x) for x in sources],
+                "document": {"title": identity["title"], "identity_artifact": document_identity.FILENAME},
                 "ocr_engine": args.ocr,
                 "ocr_languages": args.lang,
                 "vision_model": args.model,
@@ -2027,6 +2034,8 @@ def main():
         json.dumps(run_summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    document_identity.register_deliverable(output_dir, "book_clean.txt", "OCR text")
+    document_identity.register_deliverable(output_dir, "book.md", "OCR Markdown")
 
     # Убираем временную рабочую папку.
     shutil.rmtree(work_dir, ignore_errors=True)

@@ -215,10 +215,13 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                  "provenance": {**page_ref, "visual_index": visual.get("index"), "visual_type": visual.get("type"), "bbox": visual.get("bbox")}})
         add({"block_id": _stable_id("break", f"{document_id}:{page}"), "type": "page_break", "provenance": page_ref})
     unresolved = final_report.get("unresolved_priority_counts", {})
+    source_document = book.get("document") if isinstance(book.get("document"), dict) else {}
+    source_files = [Path(value).name for value in book.get("sources", []) if isinstance(value, str)]
+    document_title = source_document.get("title") or (Path(source_files[0]).stem if source_files else None)
     document = {
         "schema_version": SCHEMA_VERSION, "artifact_type": ARTIFACT_TYPE, "document_id": document_id,
-        "metadata": {"title": None, "author": None, "booktext_version": booktext_version, "source_page_count": len(pages), "languages": book.get("ocr_languages"), "ocr_engine": book.get("ocr_engine"), "source_files": [Path(value).name for value in book.get("sources", []) if isinstance(value, str)], "build_policy": "existing artifacts only; no OCR or model inference"},
-        "source": {"book_json": {"path": "book.json", "sha256": _hash_file(book_path)}, "review_priority": {"path": "review_priority.json", "sha256": _hash_file(priority_path)}, "review_decisions": {"path": decisions_path.name, "sha256": _hash_file(decisions_path) if decisions_path.is_file() else None}},
+        "metadata": {"title": document_title, "author": None, "booktext_version": booktext_version, "source_page_count": len(pages), "languages": book.get("ocr_languages"), "ocr_engine": book.get("ocr_engine"), "source_files": source_files, "build_policy": "existing artifacts only; no OCR or model inference"},
+        "source": {"book_json": {"path": "book.json", "sha256": _hash_file(book_path)}, "document_identity": {"path": source_document.get("identity_artifact"), "title": document_title}, "review_priority": {"path": "review_priority.json", "sha256": _hash_file(priority_path)}, "review_decisions": {"path": decisions_path.name, "sha256": _hash_file(decisions_path) if decisions_path.is_file() else None}},
         "review": {"final_build": {"decision_status_counts": final_report.get("decision_status_counts", {}), "applied_text_changes": final_report.get("applied_text_changes", 0), "stale_or_conflict_count": final_report.get("stale_or_conflict_count", 0)}, "unresolved_priority_counts": {"HIGH": unresolved.get("HIGH", 0), "MEDIUM": unresolved.get("MEDIUM", 0)}},
         "source_pages": source_pages, "blocks": blocks, "notes": [], "warnings": warnings,
     }

@@ -45,6 +45,8 @@ class ExportDocumentTests(unittest.TestCase):
         manifest = export_document(self.root, ["all"])
         self.assertEqual(before, (self.root / "book_document.json").read_bytes())
         self.assertEqual(set(manifest["generated"]), {"markdown","html","docx","epub","pdf"})
+        self.assertTrue(manifest["generated"]["docx"]["named_deliverable"].startswith("deliverables/"))
+        self.assertTrue((self.root / manifest["generated"]["docx"]["named_deliverable"]).is_file())
         self.assertEqual(manifest["fallback_unknown_counts"], {"unknown":1,"fallback_tables":1})
         markdown = (self.root / "exports/book.md").read_text(encoding="utf-8")
         html = (self.root / "exports/book.html").read_text(encoding="utf-8")

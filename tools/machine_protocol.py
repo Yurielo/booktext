@@ -102,7 +102,7 @@ def artifact_map(root):
         "review_text": "review_priority.txt", "clusters": "review_clusters.json", "decisions": "review_decisions.json",
         "final_build": "final_build.json", "final_text": "book_final.txt", "final_markdown": "book_final.md",
         "cdm": "book_document.json", "exports": "exports/export_manifest.json", "book_manifest": "book.json",
-        "clean_text": "book_clean.txt", "markdown": "book.md", "page_images": "pages", "images": "images", "descriptions": "descriptions",
+        "clean_text": "book_clean.txt", "markdown": "book.md", "document_identity": "document_identity.json", "deliverables": "deliverables", "page_images": "pages", "images": "images", "descriptions": "descriptions",
     }
     return {name: {"path": value, "exists": (root / value).exists()} for name, value in candidates.items()}
 
