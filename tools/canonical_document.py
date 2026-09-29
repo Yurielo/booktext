@@ -20,6 +20,7 @@ from tools import review_decisions
 SCHEMA_VERSION = "1.0"
 ARTIFACT_TYPE = "booktext.canonical_document"
 BLOCK_TYPES = {"heading", "paragraph", "list", "table", "figure", "caption", "page_break", "unknown"}
+NON_PUBLICATION_LAYOUT_LABELS = {"pageheader", "pagefooter", "pagenumber"}
 
 
 def _hash_bytes(value):
@@ -104,6 +105,53 @@ def _type_for_label(label):
     return "unknown"
 
 
+def _is_running_matter(label):
+    """True only for layout-labelled running heads, feet, and page numbers.
+
+    This deliberately does not include ``SectionHeader``/``Header``: those
+    can be authorial chapter and section titles and must remain in the book.
+    """
+    return str(label or "").replace("_", "").replace("-", "").casefold() in NON_PUBLICATION_LAYOUT_LABELS
+
+
+def _line_key(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _repeated_running_lines(pages):
+    """Find only strong cross-page header/footer evidence in legacy page text.
+
+    This is a fallback for outputs without saved layout blocks (for example,
+    native PDF text). A candidate must recur on at least three pages in the
+    first/last three nonblank lines and be short enough to be running matter.
+    """
+    counts = Counter()
+    for page in pages:
+        lines = [line.strip() for line in str(page.get("text", "")).splitlines() if line.strip()]
+        seen = set()
+        for line in [*lines[:3], *lines[-3:]]:
+            key = _line_key(line)
+            if key and not key.isdecimal() and len(key) <= 120 and len(key.split()) <= 16:
+                seen.add(key)
+        counts.update(seen)
+    return {line for line, count in counts.items() if count >= 3}
+
+
+def _without_running_matter(text, repeated_lines):
+    lines = [line for line in str(text or "").splitlines()]
+    nonblank_positions = [index for index, line in enumerate(lines) if line.strip()]
+    boundary_positions = set(nonblank_positions[:3] + nonblank_positions[-3:])
+    kept = []
+    for index, line in enumerate(lines):
+        key = _line_key(line)
+        # Numbers at a page boundary and demonstrably repeated short lines are
+        # page furniture, not source prose. Never remove a body occurrence.
+        if index in boundary_positions and (key.isdecimal() or key in repeated_lines):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def _final_pages(book, priority, decisions, book_path, priority_path, decisions_path, version):
     """Use the existing #33 semantics, then recover only final per-page text."""
     if not Path(decisions_path).is_file():
@@ -151,6 +199,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
     surya, raw_surya_ref = _surya_pages(root)
     recovered_visuals, recovered_visual_ref = _recovered_visuals(root)
     pages = sorted(book.get("pages", []), key=lambda value: value.get("page", 0))
+    repeated_running_lines = _repeated_running_lines(pages)
     page_numbers = [value.get("page") for value in pages]
     if any(not isinstance(value, int) for value in page_numbers) or len(set(page_numbers)) != len(page_numbers):
         raise ValueError("book pages must have unique numeric provenance for CDM")
@@ -197,7 +246,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
             elif status == "fallback_review":
                 add({"block_id": _stable_id("table", f"{document_id}:{page}:{index}"), "type": "table", "table_status": "fallback_review", "review_required": True, "diagnostic": table.get("diagnostic"), "provenance": provenance})
         if has_changed_text or not isinstance(page_blocks, list):
-            text = final_pages.get(page, str(record.get("text", "")))
+            text = _without_running_matter(final_pages.get(page, str(record.get("text", ""))), repeated_running_lines)
             if text:
                 add({"block_id": _stable_id("block", f"{document_id}:{page}:page-text"), "type": "unknown", "text": text,
                      "provenance": {**page_ref, "raw_page_text_sha256": _hash_bytes(str(record.get("text", "")).encode()), "correction_decision_ids": [did for _item, did in changed_by_page.get(page, []) if did], "fallback_reason": "valid_corrections_require_page_text_projection" if has_changed_text else "layout_blocks_unavailable"}})
@@ -205,6 +254,8 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
             raw_table_index = 0
             for index, raw in enumerate(sorted((value for value in page_blocks if isinstance(value, dict)), key=lambda value: value.get("reading_order", 0)), start=1):
                 label = str(raw.get("label", ""))
+                if _is_running_matter(label):
+                    continue
                 if label.lower() == "table":
                     raw_table_index += 1
                     if raw_table_index in tables_by_index:
