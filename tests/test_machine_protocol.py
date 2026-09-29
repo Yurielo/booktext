@@ -54,6 +54,14 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertTrue(result["artifacts"]["exports"]["exists"])
             self.assertEqual(1, result["review"]["unresolved_priority_counts"]["HIGH"])
 
+    @mock.patch("tools.machine_protocol.export_document.export_document", return_value={"generated": {"docx": {}}})
+    def test_machine_export_passes_only_explicit_selected_formats(self, exported):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            code, payload = events(lambda: protocol.main(["export", str(root), "--format", "docx", "--format", "pdf_image"]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            exported.assert_called_once_with(root, ["docx", "pdf_image"])
+
     def test_document_preview_is_bounded_and_read_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.fixture(temporary)

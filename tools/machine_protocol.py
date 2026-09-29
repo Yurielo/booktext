@@ -319,7 +319,7 @@ def _handle(args):
     if args.command == "document-preview":
         return _invoke(emitter, root, "cdm", "CDM preview", lambda: document_preview(root, index=args.index, limit=args.limit))
     if args.command == "export":
-        return _invoke(emitter, root, "export", "export", lambda: export_document.export_document(root, args.format or ["all"]))
+        return _invoke(emitter, root, "export", "export", lambda: export_document.export_document(root, args.format))
     if args.command == "translation":
         return _invoke(emitter, root, "translation", "translation", lambda: translation.translate_document(root,
             source_language=args.source_language, target_language=args.target_language, provider=args.provider, model=args.model,
@@ -408,7 +408,7 @@ def main(argv=None):
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("document-preview"); p.add_argument("output_dir", type=Path); p.add_argument("--index", type=int, default=0); p.add_argument("--limit", type=int, default=25)
     p = sub.add_parser("recover"); p.add_argument("output_dir", type=Path); p.add_argument("--surya-results")
-    p = sub.add_parser("export"); p.add_argument("output_dir", type=Path); p.add_argument("--format", action="append", choices=[*export_document.FORMATS, "all"])
+    p = sub.add_parser("export"); p.add_argument("output_dir", type=Path); p.add_argument("--format", action="append", required=True, choices=[*export_document.FORMATS, "all"])
     def translation_options(p, *, provider=True):
         p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru"))
         if provider:

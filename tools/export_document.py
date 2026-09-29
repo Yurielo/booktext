@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -26,7 +27,10 @@ except ModuleNotFoundError:  # helper may be invoked directly by another Python
 
 
 EXPORT_SCHEMA = "1.0"
-FORMATS = ("markdown", "html", "docx", "epub", "pdf")
+# ``pdf_image`` is deliberately separate from the publication PDF.  It is a
+# rasterized version of the CDM-derived publication layout, so text cannot be
+# selected or copied from it.  It is not a source-page facsimile.
+FORMATS = ("markdown", "html", "docx", "epub", "pdf", "pdf_image")
 WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
 
 
@@ -172,6 +176,31 @@ def _render_pdf(document_path, destination):
         raise ValueError("publication PDF rendering failed: " + (result.stderr or result.stdout).strip())
 
 
+def _render_image_pdf(publication_pdf, destination):
+    """Create a no-text-layer PDF from the publication PDF's rendered pages."""
+    renderer = shutil.which("pdftoppm")
+    if renderer is None:
+        raise ValueError("image-only PDF requires pdftoppm (Poppler)")
+    with tempfile.TemporaryDirectory(prefix="booktext-pdf-image-") as temporary:
+        prefix = Path(temporary) / "page"
+        result = subprocess.run(
+            [renderer, "-png", "-r", "150", str(publication_pdf), str(prefix)],
+            capture_output=True,
+            text=True,
+        )
+        pages = sorted(Path(temporary).glob("page-*.png"))
+        if result.returncode or not pages:
+            detail = (result.stderr or result.stdout).strip()
+            raise ValueError("image-only PDF page rendering failed" + (": " + detail if detail else ""))
+        result = subprocess.run(
+            [_renderer_python(), str(Path(__file__).resolve()), "_render_image_pdf", str(destination), *(str(page) for page in pages)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            raise ValueError("image-only PDF assembly failed: " + (result.stderr or result.stdout).strip())
+
+
 def _validate(path, fmt, root):
     if not path.is_file() or path.stat().st_size == 0: raise ValueError(f"missing or empty {fmt} export")
     if fmt in {"docx", "epub"}:
@@ -180,7 +209,7 @@ def _validate(path, fmt, root):
             names = set(archive.namelist())
             required = {"[Content_Types].xml", "word/document.xml"} if fmt == "docx" else {"mimetype", "META-INF/container.xml", "EPUB/content.opf", "EPUB/nav.xhtml"}
             if bad or not required.issubset(names): raise ValueError(f"invalid {fmt} archive")
-    elif fmt == "pdf":
+    elif fmt in {"pdf", "pdf_image"}:
         tool = shutil.which("pdfinfo")
         if tool and subprocess.run([tool, str(path)], capture_output=True).returncode != 0: raise ValueError("unreadable PDF")
     else:
@@ -201,32 +230,51 @@ def export_document(output_dir, formats):
     document = _load(document_path); decisions_path = root / "review_decisions.json"
     decisions = _load(decisions_path) if decisions_path.is_file() else None
     validate_document(document, root=root, decisions=decisions)
-    requested = FORMATS if "all" in formats else tuple(formats)
+    selected = tuple(dict.fromkeys(formats or ()))
+    if not selected:
+        raise ValueError("select at least one export format; use 'all' explicitly for every format")
+    requested = FORMATS if "all" in selected else selected
     if any(value not in FORMATS for value in requested): raise ValueError("unsupported export format")
     export_dir = root / "exports"; export_dir.mkdir(exist_ok=True)
     asset_map = {}
-    for block in document["blocks"]:
-        if block["type"] != "figure" or not block.get("image"): continue
-        source = root / block["image"]
-        if not source.is_file(): raise ValueError("CDM figure asset is missing")
-        destination = export_dir / "assets" / f"{block['block_id']}{source.suffix.lower()}"
-        destination.parent.mkdir(exist_ok=True); shutil.copyfile(source, destination)
-        asset_map[block["image"]] = str(destination.relative_to(export_dir))
+    needs_local_assets = any(fmt in requested for fmt in ("markdown", "html", "docx", "epub"))
+    if needs_local_assets:
+        for block in document["blocks"]:
+            if block["type"] != "figure" or not block.get("image"): continue
+            source = root / block["image"]
+            if not source.is_file(): raise ValueError("CDM figure asset is missing")
+            destination = export_dir / "assets" / f"{block['block_id']}{source.suffix.lower()}"
+            destination.parent.mkdir(exist_ok=True); shutil.copyfile(source, destination)
+            asset_map[block["image"]] = str(destination.relative_to(export_dir))
     markdown, html_text = render_markdown(document, root, asset_map), render_html(document, root, asset_map)
-    paths = {"markdown": export_dir / "book.md", "html": export_dir / "book.html", "docx": export_dir / "book.docx", "epub": export_dir / "book.epub", "pdf": export_dir / "book.pdf"}
-    if "markdown" in requested or any(value in requested for value in ("docx", "epub")): _write(paths["markdown"], markdown)
+    paths = {"markdown": export_dir / "book.md", "html": export_dir / "book.html", "docx": export_dir / "book.docx", "epub": export_dir / "book.epub", "pdf": export_dir / "book.pdf", "pdf_image": export_dir / "book-image.pdf"}
+    if "markdown" in requested: _write(paths["markdown"], markdown)
     if "html" in requested: _write(paths["html"], html_text)
     has_figures = any(block.get("type") == "figure" for block in document["blocks"])
     if "docx" in requested:
         docx_markdown = export_dir / ".book-docx-input.md"
-        _write(docx_markdown, render_markdown(document, root, asset_map))
+        _write(docx_markdown, markdown)
         try:
             _pandoc(docx_markdown, paths["docx"], root)
             _enable_docx_text_wrapping(paths["docx"])
         finally:
             docx_markdown.unlink(missing_ok=True)
-    if "epub" in requested: _pandoc(paths["markdown"], paths["epub"], root)
+    if "epub" in requested:
+        epub_markdown = export_dir / ".book-epub-input.md"
+        _write(epub_markdown, markdown)
+        try: _pandoc(epub_markdown, paths["epub"], root)
+        finally: epub_markdown.unlink(missing_ok=True)
     if "pdf" in requested: _render_pdf(document_path, paths["pdf"])
+    if "pdf_image" in requested:
+        source_pdf = paths["pdf"]
+        temporary_source = None
+        if "pdf" not in requested:
+            temporary_source = export_dir / ".book-image-source.pdf"
+            source_pdf = temporary_source
+            _render_pdf(document_path, source_pdf)
+        try: _render_image_pdf(source_pdf, paths["pdf_image"])
+        finally:
+            if temporary_source: temporary_source.unlink(missing_ok=True)
     validations = {fmt: _validate(paths[fmt], fmt, root) for fmt in requested}
     identity_sources = document.get("metadata", {}).get("source_files") or [document.get("metadata", {}).get("title") or "BookText document"]
     named = {
@@ -289,10 +337,27 @@ def _pdf_main(document_path, destination):
     SimpleDocTemplate(str(destination), pagesize=landscape(letter), title=document["metadata"].get("title") or "BookText export").build(story)
 
 
+def _image_pdf_main(destination, page_images):
+    """Assemble rendered PNG pages only: intentionally no selectable text."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image as PILImage
+    output = canvas.Canvas(str(destination))
+    for page in page_images:
+        with PILImage.open(page) as image:
+            width, height = image.size
+        page_width, page_height = width * 72 / 150, height * 72 / 150
+        output.setPageSize((page_width, page_height))
+        output.drawImage(ImageReader(str(page)), 0, 0, width=page_width, height=page_height)
+        output.showPage()
+    output.save()
+
+
 def main(argv=None):
     if argv and argv[0] == "_render_pdf": _pdf_main(Path(argv[1]), Path(argv[2])); return
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("output_dir", type=Path); parser.add_argument("--format", action="append", choices=[*FORMATS, "all"])
-    args = parser.parse_args(argv); print(json.dumps(export_document(args.output_dir, args.format or ["all"]), ensure_ascii=False))
+    if argv and argv[0] == "_render_image_pdf": _image_pdf_main(Path(argv[1]), [Path(value) for value in argv[2:]]); return
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("output_dir", type=Path); parser.add_argument("--format", action="append", required=True, choices=[*FORMATS, "all"])
+    args = parser.parse_args(argv); print(json.dumps(export_document(args.output_dir, args.format), ensure_ascii=False))
 
 
 if __name__ == "__main__": main(sys.argv[1:])
