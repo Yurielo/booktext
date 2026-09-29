@@ -37,6 +37,17 @@ class MachineProtocolTests(unittest.TestCase):
         self.assertEqual("job_completed", payload[-1]["event_type"])
         self.assertIn("optional", payload[-1]["details"]["dependencies"])
 
+    def test_successful_retry_clears_stale_failure_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            protocol.update_job(root, status="failed", partial=True, error_code="validation_failure", error_details={"old": True}, exit_code=5)
+            result = protocol.update_job(root, status="completed", last_phase="translation")
+            self.assertEqual("completed", result["status"])
+            self.assertFalse(result["partial"])
+            self.assertNotIn("error_code", result)
+            self.assertNotIn("error_details", result)
+            self.assertNotIn("exit_code", result)
+
     def test_cdm_export_and_inspect_preserve_persistent_job_and_artifact_map(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.fixture(temporary)

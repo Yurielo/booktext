@@ -92,6 +92,13 @@ def ensure_job(root, *, status="created", source=None):
 
 def update_job(root, **changes):
     state = ensure_job(root)
+    # A retry that reaches a verified terminal success must not inherit an
+    # earlier failure's UI state.  Artifacts/history remain intact; only the
+    # mutually exclusive terminal diagnostics are cleared.
+    if changes.get("status") == "completed":
+        for key in ("error_code", "error_details", "exit_code"):
+            state.pop(key, None)
+        changes.setdefault("partial", False)
     state.update(changes); state["updated_at"] = _now(); _atomic(_job_path(root), state); return state
 
 
