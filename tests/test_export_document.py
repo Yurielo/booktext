@@ -44,7 +44,7 @@ class ExportDocumentTests(unittest.TestCase):
         before = (self.root / "book_document.json").read_bytes()
         manifest = export_document(self.root, ["all"])
         self.assertEqual(before, (self.root / "book_document.json").read_bytes())
-        self.assertEqual(set(manifest["generated"]), {"markdown","html","docx","epub","pdf"})
+        self.assertEqual(set(manifest["generated"]), {"markdown","html","docx","epub","pdf","pdf_image"})
         self.assertTrue(manifest["generated"]["docx"]["named_deliverable"].startswith("deliverables/"))
         self.assertTrue((self.root / manifest["generated"]["docx"]["named_deliverable"]).is_file())
         self.assertEqual(manifest["fallback_unknown_counts"], {"unknown":1,"fallback_tables":1})
@@ -64,6 +64,13 @@ class ExportDocumentTests(unittest.TestCase):
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive:
             self.assertIn("mimetype", archive.namelist()); self.assertTrue(any(name.endswith(".png") for name in archive.namelist()))
         self.assertGreater((self.root / "exports/book.pdf").stat().st_size, 100)
+        self.assertGreater((self.root / "exports/book-image.pdf").stat().st_size, 100)
+        # The image-only PDF is rendered page imagery, not a second text layer.
+        try:
+            import pypdf
+            self.assertEqual("", "".join(page.extract_text() or "" for page in pypdf.PdfReader(self.root / "exports/book-image.pdf").pages).strip())
+        except ImportError:
+            pass
         self.assertTrue(any(item["kind"] == "fallback_table_not_rendered" and item["page"] == 319 for item in manifest["warnings"]))
         first_markdown = markdown; first_html = html
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive: first_docx_xml = archive.read("word/document.xml")
@@ -73,6 +80,17 @@ class ExportDocumentTests(unittest.TestCase):
         self.assertEqual(first_html, (self.root / "exports/book.html").read_text(encoding="utf-8"))
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive: self.assertEqual(first_docx_xml, archive.read("word/document.xml"))
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive: self.assertEqual(first_epub_xhtml, archive.read("EPUB/text/ch001.xhtml"))
+
+    def test_explicit_selection_never_defaults_to_all_or_leaves_helper_markdown(self):
+        with self.assertRaisesRegex(ValueError, "select at least one export format"):
+            export_document(self.root, [])
+        manifest = export_document(self.root, ["docx", "pdf_image", "docx"])
+        self.assertEqual(set(manifest["generated"]), {"docx", "pdf_image"})
+        self.assertTrue((self.root / "exports/book.docx").is_file())
+        self.assertTrue((self.root / "exports/book-image.pdf").is_file())
+        self.assertFalse((self.root / "exports/book.md").exists())
+        self.assertFalse((self.root / "exports/.book-docx-input.md").exists())
+        self.assertFalse((self.root / "exports/.book-image-source.pdf").exists())
 
     def test_invalid_cdm_or_broken_table_fails_without_export_success(self):
         self.document["blocks"][4]["artifacts"]["json"] = "tables/missing.json"; write(self.root / "book_document.json", self.document)

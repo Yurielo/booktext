@@ -24,12 +24,16 @@ booktext machine final-build OUTPUT_DIR
 booktext machine cdm OUTPUT_DIR
 booktext machine translation OUTPUT_DIR --source-language en --target-language ru --model MODEL
 booktext machine translation-validate OUTPUT_DIR --source-language en --target-language ru
-booktext machine export OUTPUT_DIR --format FORMAT
+booktext machine export OUTPUT_DIR --format FORMAT [--format FORMAT ...]
 ```
 
 The command layer calls existing production Core functions for processing,
 review decisions, final build, CDM build, and publication export. It does not
 duplicate their business logic.
+
+`export` requires at least one format: `markdown`, `html`, `docx`, `epub`,
+`pdf`, or `pdf_image`. `all` is supported only as an explicit format choice;
+Core does not default an omitted selection to every format.
 
 ## JSONL events and exits
 

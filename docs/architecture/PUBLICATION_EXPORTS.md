@@ -12,7 +12,8 @@ python3 booktext.py export /path/to/book_output --format html --format epub
 
 Outputs are written under `exports/`:
 
-- `book.md`, `book.html`, `book.docx`, `book.epub`, `book.pdf`;
+- the explicitly requested `book.md`, `book.html`, `book.docx`, `book.epub`,
+  `book.pdf`, or `book-image.pdf`;
 - copied local figure assets where needed;
 - `export_manifest.json`.
 
@@ -29,3 +30,8 @@ as success.
 DOCX and EPUB use local Pandoc. The publication PDF uses a local Python with
 `reportlab`; set `BOOKTEXT_EXPORT_PYTHON` if the Python running BookText does
 not provide it. Neither route starts OCR, Vision, Tesseract, Ollama, or an LLM.
+
+At least one `--format` is required. `--format all` is explicit; BookText never
+silently exports every format. `pdf_image` is a rasterized copy of the
+CDM-derived publication PDF with no selectable text (it is not a facsimile of
+the original source pages) and requires local Poppler `pdftoppm`.

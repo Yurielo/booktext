@@ -177,7 +177,10 @@ python3 booktext.py document validate /path/to/book_output/book_document.json \
 python3 booktext.py export /path/to/book_output --format all
 ```
 
-Он создаёт Markdown, local HTML, DOCX, EPUB, publication PDF и
+Нужно выбрать один или несколько форматов; `--format all` — явный выбор всех.
+Доступны Markdown, local HTML, DOCX, EPUB, publication PDF и raster PDF без
+выделяемого текста (`--format pdf_image`), а неявного экспорта всех форматов
+нет. Команда создаёт только выбранные готовые файлы и
 `exports/export_manifest.json`. В manifest записаны hash/size/validation,
 unresolved review и fallback/unknown counts. Подробный contract и локальные
 зависимости: [`docs/architecture/PUBLICATION_EXPORTS.md`](docs/architecture/PUBLICATION_EXPORTS.md).
