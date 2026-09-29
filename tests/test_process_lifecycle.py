@@ -34,6 +34,7 @@ class ProcessLifecycleTests(unittest.TestCase):
             self.assertIsNone(other.poll())
         finally:
             os.killpg(os.getpgid(other.pid), signal.SIGKILL)
+            other.wait(timeout=2)
 
     def test_independent_registries_do_not_cross_cleanup(self):
         first, second = LifecycleRegistry(), LifecycleRegistry()

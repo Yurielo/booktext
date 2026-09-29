@@ -22,7 +22,7 @@ booktext machine review OUTPUT_DIR [--page N]
 booktext machine decision OUTPUT_DIR --item ID --action ACTION [...]
 booktext machine final-build OUTPUT_DIR
 booktext machine cdm OUTPUT_DIR
-booktext machine translation OUTPUT_DIR --source-language en --target-language ru --model MODEL
+booktext machine translation OUTPUT_DIR --source-language en --target-language ru --model MODEL [--keep-alive 30s]
 booktext machine translation-validate OUTPUT_DIR --source-language en --target-language ru
 booktext machine export OUTPUT_DIR --format FORMAT [--format FORMAT ...]
 ```
@@ -34,6 +34,11 @@ duplicate their business logic.
 `export` requires at least one format: `markdown`, `html`, `docx`, `epub`,
 `pdf`, or `pdf_image`. `all` is supported only as an explicit format choice;
 Core does not default an omitted selection to every format.
+
+Translation defaults to a bounded `--keep-alive 30s` request lease for its
+explicit local Ollama model. This allows sequential blocks to reuse the model,
+then lets Ollama release it naturally without BookText stopping the shared
+daemon or affecting another client's process.
 
 ## JSONL events and exits
 

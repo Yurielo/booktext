@@ -1,5 +1,6 @@
 import json
 import tempfile
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -87,6 +88,40 @@ class TranslationTests(unittest.TestCase):
         payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
         self.assertFalse(payload["think"])
         self.assertFalse(settings["thinking"])
+        self.assertEqual("30s", payload["keep_alive"])
+        self.assertEqual("30s", settings["keep_alive"])
+
+    def test_model_lease_is_bounded_and_recorded_without_global_unload(self):
+        with mock.patch("tools.translation._model_info", side_effect=self.fake_metadata), \
+             mock.patch("tools.translation._translate_ollama", side_effect=self.fake_translate) as translated:
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", keep_alive="30s")
+        self.assertTrue(all(call.kwargs["keep_alive"] == "30s" for call in translated.call_args_list))
+        artifact = json.loads((self.root / "translations/en-ru.json").read_text(encoding="utf-8"))
+        lifecycle = artifact["provider"]["resource_lifecycle"]
+        self.assertEqual("30s", lifecycle["keep_alive"])
+        self.assertIn("never stops the shared daemon", lifecycle["policy"])
+        with self.assertRaisesRegex(ValueError, "bounded duration"):
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", keep_alive="forever")
+        with self.assertRaisesRegex(ValueError, "between 1ms and 300s"):
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", keep_alive="6m")
+
+    def test_failure_timeout_and_cancellation_keep_the_bounded_lease(self):
+        observed = []
+        def failed_request(request, timeout):
+            observed.append(json.loads(request.data.decode("utf-8")))
+            raise urllib.error.URLError("simulated transport failure")
+        with mock.patch("tools.translation.urllib.request.urlopen", side_effect=failed_request):
+            with self.assertRaisesRegex(ValueError, "translation request failed"):
+                translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+        self.assertEqual("30s", observed[0]["keep_alive"])
+        cancelled = []
+        def cancelled_request(request, timeout):
+            cancelled.append(json.loads(request.data.decode("utf-8")))
+            raise KeyboardInterrupt
+        with mock.patch("tools.translation.urllib.request.urlopen", side_effect=cancelled_request):
+            with self.assertRaises(KeyboardInterrupt):
+                translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+        self.assertEqual("30s", cancelled[0]["keep_alive"])
 
     def test_direction_and_glossary_validation_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "direction"):

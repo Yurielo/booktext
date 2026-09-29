@@ -105,6 +105,7 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertEqual("qwen3:8b", kwargs["model"])
             self.assertEqual("en", kwargs["source_language"])
             self.assertEqual("ru", kwargs["target_language"])
+            self.assertEqual("30s", kwargs["keep_alive"])
 
     def test_decision_and_final_build_use_existing_decision_semantics(self):
         with tempfile.TemporaryDirectory() as temporary:

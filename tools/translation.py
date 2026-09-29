@@ -23,6 +23,13 @@ SCHEMA_VERSION = "1.0"
 ARTIFACT_TYPE = "booktext.translation"
 SUPPORTED_LANGUAGES = ("en", "ru")
 TEXT_TYPES = {"heading", "paragraph", "list", "caption", "unknown"}
+# Ollama owns the shared daemon and model processes, not BookText. A request
+# lease is the only safe way to bound BookText's model residency: it lets a
+# sequential document reuse one loaded model, then lets Ollama unload it
+# naturally. BookText must never issue a global unload or kill a process by
+# name, as either action could interrupt another local client.
+DEFAULT_MODEL_KEEP_ALIVE = "30s"
+MAX_MODEL_KEEP_ALIVE_SECONDS = 300
 # Units are deliberately limited to unambiguous compact scientific forms.  A
 # following ordinary word (for example ``1/2 page``) is prose, not a unit and
 # must not make an otherwise faithful translation look numerically invalid.
@@ -60,6 +67,20 @@ def pair_name(source_language, target_language):
     if source_language not in SUPPORTED_LANGUAGES or target_language not in SUPPORTED_LANGUAGES or source_language == target_language:
         raise ValueError("translation direction must be en→ru or ru→en")
     return f"{source_language}-{target_language}"
+
+
+def _validate_keep_alive(value):
+    """Accept only a finite, short lease; never let callers pin a model."""
+    if not isinstance(value, str):
+        raise ValueError("keep_alive must be a bounded duration such as 30s")
+    match = re.fullmatch(r"(\d+)(ms|s|m)", value)
+    if not match:
+        raise ValueError("keep_alive must be a bounded duration such as 30s")
+    amount, unit = int(match.group(1)), match.group(2)
+    seconds = amount / 1000 if unit == "ms" else amount * (60 if unit == "m" else 1)
+    if seconds <= 0 or seconds > MAX_MODEL_KEEP_ALIVE_SECONDS:
+        raise ValueError("keep_alive must be between 1ms and 300s")
+    return value
 
 
 def translation_path(root, source_language, target_language):
@@ -116,7 +137,7 @@ def _extract_translation(content):
     return translation.strip()
 
 
-def _translate_ollama(*, endpoint, model, source, source_language, target_language, before, after, glossary, timeout):
+def _translate_ollama(*, endpoint, model, source, source_language, target_language, before, after, glossary, timeout, keep_alive=DEFAULT_MODEL_KEEP_ALIVE):
     glossary_text = json.dumps(glossary, ensure_ascii=False, sort_keys=True) if glossary else "{}"
     prompt = {
         "task": "Translate only the source block. Do not correct, summarize, omit, add commentary, or translate numbers/identifiers.",
@@ -133,7 +154,7 @@ def _translate_ollama(*, endpoint, model, source, source_language, target_langua
     # Qwen3 and other thinking-capable local models can otherwise spend the
     # whole bounded request window on hidden analysis before producing JSON.
     # This remains an explicit provider setting in the resulting provenance.
-    payload = {"model": model, "stream": False, "format": "json", "think": False, "options": {"temperature": 0},
+    payload = {"model": model, "stream": False, "format": "json", "think": False, "keep_alive": keep_alive, "options": {"temperature": 0},
                "messages": [{"role": "system", "content": "You are a faithful document translator."},
                             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}]}
     request = urllib.request.Request(endpoint.rstrip("/") + "/api/chat", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"})
@@ -145,7 +166,8 @@ def _translate_ollama(*, endpoint, model, source, source_language, target_langua
     content = (((result.get("message") or {}).get("content")) if isinstance(result, dict) else None)
     if not isinstance(content, str):
         raise ValueError("local Ollama response is missing message content")
-    return _extract_translation(content), {"temperature": 0, "thinking": False, "response_format": "json", "glossary_json": glossary_text}
+    return _extract_translation(content), {"temperature": 0, "thinking": False, "response_format": "json", "glossary_json": glossary_text,
+                                           "keep_alive": keep_alive}
 
 
 def _eligible(document):
@@ -156,7 +178,7 @@ def _numbers(text):
     return NUMBER_RE.findall(text)
 
 
-def _entry(block, *, source_language, target_language, text, before, after, glossary, provider, timeout):
+def _entry(block, *, source_language, target_language, text, before, after, glossary, provider, timeout, keep_alive):
     detected = _script_language(text)
     base = {"block_id": block["block_id"], "block_type": block["type"], "source_page": block.get("provenance", {}).get("source_page"),
             "source_text": text, "source_text_sha256": _sha_bytes(text.encode("utf-8")), "detected_language": detected,
@@ -166,7 +188,7 @@ def _entry(block, *, source_language, target_language, text, before, after, glos
     if detected == target_language:
         return {**base, "status": "skipped_already_target_language", "translation": None, "validation": {"numeric_tokens": "not_applicable"}}
     translated, settings = _translate_ollama(endpoint=provider["endpoint"], model=provider["model"], source=text,
-        source_language=source_language, target_language=target_language, before=before[1] if before else "", after=after[1] if after else "", glossary=glossary, timeout=timeout)
+        source_language=source_language, target_language=target_language, before=before[1] if before else "", after=after[1] if after else "", glossary=glossary, timeout=timeout, keep_alive=keep_alive)
     original_numbers, translated_numbers = _numbers(text), _numbers(translated)
     status = "machine_translated" if original_numbers == translated_numbers else "needs_numeric_review"
     return {**base, "status": status, "translation": translated, "translation_sha256": _sha_bytes(translated.encode("utf-8")),
@@ -214,7 +236,7 @@ def _validate_manifest(manifest, document, *, cdm_sha=None):
             "skipped": sum(str(item.get("status", "")).startswith("skipped_") for item in observed)}
 
 
-def translate_document(output_dir, *, source_language, target_language, provider, model, glossary_path=None, endpoint="http://127.0.0.1:11434", timeout=120):
+def translate_document(output_dir, *, source_language, target_language, provider, model, glossary_path=None, endpoint="http://127.0.0.1:11434", timeout=120, keep_alive=DEFAULT_MODEL_KEEP_ALIVE):
     root = Path(output_dir).expanduser().resolve()
     pair = pair_name(source_language, target_language)
     if provider != "ollama":
@@ -224,6 +246,7 @@ def translate_document(output_dir, *, source_language, target_language, provider
     canonical_document.validate_document(document, root=root, decisions=decisions)
     glossary, glossary_provenance = _glossary(glossary_path)
     cdm_sha = sha_file(root / "book_document.json")
+    keep_alive = _validate_keep_alive(keep_alive)
     destination = translation_path(root, source_language, target_language)
     existing = _load(destination)
     if existing and (existing.get("source") or {}).get("cdm_sha256") == cdm_sha and (existing.get("provider") or {}).get("model") == model and existing.get("glossary") == glossary_provenance:
@@ -234,13 +257,16 @@ def translate_document(output_dir, *, source_language, target_language, provider
         history = destination.parent / "history" / f"{pair}-{(existing.get('source') or {}).get('cdm_sha256', 'unknown')[:12]}.json"
         history.parent.mkdir(parents=True, exist_ok=True)
         if not history.exists(): _atomic_json(history, existing)
-    metadata = _model_info(endpoint, model, timeout)
+    metadata = {**_model_info(endpoint, model, timeout), "resource_lifecycle": {
+        "keep_alive": keep_alive,
+        "policy": "BookText requests a bounded Ollama model lease; it never stops the shared daemon or unloads a model by process name.",
+    }}
     blocks = _eligible(document)
     entries = []
     for index, block in enumerate(blocks):
         before = (blocks[index - 1]["block_id"], blocks[index - 1]["text"][-700:]) if index else None
         after = (blocks[index + 1]["block_id"], blocks[index + 1]["text"][:700]) if index + 1 < len(blocks) else None
-        entries.append(_entry(block, source_language=source_language, target_language=target_language, text=block["text"], before=before, after=after, glossary=glossary, provider=metadata, timeout=timeout))
+        entries.append(_entry(block, source_language=source_language, target_language=target_language, text=block["text"], before=before, after=after, glossary=glossary, provider=metadata, timeout=timeout, keep_alive=keep_alive))
     destination.parent.mkdir(parents=True, exist_ok=True)
     target_markdown = destination.parent / f"book-{pair}.md"
     bilingual_markdown = destination.parent / f"book-{pair}-bilingual.md"

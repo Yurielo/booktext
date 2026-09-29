@@ -323,7 +323,7 @@ def _handle(args):
     if args.command == "translation":
         return _invoke(emitter, root, "translation", "translation", lambda: translation.translate_document(root,
             source_language=args.source_language, target_language=args.target_language, provider=args.provider, model=args.model,
-            glossary_path=args.glossary, endpoint=args.endpoint, timeout=args.timeout))
+            glossary_path=args.glossary, endpoint=args.endpoint, timeout=args.timeout, keep_alive=args.keep_alive))
     if args.command == "translation-validate":
         return _invoke(emitter, root, "translation", "translation validation", lambda: translation.validate_translation(root,
             source_language=args.source_language, target_language=args.target_language))
@@ -412,7 +412,7 @@ def main(argv=None):
     def translation_options(p, *, provider=True):
         p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru"))
         if provider:
-            p.add_argument("--provider", default="ollama", choices=("ollama",)); p.add_argument("--model", required=True); p.add_argument("--glossary"); p.add_argument("--endpoint", default="http://127.0.0.1:11434"); p.add_argument("--timeout", type=int, default=120)
+            p.add_argument("--provider", default="ollama", choices=("ollama",)); p.add_argument("--model", required=True); p.add_argument("--glossary"); p.add_argument("--endpoint", default="http://127.0.0.1:11434"); p.add_argument("--timeout", type=int, default=120); p.add_argument("--keep-alive", default=translation.DEFAULT_MODEL_KEEP_ALIVE)
     translation_options(sub.add_parser("translation"))
     translation_options(sub.add_parser("translation-validate"), provider=False)
     p = sub.add_parser("final-build"); p.add_argument("output_dir", type=Path)
