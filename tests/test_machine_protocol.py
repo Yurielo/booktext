@@ -85,6 +85,19 @@ class MachineProtocolTests(unittest.TestCase):
             table = next(block for block in payload[-1]["details"]["result"]["blocks"] if block["type"] == "table")
             self.assertEqual([["H"], ["1"]], table["table_preview"])
 
+    @mock.patch("tools.machine_protocol.translation.translate_document", return_value={"path": "translations/en-ru.json", "validation": {"valid": True}})
+    def test_translation_uses_versioned_machine_operation_without_ocr(self, translate):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            code, payload = events(lambda: protocol.main(["translation", str(root), "--source-language", "en", "--target-language", "ru", "--model", "qwen3:8b"]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            self.assertEqual("translation", payload[-1]["phase"])
+            translate.assert_called_once()
+            kwargs = translate.call_args.kwargs
+            self.assertEqual("qwen3:8b", kwargs["model"])
+            self.assertEqual("en", kwargs["source_language"])
+            self.assertEqual("ru", kwargs["target_language"])
+
     def test_decision_and_final_build_use_existing_decision_semantics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.fixture(temporary)

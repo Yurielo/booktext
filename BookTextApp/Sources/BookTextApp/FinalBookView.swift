@@ -35,6 +35,15 @@ import BookTextCore
     func buildFinal() { call(["final-build", outputURL.path]) { [weak self] detail in self?.message = "Final book built. Applied changes: \(detail["result"]?.object?["applied_text_changes"]?.integer ?? 0)."; self?.refresh() } }
     func buildCDM() { call(["cdm", outputURL.path]) { [weak self] _ in self?.message = "CDM rebuilt from existing artifacts; no OCR or model ran."; self?.loadPreview(index: 0); self?.refresh() } }
     func export(_ format: String) { call(["export", outputURL.path, "--format", format]) { [weak self] detail in self?.exportCompleted(format, detail) } }
+    func translate(sourceLanguage: String, targetLanguage: String, model: String) {
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { message = "Choose a local Ollama model before translating."; return }
+        call(["translation", outputURL.path, "--source-language", sourceLanguage, "--target-language", targetLanguage, "--provider", "ollama", "--model", model]) { [weak self] detail in
+            let result = detail["result"]?.object ?? [:]
+            let reused = result["reused"]?.bool == true
+            self?.message = reused ? "Existing source-matched translation is available." : "Translation created from CDM; it is machine-translated, not human-reviewed."
+            self?.refresh()
+        }
+    }
     private func exportCompleted(_ format: String, _ detail: [String: JSONValue]) {
         let generated = detail["result"]?.object?["generated"]?.object?[format]?.object
         let relative = generated?["named_deliverable"]?.string ?? generated?["path"]?.string
@@ -57,14 +66,17 @@ import BookTextCore
 struct FinalBookView: View {
     @StateObject private var model: FinalBookModel
     @State private var showStructure = false
+    @State private var translationSource = "en"
+    @State private var translationModel = "qwen3:8b"
     @Environment(\.dismiss) private var dismiss
     init(outputURL: URL, configuration: CoreConfiguration) { _model = StateObject(wrappedValue: FinalBookModel(outputURL: outputURL, configuration: configuration)) }
     var body: some View { VStack(alignment: .leading, spacing: 12) {
         HStack { Text("Final Book & Export").font(.title2.bold()); Spacer(); Button("Close") { dismiss() } }
-        Text("Core remains the source of truth. These operations use existing artifacts only: no OCR, Vision, Tesseract, or LLM runs.").font(.caption).foregroundStyle(.secondary)
+        Text("Core remains the source of truth. Final build, CDM, and export use existing artifacts only: no OCR, Vision, Tesseract, or LLM runs. Translation is an explicit optional local-model operation below.").font(.caption).foregroundStyle(.secondary)
         summary
         HStack { Button("Build Final Book", action: model.buildFinal).buttonStyle(.borderedProminent); Button("Build / Refresh CDM", action: model.buildCDM); Divider().frame(height: 20); ForEach(["markdown", "html", "docx", "epub", "pdf"], id: \.self) { format in Button("Export \(format.uppercased())") { model.export(format) } } }.disabled(model.loading)
-        HStack { Button("Open final text") { model.openArtifact("final_text") }.disabled(model.loading); Button("Open final Markdown") { model.openArtifact("final_markdown") }.disabled(model.loading); Button("Reveal exports") { model.openArtifact("exports") }.disabled(model.loading) }
+        HStack { Button("Open final text") { model.openArtifact("final_text") }.disabled(model.loading); Button("Open final Markdown") { model.openArtifact("final_markdown") }.disabled(model.loading); Button("Reveal exports") { model.openArtifact("exports") }.disabled(model.loading); Button("Reveal translations") { model.openArtifact("translations") }.disabled(model.loading) }
+        translationControls
         if model.loading { ProgressView() }
         if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
         Divider(); readerPreview
@@ -77,6 +89,16 @@ struct FinalBookView: View {
         Text("Unresolved HIGH/MEDIUM: \(review?["unresolved_priority_counts"]?.object?["HIGH"]?.integer ?? 0) / \(review?["unresolved_priority_counts"]?.object?["MEDIUM"]?.integer ?? 0) · stale/conflicts: \(review?["stale_or_conflict_count"]?.integer ?? 0)")
         Text("CDM blocks: \(model.preview["count"]?.integer ?? 0) · tables: \(counts?["table"]?.integer ?? 0) · figures: \(counts?["figure"]?.integer ?? 0) · unknown: \(counts?["unknown"]?.integer ?? 0)").font(.caption).foregroundStyle(.secondary)
         if let warnings = model.preview["warnings"]?.values, !warnings.isEmpty { Text("Warnings: \(warnings.count) (fallback/unknown content remains explicit in CDM and exports)").font(.caption).foregroundStyle(.orange) }
+    }
+
+    @ViewBuilder private var translationControls: some View {
+        HStack(spacing: 8) {
+            Text("Derived translation").font(.caption.weight(.semibold))
+            Picker("Source", selection: $translationSource) { Text("EN → RU").tag("en"); Text("RU → EN").tag("ru") }.labelsHidden().frame(width: 110)
+            TextField("Local Ollama model", text: $translationModel).textFieldStyle(.roundedBorder).frame(width: 150)
+            Button("Translate") { model.translate(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", model: translationModel) }
+        }.disabled(model.loading)
+        Text("Optional local Ollama operation. The original CDM/OCR remains unchanged; provider and model provenance are recorded.").font(.caption2).foregroundStyle(.secondary)
     }
 
     @ViewBuilder private var readerPreview: some View {

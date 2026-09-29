@@ -2105,6 +2105,27 @@ if __name__ == "__main__":
         export_document_main(sys.argv[2:])
         sys.exit(0)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "translate":
+        from tools.translation import translate_document, validate_translation
+        parser = argparse.ArgumentParser(prog="booktext translate", description="Create a derived EN↔RU translation from an existing CDM.")
+        parser.add_argument("output_dir")
+        parser.add_argument("--source-language", required=True, choices=("en", "ru"))
+        parser.add_argument("--target-language", required=True, choices=("en", "ru"))
+        parser.add_argument("--provider", default="ollama", choices=("ollama",))
+        parser.add_argument("--model", required=True, help="Explicit locally installed Ollama model; no hidden default is used")
+        parser.add_argument("--glossary", help="JSON glossary mapping source terms to target terms")
+        parser.add_argument("--endpoint", default="http://127.0.0.1:11434")
+        parser.add_argument("--timeout", type=int, default=120)
+        parser.add_argument("--validate", action="store_true", help="Validate existing translation only; do not contact a provider")
+        options = parser.parse_args(sys.argv[2:])
+        if options.validate:
+            result = validate_translation(options.output_dir, source_language=options.source_language, target_language=options.target_language)
+        else:
+            result = translate_document(options.output_dir, source_language=options.source_language, target_language=options.target_language,
+                provider=options.provider, model=options.model, glossary_path=options.glossary, endpoint=options.endpoint, timeout=options.timeout)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        sys.exit(0)
+
     def _cleanup_signal(_signum, _frame):
         OWNED_CHILDREN.handle_signal(_signum, _frame)
 
