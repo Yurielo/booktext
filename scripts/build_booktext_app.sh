@@ -16,6 +16,7 @@ rm -rf "$app_dir"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp "$repo_root/BookTextApp/Info.plist" "$app_dir/Contents/Info.plist"
 cp "$build_dir/BookText" "$app_dir/Contents/MacOS/BookText"
+cp "$repo_root/BookTextApp/Resources/BookText.icns" "$app_dir/Contents/Resources/BookText.icns"
 # Local-only BookText.app uses macOS's supported ad-hoc identity.  This is
 # deliberately after all Contents mutations and verification is mandatory.
 codesign --force --deep --sign - --timestamp=none "$app_dir"
