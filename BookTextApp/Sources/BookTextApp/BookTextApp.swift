@@ -82,8 +82,24 @@ import BookTextCore
     func exportAndOpenDocx() {
         guard let outputURL, !docxBusy else { return }
         docxBusy = true
-        warningText = "Preparing DOCX from existing BookText artifacts…"
-        buildDocx(outputURL, openWhenReady: true)
+        // Legacy outputs can retain page images and saved layout results but
+        // predate figure-crop artifacts.  Recovering them is offline-only and
+        // deliberately never invokes OCR/model inference.
+        if FileManager.default.fileExists(atPath: outputURL.appendingPathComponent("review.json").path) {
+            warningText = "Recovering preserved visual regions, then preparing DOCX…"
+            recoverForDocx(outputURL, openWhenReady: true)
+        } else {
+            warningText = "Preparing DOCX from existing BookText artifacts…"
+            buildDocx(outputURL, openWhenReady: true)
+        }
+    }
+    private func recoverForDocx(_ url: URL, openWhenReady: Bool) {
+        let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
+        do { try client.start(arguments: ["recover", url.path], event: { [weak self] event in Task { @MainActor in
+            guard let self else { return }
+            if event.eventType == .jobCompleted { self.buildDocx(url, openWhenReady: openWhenReady) }
+            if event.eventType == .jobFailed { self.docxBusy = false; self.presentation.state = .failed; self.errorText = "recovery_failure: \(event.message)" }
+        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { docxBusy = false; presentation.state = .failed; errorText = error.localizedDescription }
     }
     private func buildDocx(_ url: URL, openWhenReady: Bool) {
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client

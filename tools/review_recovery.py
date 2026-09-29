@@ -12,6 +12,12 @@ from tools.review_decisions import atomic_write_json, sha256_file
 from tools.review_priority import prioritise_review, priority_text
 
 
+VISUAL_LABELS = {
+    "picture": "picture", "figure": "figure", "diagram": "diagram",
+    "photo": "photo", "chart": "chart", "map": "map", "illustration": "illustration",
+}
+
+
 def _compact(value):
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
@@ -88,6 +94,102 @@ def _find_surya_results(root, explicit_path):
     return None
 
 
+def _page_number(key, record):
+    match = re.fullmatch(r"page-(\d+)", str(key))
+    # The keyed production artifact is authoritative.  Some historical Surya
+    # batch records retained a stale ``page`` member (often 1) in every value.
+    if match:
+        return int(match.group(1))
+    value = record.get("page") if isinstance(record, dict) else None
+    return value if isinstance(value, int) else None
+
+
+def _recover_visual_evidence(root, pages, results_path):
+    """Crop only preserved layout-labelled visual regions from source pages.
+
+    This is deliberately narrower than image discovery: it relies on a saved
+    Surya layout label plus a saved bbox, emits no caption, and does not alter
+    raw book/review data.  A whole source page is never treated as a figure.
+    """
+    if results_path is None or not results_path.is_file():
+        return {"path": None, "recovered_count": 0, "reason": "preserved_surya_results_unavailable"}
+    try:
+        from PIL import Image
+    except ImportError as error:
+        return {"path": None, "recovered_count": 0, "reason": f"Pillow unavailable: {error}"}
+    data = json.loads(results_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Surya results artifact must be a JSON object")
+    pages_by_number = {record.get("page"): record for record in pages if isinstance(record, dict) and isinstance(record.get("page"), int)}
+    evidence, recovered, skipped_existing = [], 0, 0
+    for key, values in sorted(data.items()):
+        record = values[0] if isinstance(values, list) and values and isinstance(values[0], dict) else None
+        page_number = _page_number(key, record)
+        page = pages_by_number.get(page_number)
+        if record is None or page is None:
+            continue
+        # A current production output's visual records are authoritative; do
+        # not duplicate or replace them during legacy recovery.
+        if page.get("visuals"):
+            skipped_existing += 1
+            continue
+        relative_image = page.get("page_image")
+        image_path = root / relative_image if isinstance(relative_image, str) else None
+        image_bbox = record.get("image_bbox")
+        if not image_path or not image_path.is_file() or not isinstance(image_bbox, list) or len(image_bbox) != 4:
+            continue
+        try:
+            ix0, iy0, ix1, iy1 = (float(value) for value in image_bbox)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            image = Image.open(image_path)
+        except (OSError, ValueError):
+            continue
+        visual_index = 0
+        for block in record.get("blocks", []):
+            if not isinstance(block, dict):
+                continue
+            visual_type = VISUAL_LABELS.get(str(block.get("label", "")).casefold())
+            bbox = block.get("bbox")
+            if visual_type is None or not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            try:
+                x0, y0, x1, y1 = (float(value) for value in bbox)
+            except (TypeError, ValueError):
+                continue
+            normalised = [(x0 - ix0) / (ix1 - ix0), (y0 - iy0) / (iy1 - iy0), (x1 - ix0) / (ix1 - ix0), (y1 - iy0) / (iy1 - iy0)]
+            if not (0 <= normalised[0] < normalised[2] <= 1 and 0 <= normalised[1] < normalised[3] <= 1):
+                continue
+            crop_box = (
+                max(0, round(normalised[0] * image.width)), max(0, round(normalised[1] * image.height)),
+                min(image.width, round(normalised[2] * image.width)), min(image.height, round(normalised[3] * image.height)),
+            )
+            if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+                continue
+            visual_index += 1
+            destination = root / "images" / "recovered_visuals" / f"page-{page_number:04d}-visual-{visual_index:02d}.png"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            image.crop(crop_box).save(destination, format="PNG")
+            evidence.append({
+                "page": page_number, "index": visual_index, "type": visual_type,
+                "image": str(destination.relative_to(root)), "bbox": normalised,
+                "source_provenance": {
+                    "kind": "preserved_surya_layout_visual_crop", "raw_results": str(results_path.relative_to(root)) if results_path.is_relative_to(root) else str(results_path),
+                    "layout_label": block.get("label"), "layout_bbox": bbox, "ocr_performed": False,
+                },
+            })
+            recovered += 1
+        image.close()
+    artifact = {
+        "schema_version": "1.0", "artifact_type": "booktext.recovered_visual_evidence",
+        "source": {"surya_results": str(results_path), "page_images": "pages/"},
+        "visuals": evidence,
+        "policy": "Crops come only from preserved layout-labelled visual blocks; they are not inferred figures and no captions were generated.",
+    }
+    atomic_write_json(root / "visual_evidence.json", artifact)
+    return {"path": "visual_evidence.json", "recovered_count": recovered, "skipped_pages_with_existing_visuals": skipped_existing}
+
+
 def recover(output_dir, *, surya_results=None):
     root = Path(output_dir).expanduser().resolve()
     book_path, review_path = root / "book.json", root / "review.json"
@@ -104,6 +206,7 @@ def recover(output_dir, *, surya_results=None):
     enriched_items = [dict(item) if isinstance(item, dict) else item for item in raw_items]
     results_path = _find_surya_results(root, surya_results)
     locator = _add_surya_block_locations(enriched_items, results_path)
+    visual_evidence = _recover_visual_evidence(root, pages, results_path)
     priority = prioritise_review(qa_pages, enriched_items, pages)
     clusters = build_clusters(priority)
     atomic_write_json(root / "review_priority.json", priority)
@@ -128,6 +231,7 @@ def recover(output_dir, *, surya_results=None):
         "review_clusters": {"cluster_count": clusters["cluster_count"], **clusters["metrics"]},
         "external_evidence_unavailable": unavailable,
         "source_location_evidence": locator,
+        "visual_evidence": visual_evidence,
         "policy": "Derived offline from preserved raw OCR/QA evidence; no OCR, Vision, Tesseract, Ollama, or LLM executed.",
     }
     atomic_write_json(root / "run_summary.json", summary)

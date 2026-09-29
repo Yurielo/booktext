@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 try:
@@ -26,6 +27,7 @@ except ModuleNotFoundError:  # helper may be invoked directly by another Python
 
 EXPORT_SCHEMA = "1.0"
 FORMATS = ("markdown", "html", "docx", "epub", "pdf")
+WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
 
 
 def _load(path): return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -53,19 +55,14 @@ def _markdown_table(grid):
     return "\n".join([header, divider, *body])
 
 
-def render_markdown(document, root, asset_map=None, source_page_assets=None):
+def render_markdown(document, root, asset_map=None):
     asset_map = asset_map or {}
-    source_page_assets = source_page_assets or {}
     lines = [f"# {document['metadata'].get('title') or 'BookText export'}", "", "<!-- Generated from BookText CDM; CDM remains the machine source. -->"]
     for block in document["blocks"]:
         kind, provenance = block["type"], block.get("provenance", {})
         page = provenance.get("source_page")
         if kind == "page_break":
             lines.extend(["", f"<!-- source-page: {page} -->", "", "---"])
-            if page in source_page_assets:
-                # This is a visual facsimile of the whole source page, not a
-                # claim that BookText inferred an individual figure/caption.
-                lines.extend(["", f"> Source page facsimile, page {page}.", "", f"![source page {page}]({source_page_assets[page]})"])
         elif kind == "heading": lines.extend(["", "## " + block.get("text", "")])
         elif kind == "paragraph": lines.extend(["", block.get("text", "")])
         elif kind == "list": lines.extend(["", "- " + block.get("text", "")])
@@ -112,6 +109,48 @@ def _pandoc(markdown, destination, root):
     if not executable: raise ValueError("pandoc is required for DOCX and EPUB export")
     resources = os.pathsep.join((str(markdown.parent), str(root)))
     subprocess.run([executable, str(markdown), "--resource-path", resources, "-o", str(destination)], check=True, capture_output=True, text=True)
+
+
+def _enable_docx_text_wrapping(destination):
+    """Convert embedded CDM figures to floating Word drawings with wrap text.
+
+    Pandoc creates valid inline drawings, but Word lays those out as text
+    characters.  This post-processing affects only image layout in the DOCX;
+    figure identity and source provenance remain solely in the CDM.
+    """
+    with zipfile.ZipFile(destination, "r") as archive:
+        files = {entry.filename: archive.read(entry.filename) for entry in archive.infolist()}
+    xml = files.get("word/document.xml")
+    if xml is None:
+        raise ValueError("DOCX has no word/document.xml")
+    root = ET.fromstring(xml)
+    converted = 0
+    for inline in root.findall(f".//{WP}inline"):
+        inline.tag = f"{WP}anchor"
+        inline.attrib.update({"distT": "0", "distB": "0", "distL": "114300", "distR": "114300", "simplePos": "0", "relativeHeight": "251658240", "behindDoc": "0", "locked": "0", "layoutInCell": "1", "allowOverlap": "1"})
+        children = list(inline)
+        simple = ET.Element(f"{WP}simplePos", {"x": "0", "y": "0"})
+        horizontal = ET.Element(f"{WP}positionH", {"relativeFrom": "column"})
+        ET.SubElement(horizontal, f"{WP}posOffset").text = "0"
+        vertical = ET.Element(f"{WP}positionV", {"relativeFrom": "paragraph"})
+        ET.SubElement(vertical, f"{WP}posOffset").text = "0"
+        inline.insert(0, simple); inline.insert(1, horizontal); inline.insert(2, vertical)
+        # ``extent`` and optional ``effectExtent`` precede wrap in the Word
+        # schema.  Inserting after them makes this valid for Word/LibreOffice.
+        wrap_index = 3
+        while wrap_index < len(inline) and inline[wrap_index].tag in {f"{WP}extent", f"{WP}effectExtent"}:
+            wrap_index += 1
+        inline.insert(wrap_index, ET.Element(f"{WP}wrapSquare", {"wrapText": "bothSides"}))
+        converted += 1
+    if not converted:
+        return 0
+    files["word/document.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    temporary = destination.with_suffix(".wrapping.tmp.docx")
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, value in files.items():
+            archive.writestr(name, value)
+    temporary.replace(destination)
+    return converted
 
 
 def _renderer_python():
@@ -173,24 +212,13 @@ def export_document(output_dir, formats):
     paths = {"markdown": export_dir / "book.md", "html": export_dir / "book.html", "docx": export_dir / "book.docx", "epub": export_dir / "book.epub", "pdf": export_dir / "book.pdf"}
     if "markdown" in requested or any(value in requested for value in ("docx", "epub")): _write(paths["markdown"], markdown)
     if "html" in requested: _write(paths["html"], html_text)
-    source_page_assets = {}
     has_figures = any(block.get("type") == "figure" for block in document["blocks"])
-    if "docx" in requested and not has_figures:
-        for source_page in document.get("source_pages", []):
-            number, relative = source_page.get("source_page"), source_page.get("prepared_page")
-            if not isinstance(number, int) or not isinstance(relative, str):
-                continue
-            source = root / relative
-            if not source.is_file():
-                continue
-            destination = export_dir / "assets" / f"source-page-{number:04d}{source.suffix.lower()}"
-            destination.parent.mkdir(exist_ok=True); shutil.copyfile(source, destination)
-            source_page_assets[number] = str(destination.relative_to(export_dir))
     if "docx" in requested:
         docx_markdown = export_dir / ".book-docx-input.md"
-        _write(docx_markdown, render_markdown(document, root, asset_map, source_page_assets))
+        _write(docx_markdown, render_markdown(document, root, asset_map))
         try:
             _pandoc(docx_markdown, paths["docx"], root)
+            _enable_docx_text_wrapping(paths["docx"])
         finally:
             docx_markdown.unlink(missing_ok=True)
     if "epub" in requested: _pandoc(paths["markdown"], paths["epub"], root)
@@ -202,11 +230,11 @@ def export_document(output_dir, formats):
         for fmt in requested
     }
     block_counts = {kind: sum(block["type"] == kind for block in document["blocks"]) for kind in ("unknown", "table")}
-    visual_mode = "classified_figures" if has_figures else ("source_page_facsimile_fallback" if source_page_assets else "no_visual_evidence")
+    visual_mode = "classified_or_recovered_visual_crops" if has_figures else "no_visual_evidence"
     warnings = list(document.get("warnings", []))
     if visual_mode == "no_visual_evidence":
         warnings.append({"kind": "no_visual_evidence_for_docx", "message": "CDM has no figure blocks or retained source-page assets; DOCX cannot safely add images."})
-    manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": warnings, "visual_preservation": {"mode": visual_mode, "source_page_facsimile_count": len(source_page_assets), "policy": "Source-page facsimiles are page provenance only, never inferred figures or captions."}, "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
+    manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": warnings, "visual_preservation": {"mode": visual_mode, "figure_count": sum(block.get("type") == "figure" for block in document["blocks"]), "policy": "Only CDM figure blocks are embedded. Prepared source pages are provenance, never whole-page figure fallbacks."}, "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
     _write(export_dir / "export_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return manifest
 

@@ -53,7 +53,11 @@ class ExportDocumentTests(unittest.TestCase):
         self.assertIn("Corrected prose", markdown); self.assertIn("Unknown layout block", markdown); self.assertIn("fallback review", markdown)
         self.assertEqual(markdown.count("| A | B |"), 4)
         self.assertIn("Heading &amp; &lt;safe&gt;", html); self.assertIn("Table fallback review", html)
-        with zipfile.ZipFile(self.root / "exports/book.docx") as archive: self.assertIn("word/document.xml", archive.namelist())
+        with zipfile.ZipFile(self.root / "exports/book.docx") as archive:
+            self.assertIn("word/document.xml", archive.namelist())
+            self.assertTrue(any(name.startswith("word/media/") for name in archive.namelist()))
+            xml = archive.read("word/document.xml")
+            self.assertIn(b"wrapSquare", xml)
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive:
             self.assertIn("mimetype", archive.namelist()); self.assertTrue(any(name.endswith(".png") for name in archive.namelist()))
         self.assertGreater((self.root / "exports/book.pdf").stat().st_size, 100)
@@ -71,7 +75,7 @@ class ExportDocumentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing structured"):
             export_document(self.root, ["markdown"])
 
-    def test_docx_preserves_source_page_facsimiles_when_no_figures_were_classified(self):
+    def test_docx_never_treats_a_prepared_source_page_as_a_figure(self):
         self.document["blocks"] = [block for block in self.document["blocks"] if block["type"] != "figure"]
         self.document["blocks"].insert(0, {"block_id": "break", "type": "page_break", "reading_order": 0, "provenance": {"source_page": 1}})
         for order, block in enumerate(self.document["blocks"], start=1):
@@ -84,12 +88,12 @@ class ExportDocumentTests(unittest.TestCase):
         write(self.root / "book_document.json", self.document)
         manifest = export_document(self.root, ["docx"])
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive:
-            self.assertTrue(any(name.startswith("word/media/") for name in archive.namelist()))
+            self.assertFalse(any(name.startswith("word/media/") for name in archive.namelist()))
         self.assertEqual(manifest["visual_preservation"], {
-            "mode": "source_page_facsimile_fallback", "source_page_facsimile_count": 1,
-            "policy": "Source-page facsimiles are page provenance only, never inferred figures or captions.",
+            "mode": "no_visual_evidence", "figure_count": 0,
+            "policy": "Only CDM figure blocks are embedded. Prepared source pages are provenance, never whole-page figure fallbacks.",
         })
-        self.assertTrue((self.root / "exports/assets/source-page-0001.png").is_file())
+        self.assertTrue(any(item["kind"] == "no_visual_evidence_for_docx" for item in manifest["warnings"]))
 
 
 if __name__ == "__main__": unittest.main()
