@@ -9,7 +9,6 @@ import signal
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +19,7 @@ from tools.process_lifecycle import LifecycleRegistry
 from tools.review_priority import PRIORITIES, prioritise_review, priority_text
 from tools.review_clusters import build_clusters
 from tools import document_identity
+from tools.owned_workspace import OwnedWorkspace
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -1716,8 +1716,9 @@ def main():
     qa_pages = []
     review_items = []
 
-    with tempfile.TemporaryDirectory(prefix="booktext_") as temp:
-        temp_dir = Path(temp)
+    # A marker-backed workspace makes cleanup ownership explicit. It never
+    # performs broad /tmp cleanup and cannot remove user output directories.
+    with OwnedWorkspace() as temp_dir:
 
         try:
             pages, total_pages = prepare_pages(
