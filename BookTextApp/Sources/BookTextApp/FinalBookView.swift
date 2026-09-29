@@ -2,12 +2,24 @@ import SwiftUI
 import AppKit
 import BookTextCore
 
+enum FinalBookSection: String, CaseIterable, Identifiable {
+    case preview, translation, export
+    var id: String { rawValue }
+    var label: String {
+        switch self { case .preview: "Book"; case .translation: "Translate"; case .export: "Export" }
+    }
+}
+
 @MainActor final class FinalBookModel: ObservableObject {
     @Published var inspection: [String: JSONValue] = [:]
     @Published var preview: [String: JSONValue] = [:]
     @Published var message = ""
     @Published var completedExportPath: String?
     @Published var loading = false
+    @Published var operationPhase = ""
+    @Published var operationCurrent: Int?
+    @Published var operationTotal: Int?
+    @Published var operationResumed = false
     private let outputURL: URL
     private let configuration: CoreConfiguration
     private var bridge: CoreProcessBridge?
@@ -15,15 +27,21 @@ import BookTextCore
 
     init(outputURL: URL, configuration: CoreConfiguration) { self.outputURL = outputURL; self.configuration = configuration }
     private func call(_ arguments: [String], completed: @escaping @MainActor ([String: JSONValue]) -> Void) {
-        loading = true; message = ""
+        loading = true; message = ""; operationCurrent = nil; operationTotal = nil; operationResumed = false
         let client = CoreProcessBridge(configuration: configuration); bridge = client
         do { try client.start(arguments: arguments, event: { [weak self] event in Task { @MainActor in
             guard let self else { return }
+            self.operationPhase = DocumentPresentationMapper.phaseLabel(event.phase)
+            self.operationCurrent = event.current ?? self.operationCurrent
+            self.operationTotal = event.total ?? self.operationTotal
+            if event.eventType == .jobResumed { self.operationResumed = true }
             if event.eventType == .jobCompleted { completed(event.details.object ?? [:]) }
             if event.eventType == .jobFailed { self.message = "\(event.code): \(event.message)" }
+            if event.eventType == .jobCancelled { self.message = "Operation stopped. Completed checkpoints remain available for resume." }
         } }, stderr: { _ in }, finished: { [weak self] _ in Task { @MainActor in self?.loading = false } }) }
         catch { loading = false; message = error.localizedDescription }
     }
+    func cancel() { bridge?.cancel() }
     func refresh() {
         call(["inspect", outputURL.path]) { [weak self] detail in
             self?.inspection = detail
@@ -84,39 +102,48 @@ import BookTextCore
 struct FinalBookView: View {
     @StateObject private var model: FinalBookModel
     @State private var showStructure = false
+    @State private var section: FinalBookSection
     @State private var translationSource = "en"
     @State private var translationModel = "qwen3:8b"
     @State private var selectedFormats: Set<String> = ["docx"]
     @Environment(\.dismiss) private var dismiss
-    init(outputURL: URL, configuration: CoreConfiguration) { _model = StateObject(wrappedValue: FinalBookModel(outputURL: outputURL, configuration: configuration)) }
+    private let outputURL: URL
+    init(outputURL: URL, configuration: CoreConfiguration, initialSection: FinalBookSection = .preview) {
+        self.outputURL = outputURL
+        _model = StateObject(wrappedValue: FinalBookModel(outputURL: outputURL, configuration: configuration))
+        _section = State(initialValue: initialSection)
+    }
     var body: some View { VStack(alignment: .leading, spacing: 12) {
-        HStack { Text("Final Book & Export").font(.title2.bold()); Spacer(); Button("Close") { dismiss() } }
-        Text("Core remains the source of truth. Final build, CDM, and export use existing artifacts only: no OCR, Vision, Tesseract, or LLM runs. Translation is an explicit optional local-model operation below.").font(.caption).foregroundStyle(.secondary)
+        HStack { Text(sectionTitle).font(.title2.bold()); Spacer(); Button("Close") { dismiss() } }
+        Picker("Action", selection: $section) { ForEach(FinalBookSection.allCases) { item in Text(item.label).tag(item) } }.pickerStyle(.segmented).labelsHidden()
         summary
-        HStack {
-            Button("Build Final Book", action: model.buildFinal).buttonStyle(.borderedProminent)
-            Button("Build / Refresh CDM", action: model.buildCDM)
-            Divider().frame(height: 20)
-            Menu("Formats (\(selectedFormats.count))") {
-                ForEach(Self.exportFormats, id: \.id) { format in
-                    Toggle(format.label, isOn: formatSelection(format.id))
-                }
-                Divider()
-                Button("Select all") { selectedFormats = Set(Self.exportFormats.map(\.id)) }
-                Button("Clear selection") { selectedFormats.removeAll() }
-            }
-            Button("Export selected") { model.export(Self.exportFormats.map(\.id).filter(selectedFormats.contains)) }
-                .disabled(selectedFormats.isEmpty)
-            Button("Export all") { model.export(["all"]) }
-        }.disabled(model.loading)
-        HStack { Button("Open final text") { model.openArtifact("final_text") }.disabled(model.loading); Button("Open final Markdown") { model.openArtifact("final_markdown") }.disabled(model.loading); Button("Reveal exports") { model.openArtifact("exports") }.disabled(model.loading); Button("Reveal translations") { model.openArtifact("translations") }.disabled(model.loading) }
-        translationControls
-        if model.loading { ProgressView() }
+        Group { switch section { case .preview: previewControls; case .translation: translationControls; case .export: exportControls } }
+        if model.loading { operationProgress }
         if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
         if model.completedExportPath != nil { HStack { Button("Open exported file", action: model.openCompletedExport); Button("Reveal exported file", action: model.revealCompletedExport) }.disabled(model.loading) }
-        Divider(); readerPreview
-        DisclosureGroup("Technical structure / diagnostics", isExpanded: $showStructure) { structureInspector }
+        if section == .preview { Divider(); readerPreview; DisclosureGroup("Technical structure / diagnostics", isExpanded: $showStructure) { structureInspector } }
     }.padding(20).frame(minWidth: 900, minHeight: 650).onAppear { model.refresh() } }
+
+    private var sectionTitle: String { switch section { case .preview: "Book Preview"; case .translation: "Translate Book"; case .export: "Export Book" } }
+
+    @ViewBuilder private var previewControls: some View {
+        HStack { Button("Open final text") { model.openArtifact("final_text") }; Button("Open final Markdown") { model.openArtifact("final_markdown") }; Spacer(); Button("Refresh Structure") { model.buildCDM() } }
+            .disabled(model.loading)
+        Text("Preview and final-book rebuilding use existing artifacts only; they do not run OCR or a language model.").font(.caption2).foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder private var exportControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Formats").font(.headline)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), alignment: .leading)], alignment: .leading) {
+                ForEach(Self.exportFormats, id: \.id) { format in Toggle(format.label, isOn: formatSelection(format.id)) }
+            }
+            HStack { Button("Select All") { selectedFormats = Set(ExportFormatSelection.supported) }; Button("Clear") { selectedFormats.removeAll() } }.buttonStyle(.link)
+            LabeledContent("Destination") { Text(outputURL.appendingPathComponent("deliverables").path).lineLimit(1).truncationMode(.middle).textSelection(.enabled) }
+            HStack { Button("Export \(selectedFormats.count) Format\(selectedFormats.count == 1 ? "" : "s")") { model.export(ExportFormatSelection.ordered(selectedFormats)) }.buttonStyle(.borderedProminent).disabled(selectedFormats.isEmpty || model.loading); Button("Reveal exports") { model.openArtifact("exports") }.disabled(model.loading) }
+        }
+        Text("BookText Core creates and validates every selected format. Files are opened only when you choose Open.").font(.caption2).foregroundStyle(.secondary)
+    }
 
     @ViewBuilder private var summary: some View {
         let review = model.inspection["review"]?.object
@@ -139,14 +166,25 @@ struct FinalBookView: View {
     }
 
     @ViewBuilder private var translationControls: some View {
-        HStack(spacing: 8) {
-            Text("Derived translation").font(.caption.weight(.semibold))
-            Picker("Source", selection: $translationSource) { Text("EN → RU").tag("en"); Text("RU → EN").tag("ru") }.labelsHidden().frame(width: 110)
-            TextField("Local Ollama model", text: $translationModel).textFieldStyle(.roundedBorder).frame(width: 150)
-            Button("Translate") { model.translate(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", model: translationModel) }
-            Button("Export translation") { model.exportTranslation(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", formats: Self.exportFormats.map(\.id).filter(selectedFormats.contains)) }
-        }.disabled(model.loading)
-        Text("Translate is an optional local Ollama operation. Export translation uses only the existing validated translation and CDM — no OCR or model runs.").font(.caption2).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("Direction", selection: $translationSource) { Text("English → Russian").tag("en"); Text("Russian → English").tag("ru") }.pickerStyle(.segmented).frame(maxWidth: 360)
+            HStack { Text("Local model"); TextField("Ollama model", text: $translationModel).textFieldStyle(.roundedBorder).frame(width: 180) }
+            HStack {
+                Button(model.loading ? "Translating…" : "Start Translation") { model.translate(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", model: translationModel) }.buttonStyle(.borderedProminent).disabled(model.loading)
+                if model.loading { Button("Stop", action: model.cancel) }
+                Button("Open Translation") { model.openArtifact("translations") }.disabled(model.loading)
+                Button("Export translation") { model.exportTranslation(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", formats: ExportFormatSelection.ordered(selectedFormats)) }.disabled(model.loading || selectedFormats.isEmpty)
+            }
+            if model.operationResumed { Label("Resuming translation. Completed text units will not be translated again.", systemImage: "arrow.clockwise.circle").foregroundStyle(.blue) }
+        }
+        Text("Translation uses the existing canonical book and resumable Core workflow. Checkpoint and context internals remain available only in diagnostics.").font(.caption2).foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder private var operationProgress: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ProgressView(value: Double(model.operationCurrent ?? 0), total: Double(max(model.operationTotal ?? 1, 1)))
+            Text(model.operationPhase.isEmpty ? "Working…" : model.operationPhase).font(.caption).foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder private var readerPreview: some View {

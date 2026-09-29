@@ -63,12 +63,56 @@ func shortLivedCoreDeliversItsFinalJSONLEvent() throws {
     try check(events.snapshot().contains(where: { $0.eventType == .jobCompleted && $0.jobID == "fast-job" }), "final JSONL event must reach the UI")
 }
 
+func documentCentricStateMapping() throws {
+    func inspection(high: Int = 0, medium: Int = 0, final: Bool = false, cdm: Bool = false, translation: Bool = false) -> [String: JSONValue] {
+        [
+            "run_summary": .object(["processed": .number(7)]),
+            "review": .object(["unresolved_priority_counts": .object(["HIGH": .number(Double(high)), "MEDIUM": .number(Double(medium))])]),
+            "cdm": .object(["present": .bool(cdm)]),
+            "artifacts": .object([
+                "final_build": .object(["exists": .bool(final)]),
+                "cdm": .object(["exists": .bool(cdm)]),
+                "translations": .object(["exists": .bool(translation)])
+            ])
+        ]
+    }
+    func state(source: Bool = false, output: Bool = false, job: JobPresentationState = .idle, data: [String: JSONValue] = [:], translating: Bool = false, resumable: Bool = false) -> DocumentPresentationSnapshot {
+        DocumentPresentationMapper.snapshot(sourceSelected: source, outputSelected: output, jobState: job, inspection: data, isTranslating: translating, translationResumable: resumable)
+    }
+
+    try check(state().state == .noDocument, "no-document state")
+    try check(state(source: true).state == .readyToProcess, "selected-source state")
+    try check(state(source: true, job: .running).state == .processing, "processing state")
+    try check(state(source: true, job: .cancelled).state == .interruptedResumable, "resume state")
+    try check(state(output: true, job: .completed, data: inspection(high: 2, medium: 3)).state == .reviewRequired, "review-required state")
+    try check(state(output: true, job: .completed, data: inspection()).state == .readyForFinalBuild, "ready-for-final-build state")
+    try check(state(output: true, job: .completed, data: inspection(final: true, cdm: true)).state == .bookReady, "book-ready state")
+    try check(state(output: true, job: .completed, data: inspection(final: true, cdm: true), translating: true).state == .translating, "translating state")
+    try check(state(output: true, job: .completed, data: inspection(final: true, cdm: true, translation: true)).state == .translationReady, "translation-ready state")
+    try check(state(output: true, job: .failed, data: inspection()).state == .failed, "error state")
+    try check(state(output: true, job: .completed, data: inspection(high: 1)).primaryAction == .reviewItems, "review primary action")
+    try check(state(output: true, job: .completed, data: inspection(final: true, cdm: true)).primaryAction == .openBook, "open-book primary action")
+
+    let beforeReview = state(output: true, job: .completed, data: inspection(high: 1))
+    let afterReview = state(output: true, job: .completed, data: inspection())
+    try check(beforeReview.state == .reviewRequired && afterReview.state == .readyForFinalBuild, "Core refresh after Review must change presentation without Swift decision state")
+    try check(DocumentPresentationMapper.phaseLabel("ocr") == "Recognizing text", "human-readable OCR phase")
+    try check(DocumentPresentationMapper.phaseLabel("translation") == "Translating book", "human-readable translation phase")
+}
+
+func recentsAndExportSelectionArePresentationOnly() throws {
+    let recents = RecentOutputList.normalized(["/tmp/one", "/tmp/two", "/tmp/one"], adding: "/tmp/three", limit: 3)
+    try check(recents == ["/tmp/three", "/tmp/one", "/tmp/two"], "recents must be bounded and deduplicated paths only")
+    let formats = ExportFormatSelection.ordered(Set(["pdf", "docx", "invalid"]))
+    try check(formats == ["docx", "pdf"], "export sheet must pass only supported selected formats in stable order")
+}
+
 func unwrap<T>(_ value: T?, _ message: String) throws -> T {
     guard let value else { throw NSError(domain: "BookTextProtocolTests", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
     return value
 }
 
 do {
-    try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping(); try reviewPayloadFixtureDecodesWithoutTerminalParsing(); try shortLivedCoreDeliversItsFinalJSONLEvent()
+    try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping(); try reviewPayloadFixtureDecodesWithoutTerminalParsing(); try shortLivedCoreDeliversItsFinalJSONLEvent(); try documentCentricStateMapping(); try recentsAndExportSelectionArePresentationOnly()
     print("BookTextProtocolTests: PASS")
 } catch { fputs("BookTextProtocolTests: FAIL \(error.localizedDescription)\n", stderr); exit(1) }
