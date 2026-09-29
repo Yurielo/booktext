@@ -24,6 +24,7 @@ import BookTextCore
     @Published var useTesseract = true
     @Published var includePDF = false
     @Published var nativeTextOnly = false
+    @Published var docxBusy = false
     private var bridge: CoreProcessBridge?
     private var startedAt: Date?
     private var preflightGeneration = 0
@@ -65,7 +66,7 @@ import BookTextCore
     private func finishRun(_ status: Int32) {
         guard presentation.state != .cancelled else { return }
         if status == 0, let outputURL {
-            nativeTextOnly ? buildNativeDocx(outputURL) : inspect(outputURL)
+            nativeTextOnly ? buildDocx(outputURL, openWhenReady: false) : inspect(outputURL)
         } else if presentation.state != .failed { presentation.state = .failed; errorText = "processing_failure: Core exited with \(status)." }
     }
     func cancel() { guard bridge?.isRunning == true else { return }; presentation.state = .cancelling; bridge?.cancel() }
@@ -76,21 +77,47 @@ import BookTextCore
             self?.presentation.consume(event); if event.eventType == .jobCompleted { self?.result = event.details.object ?? [:]; self?.presentation.state = .completed }
         } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { errorText = error.localizedDescription }
     }
-    private func buildNativeDocx(_ url: URL) {
+    /// Builds from existing artifacts only.  This does not enter the OCR run
+    /// path; Core validates the CDM and export manifest before a file is open.
+    func exportAndOpenDocx() {
+        guard let outputURL, !docxBusy else { return }
+        docxBusy = true
+        warningText = "Preparing DOCX from existing BookText artifacts…"
+        buildDocx(outputURL, openWhenReady: true)
+    }
+    private func buildDocx(_ url: URL, openWhenReady: Bool) {
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
         do { try client.start(arguments: ["cdm", url.path], event: { [weak self] event in Task { @MainActor in
             guard let self else { return }
-            if event.eventType == .jobCompleted { self.exportNativeDocx(url) }
-            if event.eventType == .jobFailed { self.presentation.state = .failed; self.errorText = "cdm_failure: \(event.message)" }
-        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { presentation.state = .failed; errorText = error.localizedDescription }
+            if event.eventType == .jobCompleted { self.exportDocx(url, openWhenReady: openWhenReady) }
+            if event.eventType == .jobFailed { self.docxBusy = false; self.presentation.state = .failed; self.errorText = "cdm_failure: \(event.message)" }
+        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { docxBusy = false; presentation.state = .failed; errorText = error.localizedDescription }
     }
-    private func exportNativeDocx(_ url: URL) {
+    private func exportDocx(_ url: URL, openWhenReady: Bool) {
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
         do { try client.start(arguments: ["export", url.path, "--format", "docx"], event: { [weak self] event in Task { @MainActor in
             guard let self else { return }
-            if event.eventType == .jobCompleted { self.inspect(url) }
-            if event.eventType == .jobFailed { self.presentation.state = .failed; self.errorText = "export_failure: \(event.message)" }
-        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { presentation.state = .failed; errorText = error.localizedDescription }
+            if event.eventType == .jobCompleted {
+                self.docxBusy = false
+                let entry = event.details.object?["result"]?.object?["generated"]?.object?["docx"]?.object
+                let relative = entry?["named_deliverable"]?.string ?? entry?["path"]?.string
+                if openWhenReady, let relative, let destination = self.safeOutputFile(url, relative) {
+                    NSWorkspace.shared.open(destination)
+                    self.warningText = "DOCX created and opened: \(destination.lastPathComponent)"
+                } else if openWhenReady {
+                    self.warningText = "DOCX was created, but its output path was not safe to open automatically."
+                }
+                self.inspect(url)
+            }
+            if event.eventType == .jobFailed { self.docxBusy = false; self.presentation.state = .failed; self.errorText = "export_failure: \(event.message)" }
+        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) } catch { docxBusy = false; presentation.state = .failed; errorText = error.localizedDescription }
+    }
+    private func safeOutputFile(_ root: URL, _ relative: String) -> URL? {
+        guard !relative.isEmpty, !relative.contains("..") else { return nil }
+        let base = root.standardizedFileURL
+        let candidate = base.appendingPathComponent(relative).standardizedFileURL
+        guard candidate.path.hasPrefix(base.path + "/"), candidate.pathExtension.lowercased() == "docx", FileManager.default.fileExists(atPath: candidate.path) else { return nil }
+        return candidate
     }
     func reveal() { if let outputURL { NSWorkspace.shared.activateFileViewerSelecting([outputURL]) } }
     func openPrimary() { guard let outputURL, let artifacts = result["artifacts"]?.object else { return }; let key = artifacts["clean_text"]?.object?["exists"]?.bool == true ? "clean_text" : "markdown"; if let relative = artifacts[key]?.object?["path"]?.string { NSWorkspace.shared.open(outputURL.appendingPathComponent(relative)) } }
@@ -121,7 +148,7 @@ struct ContentView: View {
         case .ready: Button("Start BookText") { model.start() }.buttonStyle(.borderedProminent).disabled(model.sourceURLs.isEmpty)
         case .running, .cancelling: VStack(alignment: .leading) { ProgressView(value: Double(model.presentation.current ?? 0), total: Double(max(model.presentation.total ?? 1, 1))); Text("\(model.presentation.phase ?? "working")  page \(model.presentation.page.map(String.init) ?? "—")  \(model.elapsed)"); Button(model.presentation.state == .cancelling ? "Cancelling…" : "Cancel") { model.cancel() }.disabled(model.presentation.state == .cancelling) }
         case .cancelled: Label("Cancelled — Core cleanup completed.", systemImage: "xmark.circle").foregroundStyle(.orange)
-        case .completed: VStack(alignment: .leading) { Label("Completed", systemImage: "checkmark.circle.fill").foregroundStyle(.green); if let url = model.outputURL { Text(url.path).textSelection(.enabled) }; resultSummary; HStack { Button("Reveal in Finder") { model.reveal() }; Button("Open Primary Result") { model.openPrimary() }; Button("Open Review") { model.openReview() } } }
+        case .completed: VStack(alignment: .leading) { Label("Completed", systemImage: "checkmark.circle.fill").foregroundStyle(.green); if let url = model.outputURL { Text(url.path).textSelection(.enabled) }; resultSummary; HStack { Button("Reveal in Finder") { model.reveal() }; Button("Open Primary Result") { model.openPrimary() }; Button("Open Review") { model.openReview() }; Button(model.docxBusy ? "Building DOCX…" : "Export & Open DOCX") { model.exportAndOpenDocx() }.disabled(model.docxBusy) } }
         case .failed: VStack(alignment: .leading) { Label("\(model.errorText)", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).textSelection(.enabled); Button("Retry Preflight") { model.preflight() } }
         }
         if !model.warningText.isEmpty { Text(model.warningText).font(.caption).foregroundStyle(.orange).lineLimit(4).textSelection(.enabled) }
