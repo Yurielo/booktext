@@ -62,7 +62,9 @@ def render_markdown(document, root, asset_map=None):
         kind, provenance = block["type"], block.get("provenance", {})
         page = provenance.get("source_page")
         if kind == "page_break":
-            lines.extend(["", f"<!-- source-page: {page} -->", "", "---"])
+            # Provenance remains in CDM; a source-page boundary is not a
+            # publication rule and must not draw a line in Word/Pandoc output.
+            lines.extend(["", f"<!-- source-page: {page} -->"])
         elif kind == "heading": lines.extend(["", "## " + block.get("text", "")])
         elif kind == "paragraph": lines.extend(["", block.get("text", "")])
         elif kind == "list": lines.extend(["", "- " + block.get("text", "")])
@@ -86,7 +88,7 @@ def render_html(document, root, asset_map=None):
     for block in document["blocks"]:
         kind, provenance = block["type"], block.get("provenance", {}); page = provenance.get("source_page")
         text = html.escape(str(block.get("text", ""))).replace("\n", "<br>\n")
-        if kind == "page_break": parts.append(f"<hr data-source-page=\"{page}\">")
+        if kind == "page_break": parts.append(f"<!-- source-page: {page} -->")
         elif kind == "heading": parts.append(f"<h2 data-source-page=\"{page}\">{text}</h2>")
         elif kind == "paragraph": parts.append(f"<p data-source-page=\"{page}\">{text}</p>")
         elif kind == "list": parts.append(f"<ul data-source-page=\"{page}\"><li>{text}</li></ul>")

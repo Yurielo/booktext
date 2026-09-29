@@ -51,8 +51,9 @@ class ExportDocumentTests(unittest.TestCase):
         markdown = (self.root / "exports/book.md").read_text(encoding="utf-8")
         html = (self.root / "exports/book.html").read_text(encoding="utf-8")
         self.assertIn("Corrected prose", markdown); self.assertIn("Unclassified content", markdown); self.assertNotIn("Unknown layout block", markdown); self.assertNotIn("fallback review", markdown)
+        self.assertNotIn("\n---\n", markdown)
         self.assertEqual(markdown.count("| A | B |"), 4)
-        self.assertIn("Heading &amp; &lt;safe&gt;", html); self.assertIn("Unclassified content", html); self.assertNotIn("Table fallback review", html)
+        self.assertIn("Heading &amp; &lt;safe&gt;", html); self.assertIn("Unclassified content", html); self.assertNotIn("Table fallback review", html); self.assertNotIn("<hr", html)
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive:
             self.assertIn("word/document.xml", archive.namelist())
             self.assertTrue(any(name.startswith("word/media/") for name in archive.namelist()))
