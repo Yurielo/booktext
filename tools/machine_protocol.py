@@ -30,7 +30,7 @@ JOB_FILENAME = ".booktext_job.json"
 PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "export")
 EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled")
 EXIT_CODES = {"success": 0, "invalid_input": 2, "preflight_failure": 3, "processing_failure": 4, "validation_failure": 5, "cancelled": 130, "stale_conflict": 6}
-COMMAND_PHASE = {"run": "ocr", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "export": "export", "inspect": None}
+COMMAND_PHASE = {"run": "ocr", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "export": "export", "inspect": None}
 
 
 class MachineError(RuntimeError):
@@ -128,6 +128,27 @@ def inspect_output(root):
             "cdm": {"present": artifacts["cdm"]["exists"], "schema_version": document.get("schema_version")},
             "exports": {"present": artifacts["exports"]["exists"], "validation": export.get("validation")},
             "run_summary": summary.get("pages")}
+
+
+def document_preview(root, *, index=0, limit=25):
+    """Return a bounded slice of an existing CDM for native UI navigation.
+
+    It is deliberately read-only: no OCR, final build, CDM rebuild, or model
+    is started merely to inspect a book.
+    """
+    root = Path(root).expanduser().resolve()
+    document = _load(root / "book_document.json")
+    if not isinstance(document, dict):
+        raise MachineError("invalid_input", "canonical document has not been built", details={"path": "book_document.json"})
+    try:
+        canonical_document.validate_document(document, root=root, decisions=_load(root / "review_decisions.json", {}))
+    except ValueError as error:
+        raise MachineError("validation_failure", str(error)) from error
+    blocks = document["blocks"]
+    index, limit = min(max(index, 0), len(blocks)), min(max(limit, 1), 100)
+    public_keys = ("block_id", "type", "text", "table_status", "review_required", "image", "description", "reading_order", "provenance")
+    counts = {kind: sum(block.get("type") == kind for block in blocks) for kind in canonical_document.BLOCK_TYPES}
+    return {"document_id": document.get("document_id"), "metadata": document.get("metadata", {}), "review": document.get("review", {}), "warnings": document.get("warnings", []), "block_counts": counts, "count": len(blocks), "index": index, "limit": limit, "blocks": [{key: block.get(key) for key in public_keys} for block in blocks[index:index + limit]]}
 
 
 def _dependency(name, *, path=None):
@@ -268,13 +289,22 @@ def _handle(args):
         return _invoke(emitter, root, "review", "offline review recovery", lambda: review_recovery.recover(root, surya_results=args.surya_results))
     if args.command == "cdm":
         return _invoke(emitter, root, "cdm", "CDM build", lambda: {"path": str(canonical_document.write_document(canonical_document.build_document(root), root))})
+    if args.command == "document-preview":
+        return _invoke(emitter, root, "cdm", "CDM preview", lambda: document_preview(root, index=args.index, limit=args.limit))
     if args.command == "export":
         return _invoke(emitter, root, "export", "export", lambda: export_document.export_document(root, args.format or ["all"]))
     if args.command == "final-build":
         def build():
             book, priority = review_decisions.load_json(Path(root)/"book.json"), review_decisions.load_json(Path(root)/"review_priority.json")
             decisions_path = Path(root)/"review_decisions.json"
-            decisions = review_decisions.load_json(decisions_path) if decisions_path.exists() else review_decisions.empty_decisions(Path(root)/"review_priority.json", Path(root)/"book.json")
+            # A final book without review decisions is valid. Persist the empty
+            # authoritative decision artifact before building so its source
+            # fingerprint is real and the final-build report is reproducible.
+            if decisions_path.exists():
+                decisions = review_decisions.load_json(decisions_path)
+            else:
+                decisions = review_decisions.empty_decisions(Path(root)/"review_priority.json", Path(root)/"book.json")
+                review_decisions.atomic_write_json(decisions_path, decisions)
             text, markdown, report = review_decisions.build_final(book, priority, decisions, book_path=Path(root)/"book.json", priority_path=Path(root)/"review_priority.json", decisions_path=decisions_path, booktext_version="0.1.0")
             review_decisions.write_final(root, text, markdown, report)
             if report["stale_or_conflict_count"]: raise MachineError("stale_conflict", "final build has stale or conflicting decisions", details=report)
@@ -342,6 +372,7 @@ def main(argv=None):
     p = sub.add_parser("inspect"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
+    p = sub.add_parser("document-preview"); p.add_argument("output_dir", type=Path); p.add_argument("--index", type=int, default=0); p.add_argument("--limit", type=int, default=25)
     p = sub.add_parser("recover"); p.add_argument("output_dir", type=Path); p.add_argument("--surya-results")
     p = sub.add_parser("export"); p.add_argument("output_dir", type=Path); p.add_argument("--format", action="append", choices=[*export_document.FORMATS, "all"])
     p = sub.add_parser("final-build"); p.add_argument("output_dir", type=Path)

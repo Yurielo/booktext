@@ -21,6 +21,7 @@ import BookTextCore
     @Published var result: [String: JSONValue] = [:]
     @Published var outputURL: URL?
     @Published var reviewPresented = false
+    @Published var finalPresented = false
     @Published var useTesseract = true
     @Published var includePDF = false
     @Published var nativeTextOnly = false
@@ -138,6 +139,7 @@ import BookTextCore
     func reveal() { if let outputURL { NSWorkspace.shared.activateFileViewerSelecting([outputURL]) } }
     func openPrimary() { guard let outputURL, let artifacts = result["artifacts"]?.object else { return }; let key = artifacts["clean_text"]?.object?["exists"]?.bool == true ? "clean_text" : "markdown"; if let relative = artifacts[key]?.object?["path"]?.string { NSWorkspace.shared.open(outputURL.appendingPathComponent(relative)) } }
     func openReview() { guard outputURL != nil else { return }; reviewPresented = true }
+    func openFinalBook() { guard outputURL != nil else { return }; finalPresented = true }
 }
 
 struct ContentView: View {
@@ -156,7 +158,7 @@ struct ContentView: View {
         } }
         status
         Spacer()
-    }.padding(24).sheet(isPresented: $model.reviewPresented) { if let output = model.outputURL { NativeReviewView(outputURL: output, configuration: CoreConfiguration(scriptPath: model.corePath)) } } }
+    }.padding(24).sheet(isPresented: $model.reviewPresented) { if let output = model.outputURL { NativeReviewView(outputURL: output, configuration: CoreConfiguration(scriptPath: model.corePath)) } }.sheet(isPresented: $model.finalPresented) { if let output = model.outputURL { FinalBookView(outputURL: output, configuration: CoreConfiguration(scriptPath: model.corePath)) } } }
     @ViewBuilder var status: some View {
         switch model.presentation.state {
         case .idle: Text("Choose an input to begin.")
@@ -164,7 +166,7 @@ struct ContentView: View {
         case .ready: Button("Start BookText") { model.start() }.buttonStyle(.borderedProminent).disabled(model.sourceURLs.isEmpty)
         case .running, .cancelling: VStack(alignment: .leading) { ProgressView(value: Double(model.presentation.current ?? 0), total: Double(max(model.presentation.total ?? 1, 1))); Text("\(model.presentation.phase ?? "working")  page \(model.presentation.page.map(String.init) ?? "—")  \(model.elapsed)"); Button(model.presentation.state == .cancelling ? "Cancelling…" : "Cancel") { model.cancel() }.disabled(model.presentation.state == .cancelling) }
         case .cancelled: Label("Cancelled — Core cleanup completed.", systemImage: "xmark.circle").foregroundStyle(.orange)
-        case .completed: VStack(alignment: .leading) { Label("Completed", systemImage: "checkmark.circle.fill").foregroundStyle(.green); if let url = model.outputURL { Text(url.path).textSelection(.enabled) }; resultSummary; HStack { Button("Reveal in Finder") { model.reveal() }; Button("Open Primary Result") { model.openPrimary() }; Button("Open Review") { model.openReview() }; Button(model.docxBusy ? "Building DOCX…" : "Export & Open DOCX") { model.exportAndOpenDocx() }.disabled(model.docxBusy) } }
+        case .completed: VStack(alignment: .leading) { Label("Completed", systemImage: "checkmark.circle.fill").foregroundStyle(.green); if let url = model.outputURL { Text(url.path).textSelection(.enabled) }; resultSummary; HStack { Button("Reveal in Finder") { model.reveal() }; Button("Open Primary Result") { model.openPrimary() }; Button("Open Review") { model.openReview() }; Button("Final Book & Export") { model.openFinalBook() }; Button(model.docxBusy ? "Building DOCX…" : "Export & Open DOCX") { model.exportAndOpenDocx() }.disabled(model.docxBusy) } }
         case .failed: VStack(alignment: .leading) { Label("\(model.errorText)", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).textSelection(.enabled); Button("Retry Preflight") { model.preflight() } }
         }
         if !model.warningText.isEmpty { Text(model.warningText).font(.caption).foregroundStyle(.orange).lineLimit(4).textSelection(.enabled) }
