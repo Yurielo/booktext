@@ -66,3 +66,27 @@ preserves the old derived revision before atomically publishing the new one.
 Machine translation is evidence for a later human language review, separate
 from OCR human review. Cloud and paid translation services are intentionally
 out of scope until the Product Owner explicitly chooses one.
+
+## Resumable logical-unit execution
+
+Translation is checkpointed below `translations/chunks/`, separately from OCR
+page chunks.  A translation chunk owns complete CDM text-block identifiers,
+never a physical page slice.  It records adjacent blocks only as read-only
+context.  Context is sent to the local model to improve continuity but is
+never committed or assembled as output.
+
+For every owned chunk BookText performs:
+
+`translate → validate → atomic checkpoint → verify → release transient request state`.
+
+Completed, hash-verified chunks are resumed without provider calls.  The final
+assembly checks exact source-unit coverage, duplicate absence, source order,
+and context-only exclusion before publishing the versioned translation
+artifact.  After successful assembly, checkpoint payloads are compacted while
+the source-anchored final artifact, plan metadata, and provenance remain.
+
+`--chunk-size` is measured in complete logical units, not pages.  `--restart`
+is explicit: it archives an existing derived translation before restarting its
+authenticated checkpoint workspace.  The machine `translation` operation emits
+chunk plan/start/completion/resume/assembly/cleanup JSONL events for native
+progress UI.

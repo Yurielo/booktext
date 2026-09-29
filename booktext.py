@@ -2247,13 +2247,15 @@ if __name__ == "__main__":
         parser.add_argument("--endpoint", default="http://127.0.0.1:11434")
         parser.add_argument("--timeout", type=int, default=120)
         parser.add_argument("--keep-alive", default="30s", help="Bounded Ollama model residency for this translation run (default: 30s)")
+        parser.add_argument("--chunk-size", type=int, default=12, help="Whole logical units per resumable translation checkpoint")
+        parser.add_argument("--restart", action="store_true", help="Archive current derived translation and restart its owned checkpoints")
         parser.add_argument("--validate", action="store_true", help="Validate existing translation only; do not contact a provider")
         options = parser.parse_args(sys.argv[2:])
         if options.validate:
             result = validate_translation(options.output_dir, source_language=options.source_language, target_language=options.target_language)
         else:
             result = translate_document(options.output_dir, source_language=options.source_language, target_language=options.target_language,
-                provider=options.provider, model=options.model, glossary_path=options.glossary, endpoint=options.endpoint, timeout=options.timeout, keep_alive=options.keep_alive)
+                provider=options.provider, model=options.model, glossary_path=options.glossary, endpoint=options.endpoint, timeout=options.timeout, keep_alive=options.keep_alive, chunk_size=options.chunk_size, restart=options.restart)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(0)
 

@@ -123,6 +123,47 @@ class TranslationTests(unittest.TestCase):
                 translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
         self.assertEqual("30s", cancelled[0]["keep_alive"])
 
+    @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
+    def test_logical_unit_checkpoints_resume_without_retranslating_completed_units(self, _metadata):
+        calls = []
+        failed_once = {"value": False}
+        def interrupted(**kwargs):
+            calls.append(kwargs["source"])
+            if kwargs["source"] == "Value 12.5 mg on 1/2 page." and not failed_once["value"]:
+                failed_once["value"] = True
+                raise ValueError("simulated provider interruption")
+            return self.fake_translate(**kwargs)
+        with mock.patch("tools.translation._translate_ollama", side_effect=interrupted):
+            with self.assertRaisesRegex(ValueError, "interruption"):
+                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=1)
+            plan_path = self.root / "translations/chunks/translation_plan.json"
+            plan = json.loads(plan_path.read_text())
+            self.assertEqual("complete", plan["chunks"][0]["status"])
+            self.assertEqual("failed", plan["chunks"][1]["status"])
+            self.assertTrue((self.root / plan["chunks"][0]["artifacts"]["checkpoint"]).is_file())
+            result = translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=1)
+        self.assertEqual(["HELLO", "Value 12.5 mg on 1/2 page.", "Value 12.5 mg on 1/2 page."], calls)
+        self.assertEqual(["chunk-0001"], result["execution"]["resumed_chunks"])
+        artifact = json.loads((self.root / "translations/en-ru.json").read_text())
+        self.assertEqual(["b1", "b2", "b3"], [item["block_id"] for item in artifact["blocks"]])
+        self.assertEqual("PASS", artifact["execution"]["assembly"]["context_only_output"])
+        final_plan = json.loads(plan_path.read_text())
+        self.assertEqual("complete", final_plan["assembly"]["status"])
+        self.assertTrue(all(item["artifacts"].get("checkpoint_compacted") for item in final_plan["chunks"]))
+        self.assertFalse((self.root / final_plan["chunks"][0]["artifacts"]["checkpoint"]).exists())
+
+    @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
+    @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
+    def test_chunk_plan_context_is_read_only_and_source_anchored(self, _translate, _metadata):
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=1)
+        plan = json.loads((self.root / "translations/chunks/translation_plan.json").read_text())
+        self.assertEqual(["b1"], plan["chunks"][0]["owned_unit_ids"])
+        self.assertEqual(["b2"], plan["chunks"][0]["context_after_unit_ids"])
+        self.assertEqual(["b1"], plan["chunks"][1]["context_before_unit_ids"])
+        contexts = [call.kwargs["document_context"] for call in _translate.call_args_list]
+        self.assertTrue(all(context["document_id"] == "book-1" for context in contexts))
+        self.assertTrue(all("owned source block" in context["output_contract"] for context in contexts))
+
     def test_direction_and_glossary_validation_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "direction"):
             translation.translate_document(self.root, source_language="en", target_language="en", provider="ollama", model="test-model")
