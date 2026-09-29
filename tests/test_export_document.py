@@ -50,17 +50,20 @@ class ExportDocumentTests(unittest.TestCase):
         self.assertEqual(manifest["fallback_unknown_counts"], {"unknown":1,"fallback_tables":1})
         markdown = (self.root / "exports/book.md").read_text(encoding="utf-8")
         html = (self.root / "exports/book.html").read_text(encoding="utf-8")
-        self.assertIn("Corrected prose", markdown); self.assertIn("Unknown layout block", markdown); self.assertIn("fallback review", markdown)
+        self.assertIn("Corrected prose", markdown); self.assertIn("Unclassified content", markdown); self.assertNotIn("Unknown layout block", markdown); self.assertNotIn("fallback review", markdown)
         self.assertEqual(markdown.count("| A | B |"), 4)
-        self.assertIn("Heading &amp; &lt;safe&gt;", html); self.assertIn("Table fallback review", html)
+        self.assertIn("Heading &amp; &lt;safe&gt;", html); self.assertIn("Unclassified content", html); self.assertNotIn("Table fallback review", html)
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive:
             self.assertIn("word/document.xml", archive.namelist())
             self.assertTrue(any(name.startswith("word/media/") for name in archive.namelist()))
             xml = archive.read("word/document.xml")
             self.assertIn(b"wrapSquare", xml)
+            self.assertNotIn(b"Unknown layout", xml)
+            self.assertNotIn(b"Table fallback review", xml)
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive:
             self.assertIn("mimetype", archive.namelist()); self.assertTrue(any(name.endswith(".png") for name in archive.namelist()))
         self.assertGreater((self.root / "exports/book.pdf").stat().st_size, 100)
+        self.assertTrue(any(item["kind"] == "fallback_table_not_rendered" and item["page"] == 319 for item in manifest["warnings"]))
         first_markdown = markdown; first_html = html
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive: first_docx_xml = archive.read("word/document.xml")
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive: first_epub_xhtml = archive.read("EPUB/text/ch001.xhtml")

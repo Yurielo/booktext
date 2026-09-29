@@ -66,11 +66,13 @@ def render_markdown(document, root, asset_map=None):
         elif kind == "heading": lines.extend(["", "## " + block.get("text", "")])
         elif kind == "paragraph": lines.extend(["", block.get("text", "")])
         elif kind == "list": lines.extend(["", "- " + block.get("text", "")])
-        elif kind == "unknown": lines.extend(["", f"> **Unknown layout block, source page {page}:**", "> " + block.get("text", "").replace("\n", "\n> ")])
+        # Unknown is a conservative CDM classification, not reader-facing
+        # content. Keep its text without a developer diagnostic label.
+        elif kind == "unknown": lines.extend(["", block.get("text", "")])
         elif kind == "table":
             lines.extend([""])
             if block.get("table_status") == "structured": lines.append(_markdown_table(_grid(root, block)))
-            else: lines.append(f"> **Table fallback review, source page {page}.** No verified cells are available.")
+            else: continue
         elif kind == "figure":
             lines.extend(["", f"![figure]({asset_map.get(block.get('image'), _asset_path(block.get('image')))})"])
             if block.get("caption_id"): lines.append(block["caption_id"])
@@ -88,9 +90,9 @@ def render_html(document, root, asset_map=None):
         elif kind == "heading": parts.append(f"<h2 data-source-page=\"{page}\">{text}</h2>")
         elif kind == "paragraph": parts.append(f"<p data-source-page=\"{page}\">{text}</p>")
         elif kind == "list": parts.append(f"<ul data-source-page=\"{page}\"><li>{text}</li></ul>")
-        elif kind == "unknown": parts.append(f"<section class=\"unknown\" data-source-page=\"{page}\"><strong>Unknown layout block</strong><br>{text}</section>")
+        elif kind == "unknown": parts.append(f"<p data-source-page=\"{page}\">{text}</p>")
         elif kind == "table":
-            if block.get("table_status") == "fallback_review": parts.append(f"<section class=\"fallback\" data-source-page=\"{page}\">Table fallback review; no verified cells are available.</section>")
+            if block.get("table_status") == "fallback_review": continue
             else:
                 grid = _grid(root, block); rows = []
                 for row_index, row in enumerate(grid):
@@ -232,6 +234,9 @@ def export_document(output_dir, formats):
     block_counts = {kind: sum(block["type"] == kind for block in document["blocks"]) for kind in ("unknown", "table")}
     visual_mode = "classified_or_recovered_visual_crops" if has_figures else "no_visual_evidence"
     warnings = list(document.get("warnings", []))
+    fallback_pages = sorted({block.get("provenance", {}).get("source_page") for block in document["blocks"] if block["type"] == "table" and block.get("table_status") == "fallback_review"})
+    for page in fallback_pages:
+        warnings.append({"kind": "fallback_table_not_rendered", "page": page, "message": "No verified table cells: retained in CDM/review evidence, not rendered as publication text."})
     if visual_mode == "no_visual_evidence":
         warnings.append({"kind": "no_visual_evidence_for_docx", "message": "CDM has no figure blocks or retained source-page assets; DOCX cannot safely add images."})
     manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": warnings, "visual_preservation": {"mode": visual_mode, "figure_count": sum(block.get("type") == "figure" for block in document["blocks"]), "policy": "Only CDM figure blocks are embedded. Prepared source pages are provenance, never whole-page figure fallbacks."}, "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
@@ -260,10 +265,10 @@ def _pdf_main(document_path, destination):
         if kind == "page_break": story.append(PageBreak())
         elif kind == "heading": story.extend([Paragraph(block.get("text", ""), styles["Heading2"]), Spacer(1, 8)])
         elif kind in {"paragraph", "list", "unknown"}:
-            prefix = "• " if kind == "list" else ("Unknown layout: " if kind == "unknown" else "")
+            prefix = "• " if kind == "list" else ""
             story.extend([Paragraph(prefix + html.escape(block.get("text", "")).replace("\n", "<br/>"), styles["BodyText"]), Spacer(1, 5)])
         elif kind == "table":
-            if block.get("table_status") == "fallback_review": story.extend([Paragraph("Table fallback review — no verified cells are available.", styles["Italic"]), Spacer(1, 5)])
+            if block.get("table_status") == "fallback_review": continue
             else:
                 table = Table(_grid(root, block), repeatRows=1)
                 table.setStyle(TableStyle([("GRID", (0,0), (-1,-1), .25, colors.grey), ("FONTNAME", (0,0), (-1,-1), "BookTextUnicode" if Path(font).is_file() else "Helvetica"), ("FONTSIZE", (0,0), (-1,-1), 7), ("BACKGROUND", (0,0), (-1,0), colors.lightgrey)])); story.extend([table, Spacer(1, 8)])
