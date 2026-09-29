@@ -22,6 +22,12 @@ class NativeExportUIContractTests(unittest.TestCase):
         self.assertRegex(source, r"func openCompletedExport\(\).*NSWorkspace\.shared\.open")
         self.assertRegex(source, r"func revealCompletedExport\(\).*activateFileViewerSelecting")
 
+    def test_translation_export_is_explicit_and_reuses_selected_formats(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn('Button("Export translation")', source)
+        self.assertIn('call(["translation-export", outputURL.path', source)
+        self.assertIn('formats: Self.exportFormats.map(\\.id).filter(selectedFormats.contains)', source)
+
 
 if __name__ == "__main__":
     unittest.main()

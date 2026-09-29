@@ -19,11 +19,11 @@ from pathlib import Path
 
 try:
     from tools.canonical_document import validate_document
-    from tools import document_identity
+    from tools import document_identity, translation
 except ModuleNotFoundError:  # helper may be invoked directly by another Python
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from tools.canonical_document import validate_document
-    from tools import document_identity
+    from tools import document_identity, translation
 
 
 EXPORT_SCHEMA = "1.0"
@@ -225,9 +225,14 @@ def _validate(path, fmt, root):
     return {"valid": True, "bytes": path.stat().st_size, "sha256": _sha(path)}
 
 
-def export_document(output_dir, formats):
+def export_document(output_dir, formats, *, document_override=None, export_relative="exports", basename="book", provenance=None, deliverable_label_prefix="publication"):
+    """Export canonical CDM, or a separately validated derivative projection.
+
+    ``document_override`` is intentionally in-memory.  Translation uses this
+    path so it cannot rewrite the canonical CDM or raw OCR artifacts.
+    """
     root = Path(output_dir).expanduser().resolve(); document_path = root / "book_document.json"
-    document = _load(document_path); decisions_path = root / "review_decisions.json"
+    document = document_override if document_override is not None else _load(document_path); decisions_path = root / "review_decisions.json"
     decisions = _load(decisions_path) if decisions_path.is_file() else None
     validate_document(document, root=root, decisions=decisions)
     selected = tuple(dict.fromkeys(formats or ()))
@@ -235,7 +240,7 @@ def export_document(output_dir, formats):
         raise ValueError("select at least one export format; use 'all' explicitly for every format")
     requested = FORMATS if "all" in selected else selected
     if any(value not in FORMATS for value in requested): raise ValueError("unsupported export format")
-    export_dir = root / "exports"; export_dir.mkdir(exist_ok=True)
+    export_dir = root / export_relative; export_dir.mkdir(parents=True, exist_ok=True)
     asset_map = {}
     needs_local_assets = any(fmt in requested for fmt in ("markdown", "html", "docx", "epub"))
     if needs_local_assets:
@@ -247,12 +252,12 @@ def export_document(output_dir, formats):
             destination.parent.mkdir(exist_ok=True); shutil.copyfile(source, destination)
             asset_map[block["image"]] = str(destination.relative_to(export_dir))
     markdown, html_text = render_markdown(document, root, asset_map), render_html(document, root, asset_map)
-    paths = {"markdown": export_dir / "book.md", "html": export_dir / "book.html", "docx": export_dir / "book.docx", "epub": export_dir / "book.epub", "pdf": export_dir / "book.pdf", "pdf_image": export_dir / "book-image.pdf"}
+    paths = {"markdown": export_dir / f"{basename}.md", "html": export_dir / f"{basename}.html", "docx": export_dir / f"{basename}.docx", "epub": export_dir / f"{basename}.epub", "pdf": export_dir / f"{basename}.pdf", "pdf_image": export_dir / f"{basename}-image.pdf"}
     if "markdown" in requested: _write(paths["markdown"], markdown)
     if "html" in requested: _write(paths["html"], html_text)
     has_figures = any(block.get("type") == "figure" for block in document["blocks"])
     if "docx" in requested:
-        docx_markdown = export_dir / ".book-docx-input.md"
+        docx_markdown = export_dir / f".{basename}-docx-input.md"
         _write(docx_markdown, markdown)
         try:
             _pandoc(docx_markdown, paths["docx"], root)
@@ -260,25 +265,35 @@ def export_document(output_dir, formats):
         finally:
             docx_markdown.unlink(missing_ok=True)
     if "epub" in requested:
-        epub_markdown = export_dir / ".book-epub-input.md"
+        epub_markdown = export_dir / f".{basename}-epub-input.md"
         _write(epub_markdown, markdown)
         try: _pandoc(epub_markdown, paths["epub"], root)
         finally: epub_markdown.unlink(missing_ok=True)
-    if "pdf" in requested: _render_pdf(document_path, paths["pdf"])
+    temporary_document = None
+    if document_override is not None and any(fmt in requested for fmt in ("pdf", "pdf_image")):
+        # Keep the temporary projection at the BookText root: PDF rendering
+        # resolves CDM figure/table references relative to that root.
+        temporary_document = root / f".{basename}-translation-export-document.json"
+        _write(temporary_document, json.dumps(document, ensure_ascii=False))
+        render_document_path = temporary_document
+    else:
+        render_document_path = document_path
+    if "pdf" in requested: _render_pdf(render_document_path, paths["pdf"])
     if "pdf_image" in requested:
         source_pdf = paths["pdf"]
         temporary_source = None
         if "pdf" not in requested:
             temporary_source = export_dir / ".book-image-source.pdf"
             source_pdf = temporary_source
-            _render_pdf(document_path, source_pdf)
+            _render_pdf(render_document_path, source_pdf)
         try: _render_image_pdf(source_pdf, paths["pdf_image"])
         finally:
             if temporary_source: temporary_source.unlink(missing_ok=True)
+    if temporary_document: temporary_document.unlink(missing_ok=True)
     validations = {fmt: _validate(paths[fmt], fmt, root) for fmt in requested}
     identity_sources = document.get("metadata", {}).get("source_files") or [document.get("metadata", {}).get("title") or "BookText document"]
     named = {
-        fmt: str(document_identity.register_deliverable(root, paths[fmt].relative_to(root), f"publication {fmt.upper()}", sources=identity_sources))
+        fmt: str(document_identity.register_deliverable(root, paths[fmt].relative_to(root), f"{deliverable_label_prefix} {fmt.upper()}", sources=identity_sources))
         for fmt in requested
     }
     block_counts = {kind: sum(block["type"] == kind for block in document["blocks"]) for kind in ("unknown", "table")}
@@ -290,8 +305,31 @@ def export_document(output_dir, formats):
     if visual_mode == "no_visual_evidence":
         warnings.append({"kind": "no_visual_evidence_for_docx", "message": "CDM has no figure blocks or retained source-page assets; DOCX cannot safely add images."})
     manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": warnings, "visual_preservation": {"mode": visual_mode, "figure_count": sum(block.get("type") == "figure" for block in document["blocks"]), "policy": "Only CDM figure blocks are embedded. Prepared source pages are provenance, never whole-page figure fallbacks."}, "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
+    if provenance:
+        manifest.update(provenance)
     _write(export_dir / "export_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return manifest
+
+
+def export_translation(output_dir, formats, *, source_language, target_language):
+    """Export an existing validated derivative translation without model calls."""
+    root = Path(output_dir).expanduser().resolve()
+    validation = translation.validate_translation(root, source_language=source_language, target_language=target_language)
+    if not validation["valid"] or validation["stale"]:
+        raise ValueError("translation must be valid and source-matched before export")
+    translation_manifest = _load(translation.translation_path(root, source_language, target_language))
+    source_document = _load(root / "book_document.json")
+    document = json.loads(json.dumps(source_document, ensure_ascii=False))
+    entries = {entry["block_id"]: entry for entry in translation_manifest["blocks"]}
+    for block in document["blocks"]:
+        entry = entries.get(block.get("block_id"))
+        if entry and isinstance(entry.get("translation"), str):
+            block["text"] = entry["translation"]
+    pair = f"{source_language}-{target_language}"
+    title = document.get("metadata", {}).get("title") or "BookText export"
+    document.setdefault("metadata", {})["title"] = f"{title} ({pair} translation)"
+    return export_document(root, formats, document_override=document, export_relative=f"translations/exports/{pair}", basename=f"book-{pair}", deliverable_label_prefix=f"translation {pair}",
+        provenance={"artifact_type": "booktext.translation_export_manifest", "translation": {"path": str(translation.translation_path(root, source_language, target_language).relative_to(root)), "translation_id": translation_manifest["translation_id"], "validation": validation, "raw_ocr_mutated": False}})
 
 
 def _pdf_main(document_path, destination):

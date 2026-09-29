@@ -30,7 +30,7 @@ JOB_FILENAME = ".booktext_job.json"
 PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "translation", "export")
 EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled", "chunk_plan_created", "chunk_started", "chunk_progress", "chunk_completed", "chunk_failed", "chunk_retry", "job_resumed", "assembly_started", "assembly_completed", "cleanup_started", "cleanup_progress", "cleanup_completed", "cleanup_warning")
 EXIT_CODES = {"success": 0, "invalid_input": 2, "preflight_failure": 3, "processing_failure": 4, "validation_failure": 5, "cancelled": 130, "stale_conflict": 6}
-COMMAND_PHASE = {"run": "ocr", "cleanup": "prepare", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "export": "export", "inspect": None}
+COMMAND_PHASE = {"run": "ocr", "cleanup": "prepare", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "translation-export": "export", "export": "export", "inspect": None}
 
 
 class MachineError(RuntimeError):
@@ -358,6 +358,9 @@ def _handle(args):
     if args.command == "translation-validate":
         return _invoke(emitter, root, "translation", "translation validation", lambda: translation.validate_translation(root,
             source_language=args.source_language, target_language=args.target_language))
+    if args.command == "translation-export":
+        return _invoke(emitter, root, "export", "translation export", lambda: export_document.export_translation(root, args.format,
+            source_language=args.source_language, target_language=args.target_language))
     if args.command == "final-build":
         def build():
             book, priority = review_decisions.load_json(Path(root)/"book.json"), review_decisions.load_json(Path(root)/"review_priority.json")
@@ -447,6 +450,7 @@ def main(argv=None):
             p.add_argument("--provider", default="ollama", choices=("ollama",)); p.add_argument("--model", required=True); p.add_argument("--glossary"); p.add_argument("--endpoint", default="http://127.0.0.1:11434"); p.add_argument("--timeout", type=int, default=120); p.add_argument("--keep-alive", default=translation.DEFAULT_MODEL_KEEP_ALIVE); p.add_argument("--chunk-size", type=int, default=translation.DEFAULT_LOGICAL_UNIT_CHUNK_SIZE); p.add_argument("--restart", action="store_true")
     translation_options(sub.add_parser("translation"))
     translation_options(sub.add_parser("translation-validate"), provider=False)
+    p = sub.add_parser("translation-export"); p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru")); p.add_argument("--format", action="append", required=True, choices=[*export_document.FORMATS, "all"])
     p = sub.add_parser("final-build"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("decision"); p.add_argument("output_dir", type=Path); p.add_argument("--item", required=True); p.add_argument("--action", choices=sorted(review_decisions.TEXT_ACTIONS), required=True); p.add_argument("--replacement"); p.add_argument("--note"); p.add_argument("--replace", action="store_true")
     p = sub.add_parser("baseline-preview"); p.add_argument("output_dir", type=Path)

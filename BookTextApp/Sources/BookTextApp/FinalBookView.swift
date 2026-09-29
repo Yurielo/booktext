@@ -48,16 +48,22 @@ import BookTextCore
             self?.refresh()
         }
     }
-    private func exportCompleted(_ formats: [String], _ detail: [String: JSONValue]) {
+    func exportTranslation(sourceLanguage: String, targetLanguage: String, formats: [String]) {
+        guard !formats.isEmpty else { message = "Select at least one translation export format."; return }
+        call(["translation-export", outputURL.path, "--source-language", sourceLanguage, "--target-language", targetLanguage] + formats.flatMap { ["--format", $0] }) { [weak self] detail in
+            self?.exportCompleted(formats, detail, label: "Translated")
+        }
+    }
+    private func exportCompleted(_ formats: [String], _ detail: [String: JSONValue], label: String = "") {
         completedExportPath = nil
         guard formats.count == 1, let format = formats.first else {
-            message = "Selected formats were validated by Core. Reveal exports to open them."
+            message = "\(label.isEmpty ? "Selected" : label) formats were validated by Core. Reveal exports to open them."
             refresh()
             return
         }
         let generated = detail["result"]?.object?["generated"]?.object?[format]?.object
         let relative = generated?["named_deliverable"]?.string ?? generated?["path"]?.string
-        if let relative, safeFile(relative) != nil { completedExportPath = relative; message = "\(format.uppercased()) validated by Core. Open or Reveal it when you are ready." }
+        if let relative, safeFile(relative) != nil { completedExportPath = relative; message = "\(label.isEmpty ? "" : label + " ")\(format.uppercased()) validated by Core. Open or Reveal it when you are ready." }
         else { message = "\(format.uppercased()) validated by Core. Use Reveal exports to locate it." }
         refresh()
     }
@@ -138,8 +144,9 @@ struct FinalBookView: View {
             Picker("Source", selection: $translationSource) { Text("EN → RU").tag("en"); Text("RU → EN").tag("ru") }.labelsHidden().frame(width: 110)
             TextField("Local Ollama model", text: $translationModel).textFieldStyle(.roundedBorder).frame(width: 150)
             Button("Translate") { model.translate(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", model: translationModel) }
+            Button("Export translation") { model.exportTranslation(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", formats: Self.exportFormats.map(\.id).filter(selectedFormats.contains)) }
         }.disabled(model.loading)
-        Text("Optional local Ollama operation. The original CDM/OCR remains unchanged; provider and model provenance are recorded.").font(.caption2).foregroundStyle(.secondary)
+        Text("Translate is an optional local Ollama operation. Export translation uses only the existing validated translation and CDM — no OCR or model runs.").font(.caption2).foregroundStyle(.secondary)
     }
 
     @ViewBuilder private var readerPreview: some View {

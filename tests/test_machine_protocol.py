@@ -118,6 +118,15 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertEqual("ru", kwargs["target_language"])
             self.assertEqual("30s", kwargs["keep_alive"])
 
+    @mock.patch("tools.machine_protocol.export_document.export_translation", return_value={"generated": {"docx": {}}})
+    def test_translation_export_uses_validated_derivative_operation(self, exported):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            code, payload = events(lambda: protocol.main(["translation-export", str(root), "--source-language", "en", "--target-language", "ru", "--format", "docx"]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            exported.assert_called_once_with(root, ["docx"], source_language="en", target_language="ru")
+            self.assertEqual("export", payload[-1]["phase"])
+
     def test_decision_and_final_build_use_existing_decision_semantics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.fixture(temporary)
