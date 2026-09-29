@@ -6,6 +6,7 @@ import BookTextCore
     @Published var inspection: [String: JSONValue] = [:]
     @Published var preview: [String: JSONValue] = [:]
     @Published var message = ""
+    @Published var completedExportPath: String?
     @Published var loading = false
     private let outputURL: URL
     private let configuration: CoreConfiguration
@@ -48,6 +49,7 @@ import BookTextCore
         }
     }
     private func exportCompleted(_ formats: [String], _ detail: [String: JSONValue]) {
+        completedExportPath = nil
         guard formats.count == 1, let format = formats.first else {
             message = "Selected formats were validated by Core. Reveal exports to open them."
             refresh()
@@ -55,10 +57,12 @@ import BookTextCore
         }
         let generated = detail["result"]?.object?["generated"]?.object?[format]?.object
         let relative = generated?["named_deliverable"]?.string ?? generated?["path"]?.string
-        if let relative, let url = safeFile(relative) { NSWorkspace.shared.open(url); message = "\(format.uppercased()) validated by Core and opened." }
-        else { message = "\(format.uppercased()) validated by Core. Use Reveal in Finder to open it." }
+        if let relative, safeFile(relative) != nil { completedExportPath = relative; message = "\(format.uppercased()) validated by Core. Open or Reveal it when you are ready." }
+        else { message = "\(format.uppercased()) validated by Core. Use Reveal exports to locate it." }
         refresh()
     }
+    func openCompletedExport() { guard let relative = completedExportPath, let url = safeFile(relative) else { return }; NSWorkspace.shared.open(url) }
+    func revealCompletedExport() { guard let relative = completedExportPath, let url = safeFile(relative) else { return }; NSWorkspace.shared.activateFileViewerSelecting([url]) }
     func openArtifact(_ key: String) { guard let path = inspection["artifacts"]?.object?[key]?.object?["path"]?.string, let url = safeFile(path) else { return }; NSWorkspace.shared.open(url) }
     func localImage(_ block: [String: JSONValue]) -> NSImage? {
         guard let path = block["image"]?.string, let url = safeFile(path) else { return nil }
@@ -103,6 +107,7 @@ struct FinalBookView: View {
         translationControls
         if model.loading { ProgressView() }
         if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
+        if model.completedExportPath != nil { HStack { Button("Open exported file", action: model.openCompletedExport); Button("Reveal exported file", action: model.revealCompletedExport) }.disabled(model.loading) }
         Divider(); readerPreview
         DisclosureGroup("Technical structure / diagnostics", isExpanded: $showStructure) { structureInspector }
     }.padding(20).frame(minWidth: 900, minHeight: 650).onAppear { model.refresh() } }

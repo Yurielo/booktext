@@ -27,6 +27,16 @@ BookText asks thinking-capable local models for a non-reasoning response
 (`think: false`): translation requires the rendered block, not an internal
 reasoning trace. This setting is stored in the per-block provider provenance.
 
+Each BookText translation request asks Ollama for a bounded `keep_alive: 30s`
+lease. Sequential blocks reuse the loaded model during that lease; after the
+last BookText request Ollama unloads the model naturally when the lease
+expires. BookText never calls a global unload, stops `ollama serve`, or kills a
+process by name, because that could interrupt another local client. The bounded
+lease applies on normal completion, provider failure, timeout, and cancellation
+once Ollama finishes the already-received request. Advanced CLI and machine
+callers may pass a bounded `--keep-alive` value such as `30s`; BookText accepts
+only 1 ms through 300 s and defaults to 30 s.
+
 ## Artifacts and safety
 
 For EN→RU, BookText writes:
