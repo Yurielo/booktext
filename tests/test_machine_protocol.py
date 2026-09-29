@@ -54,6 +54,18 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertTrue(result["artifacts"]["exports"]["exists"])
             self.assertEqual(1, result["review"]["unresolved_priority_counts"]["HIGH"])
 
+    def test_document_preview_is_bounded_and_read_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            code, _payload = events(lambda: protocol.main(["cdm", str(root)]))
+            self.assertEqual(0, code)
+            before = (root / "book_document.json").read_bytes()
+            code, payload = events(lambda: protocol.main(["document-preview", str(root), "--index", "0", "--limit", "1"]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            result = payload[-1]["details"]["result"]
+            self.assertEqual(1, len(result["blocks"]))
+            self.assertEqual(before, (root / "book_document.json").read_bytes())
+
     def test_decision_and_final_build_use_existing_decision_semantics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.fixture(temporary)
@@ -63,6 +75,14 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertEqual(0, code); self.assert_protocol(payload)
             self.assertTrue((root / "book_final.txt").is_file())
             self.assertIn("replacement", (root / "book_final.txt").read_text(encoding="utf-8"))
+
+    def test_final_build_without_prior_decisions_creates_empty_source_of_truth(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            code, payload = events(lambda: protocol.main(["final-build", str(root)]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            self.assertTrue((root / "review_decisions.json").is_file())
+            self.assertTrue((root / "book_final.txt").is_file())
 
     def test_confirmed_raw_surya_baseline_is_explicit_and_uses_no_ocr_process(self):
         with tempfile.TemporaryDirectory() as temporary:
