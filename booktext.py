@@ -868,7 +868,16 @@ def _recognize_pages_surya_batch(pages, output_dir, temp_dir):
 
     for page_number, _page in pages:
         key = f"page-{page_number:04d}"
-        page_data = merged.get(key)
+        # A page record is mandatory.  Its textual payload is not: a diagram,
+        # photograph, or deliberately excluded non-text page can legitimately
+        # have no OCR text.  Keep that page in the ordered result as an empty
+        # string so the caller can preserve its provenance and continue with
+        # the rest of the book.  An absent record is still a fail-closed OCR
+        # failure rather than silently manufactured evidence.
+        if key not in merged:
+            missing.append(page_number)
+            continue
+        page_data = merged[key]
 
         if isinstance(page_data, list):
             page_result = page_data[0] if page_data else {}
@@ -879,10 +888,7 @@ def _recognize_pages_surya_batch(pages, output_dir, temp_dir):
 
         text = _surya_page_text(page_result)
 
-        if not text:
-            missing.append(page_number)
-        else:
-            texts[page_number] = text
+        texts[page_number] = text
 
     if missing:
         raise RuntimeError(
@@ -907,7 +913,8 @@ def _recognize_pages_surya_batch(pages, output_dir, temp_dir):
         if previous_dir is not None:
             shutil.rmtree(previous_dir)
 
-    print(f"Surya OCR получен для страниц: {len(texts)}")
+    text_pages = sum(bool(text) for text in texts.values())
+    print(f"Surya OCR получен для страниц: {len(texts)} (с текстом: {text_pages})")
     return texts
 
 
