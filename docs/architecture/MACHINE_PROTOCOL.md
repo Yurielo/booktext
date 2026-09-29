@@ -15,13 +15,15 @@ stderr.
 ## Commands
 
 ```text
-booktext machine preflight [--operation run|export|cdm|final-build|review]
+booktext machine preflight [--operation run|export|cdm|final-build|review|translation]
 booktext machine run SOURCE... -- [existing BookText run options]
 booktext machine inspect OUTPUT_DIR
 booktext machine review OUTPUT_DIR [--page N]
 booktext machine decision OUTPUT_DIR --item ID --action ACTION [...]
 booktext machine final-build OUTPUT_DIR
 booktext machine cdm OUTPUT_DIR
+booktext machine translation OUTPUT_DIR --source-language en --target-language ru --model MODEL
+booktext machine translation-validate OUTPUT_DIR --source-language en --target-language ru
 booktext machine export OUTPUT_DIR --format FORMAT
 ```
 
@@ -36,7 +38,7 @@ Every record has `protocol_version`, `job_id`, `event_type`, `phase`,
 types are: `job_started`, `phase_started`, `progress`, `warning`,
 `artifact_created`, `review_summary`, `phase_completed`, `job_completed`,
 `job_failed`, and `job_cancelled`. Stable UI phases are `preflight`, `prepare`,
-`ocr`, `qa`, `visuals/tables`, `review`, `final_build`, `cdm`, and `export`.
+`ocr`, `qa`, `visuals/tables`, `review`, `final_build`, `cdm`, `translation`, and `export`.
 
 Exit codes: 0 success; 2 invalid input; 3 preflight/dependency failure; 4
 processing failure; 5 validation failure; 6 stale/conflict; 130 cancellation.

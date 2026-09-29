@@ -24,6 +24,8 @@
 - TXT, Markdown, JSON и searchable PDF;
 - извлечение и описание иллюстраций;
 - независимый Apple Vision QA с координатами и confidence;
+- отдельный source-anchored слой перевода EN↔RU из CDM с явным локальным
+  provider/model, без подмены OCR или финальной книги;
 - консервативная реконструкция таблиц частот из уже полученных Surya/Vision
   данных.
 
@@ -180,6 +182,22 @@ python3 booktext.py export /path/to/book_output --format all
 unresolved review и fallback/unknown counts. Подробный contract и локальные
 зависимости: [`docs/architecture/PUBLICATION_EXPORTS.md`](docs/architecture/PUBLICATION_EXPORTS.md).
 
+### Производный перевод EN↔RU
+
+Перевод запускается только явно и только от уже проверенного CDM. В первой
+версии поддержан локальный Ollama без скрытой модели или облачного fallback:
+
+```bash
+python3 booktext.py translate /path/to/book_output \
+  --source-language en --target-language ru \
+  --provider ollama --model qwen3:8b
+```
+
+Результат находится в `translations/`: block-level provenance, модель и
+настройки, исходный и переводной текст, а также target/bilingual Markdown.
+`--validate` проверяет staleness без обращения к модели. Подробный контракт:
+[`docs/architecture/TRANSLATION_LAYER.md`](docs/architecture/TRANSLATION_LAYER.md).
+
 ### Machine protocol for the future native app
 
 The future macOS app uses the versioned JSONL contract, never terminal prose:
@@ -188,6 +206,8 @@ The future macOS app uses the versioned JSONL contract, never terminal prose:
 python3 booktext.py machine preflight --operation export
 python3 booktext.py machine inspect /path/to/book_output
 python3 booktext.py machine export /path/to/book_output --format html
+python3 booktext.py machine translation /path/to/book_output \
+  --source-language en --target-language ru --model qwen3:8b
 ```
 
 Commands, stable events, exit codes, cancellation, and logical artifact

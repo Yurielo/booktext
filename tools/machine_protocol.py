@@ -20,17 +20,17 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tools import canonical_document, export_document, review_decisions, review_workspace, review_recovery
+from tools import canonical_document, export_document, review_decisions, review_workspace, review_recovery, translation
 from tools.process_lifecycle import ManagedProcess
 
 
 PROTOCOL_VERSION = "1.0"
 JOB_SCHEMA_VERSION = "1.0"
 JOB_FILENAME = ".booktext_job.json"
-PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "export")
+PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "translation", "export")
 EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled")
 EXIT_CODES = {"success": 0, "invalid_input": 2, "preflight_failure": 3, "processing_failure": 4, "validation_failure": 5, "cancelled": 130, "stale_conflict": 6}
-COMMAND_PHASE = {"run": "ocr", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "export": "export", "inspect": None}
+COMMAND_PHASE = {"run": "ocr", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "export": "export", "inspect": None}
 
 
 class MachineError(RuntimeError):
@@ -103,6 +103,7 @@ def artifact_map(root):
         "final_build": "final_build.json", "final_text": "book_final.txt", "final_markdown": "book_final.md",
         "cdm": "book_document.json", "exports": "exports/export_manifest.json", "book_manifest": "book.json",
         "clean_text": "book_clean.txt", "markdown": "book.md", "document_identity": "document_identity.json", "deliverables": "deliverables", "page_images": "pages", "images": "images", "descriptions": "descriptions",
+        "translations": "translations",
     }
     return {name: {"path": value, "exists": (root / value).exists()} for name, value in candidates.items()}
 
@@ -190,12 +191,16 @@ def preflight(operation="status"):
         required = [] ; optional = [_dependency("pandoc"), _dependency("pdfinfo")]
     elif operation == "native-text":
         required = [_dependency("pdftotext"), _dependency("pdfimages"), _dependency("pdfinfo")]
+    elif operation == "translation":
+        # Translation is opt-in and must never make local Ollama a requirement
+        # for OCR, review, CDM, or export.
+        optional = [_dependency("ollama")]
     result = {"protocol_version": PROTOCOL_VERSION, "booktext_version": __version__, "operation": operation,
               "dependencies": {"required": required, "optional": optional},
               "features": {"run": True, "surya": bool(optional and optional[0]["available"] and optional[1]["available"]) if operation in {"run", "status"} else None,
                            "vision_qa": bool(len(optional) > 2 and optional[2]["available"]) if operation in {"run", "status"} else None,
                            "native_pdf_text": operation == "native-text" and all(item["available"] for item in required),
-                           "review": True, "final_build": True, "cdm": True, "export": True},
+                           "review": True, "final_build": True, "cdm": True, "translation": operation == "translation", "export": True},
               "errors": [{"code": "missing_required_dependency", "dependency": item["name"], "message": f"Missing required dependency: {item['name']}"} for item in required if not item["available"]]}
     result["ok"] = not result["errors"]
     return result
@@ -315,6 +320,13 @@ def _handle(args):
         return _invoke(emitter, root, "cdm", "CDM preview", lambda: document_preview(root, index=args.index, limit=args.limit))
     if args.command == "export":
         return _invoke(emitter, root, "export", "export", lambda: export_document.export_document(root, args.format or ["all"]))
+    if args.command == "translation":
+        return _invoke(emitter, root, "translation", "translation", lambda: translation.translate_document(root,
+            source_language=args.source_language, target_language=args.target_language, provider=args.provider, model=args.model,
+            glossary_path=args.glossary, endpoint=args.endpoint, timeout=args.timeout))
+    if args.command == "translation-validate":
+        return _invoke(emitter, root, "translation", "translation validation", lambda: translation.validate_translation(root,
+            source_language=args.source_language, target_language=args.target_language))
     if args.command == "final-build":
         def build():
             book, priority = review_decisions.load_json(Path(root)/"book.json"), review_decisions.load_json(Path(root)/"review_priority.json")
@@ -390,13 +402,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol-version", action="version", version=PROTOCOL_VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("preflight"); p.add_argument("--operation", choices=("status", "run", "native-text", "export", "cdm", "final-build", "review"), default="status")
+    p = sub.add_parser("preflight"); p.add_argument("--operation", choices=("status", "run", "native-text", "export", "cdm", "final-build", "review", "translation"), default="status")
     p = sub.add_parser("inspect"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("document-preview"); p.add_argument("output_dir", type=Path); p.add_argument("--index", type=int, default=0); p.add_argument("--limit", type=int, default=25)
     p = sub.add_parser("recover"); p.add_argument("output_dir", type=Path); p.add_argument("--surya-results")
     p = sub.add_parser("export"); p.add_argument("output_dir", type=Path); p.add_argument("--format", action="append", choices=[*export_document.FORMATS, "all"])
+    def translation_options(p, *, provider=True):
+        p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru"))
+        if provider:
+            p.add_argument("--provider", default="ollama", choices=("ollama",)); p.add_argument("--model", required=True); p.add_argument("--glossary"); p.add_argument("--endpoint", default="http://127.0.0.1:11434"); p.add_argument("--timeout", type=int, default=120)
+    translation_options(sub.add_parser("translation"))
+    translation_options(sub.add_parser("translation-validate"), provider=False)
     p = sub.add_parser("final-build"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("decision"); p.add_argument("output_dir", type=Path); p.add_argument("--item", required=True); p.add_argument("--action", choices=sorted(review_decisions.TEXT_ACTIONS), required=True); p.add_argument("--replacement"); p.add_argument("--note"); p.add_argument("--replace", action="store_true")
     p = sub.add_parser("baseline-preview"); p.add_argument("output_dir", type=Path)
