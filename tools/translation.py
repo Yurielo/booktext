@@ -129,7 +129,11 @@ def _translate_ollama(*, endpoint, model, source, source_language, target_langua
         "response": "Return exactly JSON: {\"translation\": \"...\"}",
         "safety": "Preserve all numeric tokens, fractions, units, citations and proper identifiers exactly when possible.",
     }
-    payload = {"model": model, "stream": False, "format": "json", "options": {"temperature": 0},
+    # Translation needs a faithful rendered block, not a reasoning trace.
+    # Qwen3 and other thinking-capable local models can otherwise spend the
+    # whole bounded request window on hidden analysis before producing JSON.
+    # This remains an explicit provider setting in the resulting provenance.
+    payload = {"model": model, "stream": False, "format": "json", "think": False, "options": {"temperature": 0},
                "messages": [{"role": "system", "content": "You are a faithful document translator."},
                             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}]}
     request = urllib.request.Request(endpoint.rstrip("/") + "/api/chat", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"})
@@ -141,7 +145,7 @@ def _translate_ollama(*, endpoint, model, source, source_language, target_langua
     content = (((result.get("message") or {}).get("content")) if isinstance(result, dict) else None)
     if not isinstance(content, str):
         raise ValueError("local Ollama response is missing message content")
-    return _extract_translation(content), {"temperature": 0, "response_format": "json", "glossary_json": glossary_text}
+    return _extract_translation(content), {"temperature": 0, "thinking": False, "response_format": "json", "glossary_json": glossary_text}
 
 
 def _eligible(document):
