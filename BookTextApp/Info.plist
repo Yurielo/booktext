@@ -3,6 +3,7 @@
 <plist version="1.0"><dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleExecutable</key><string>BookText</string>
+  <key>CFBundleIconFile</key><string>BookText</string>
   <key>CFBundleIdentifier</key><string>local.yurielo.BookText</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>BookText</string>
