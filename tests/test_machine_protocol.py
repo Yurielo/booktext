@@ -64,6 +64,22 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertTrue((root / "book_final.txt").is_file())
             self.assertIn("replacement", (root / "book_final.txt").read_text(encoding="utf-8"))
 
+    def test_confirmed_raw_surya_baseline_is_explicit_and_uses_no_ocr_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            code, payload = events(lambda: protocol.main(["baseline-preview", str(root)]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            preview = payload[-1]["details"]["result"]
+            self.assertTrue(preview["requires_confirmation"])
+            self.assertFalse((root / "review_decisions.json").exists())
+            with mock.patch("subprocess.run", side_effect=AssertionError("must not invoke OCR/model")), mock.patch("subprocess.Popen", side_effect=AssertionError("must not invoke OCR/model")):
+                code, payload = events(lambda: protocol.main(["baseline-confirm", str(root), "--confirmed"]))
+                self.assertEqual(0, code); self.assert_protocol(payload)
+                self.assertTrue(payload[-1]["details"]["result"]["applied"])
+                code, payload = events(lambda: protocol.main(["final-build", str(root)]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            self.assertIn("A source sentence.", (root / "book_final.txt").read_text(encoding="utf-8"))
+
     def test_failure_and_cancellation_event_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "missing"

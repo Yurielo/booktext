@@ -23,6 +23,8 @@ import BookTextCore
     @Published var excludedMembers: Set<String> = []
     @Published var batchAction = "keep_surya"
     @Published var batchIDToRevert = ""
+    @Published var baselinePreview: [String: JSONValue] = [:]
+    @Published var baselineIDToRevert = ""
     private let outputURL: URL
     private let configuration: CoreConfiguration
     private var bridge: CoreProcessBridge?
@@ -82,6 +84,32 @@ import BookTextCore
     func revertBatch(_ batchID: String) {
         call(["batch-revert", outputURL.path, "--batch-id", batchID]) { [weak self] _ in self?.message = "Batch reverted by Core."; self?.load() }
     }
+    func previewRawSuryaBaseline() {
+        // This is deliberately whole-output only: a baseline is an explicit
+        // release decision, not a hidden application of the current filters.
+        call(["baseline-preview", outputURL.path]) { [weak self] details in
+            self?.baselinePreview = details["result"]?.object ?? [:]
+        }
+    }
+    func confirmRawSuryaBaseline() {
+        call(["baseline-confirm", outputURL.path, "--confirmed"]) { [weak self] details in
+            guard let self else { return }
+            let result = details["result"]?.object ?? [:]
+            self.baselineIDToRevert = result["baseline_id"]?.string ?? ""
+            self.baselinePreview = [:]
+            self.message = result["already_applied"]?.bool == true
+                ? "This raw Surya baseline is already recorded."
+                : "Raw Surya baseline saved atomically by Core. Raw OCR was not changed."
+            self.load()
+        }
+    }
+    func revertRawSuryaBaseline(_ baselineID: String) {
+        call(["baseline-revert", outputURL.path, "--baseline-id", baselineID]) { [weak self] _ in
+            self?.message = "Raw Surya baseline reverted safely by Core."
+            self?.baselinePreview = [:]
+            self?.load()
+        }
+    }
     func buildFinal() {
         call(["final-build", outputURL.path]) { [weak self] details in
             let report = details["result"]?.object ?? [:]
@@ -121,6 +149,7 @@ struct NativeReviewView: View {
             filters
             progress
             HStack { Button("Previous", action: model.previous).disabled(model.index == 0 || model.loading); Button("Next", action: model.next).disabled(model.index + 1 >= model.total || model.loading); Button("Next unresolved", action: model.nextUnresolved); Spacer(); Button("Build Final Book", action: model.buildFinal).buttonStyle(.borderedProminent) }
+            baselineControls
             if model.loading { ProgressView() }
             if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
             Divider(); if model.mode == .items { itemView } else { clusterView }
@@ -134,6 +163,30 @@ struct NativeReviewView: View {
         TextField("Page", text: $model.pageFilter).frame(width: 80); Button("Apply") { model.index = 0; model.load() }
     } }
     private var progress: some View { let p = model.progress; return Text("Queue \(model.index + 1)/\(model.total) · total \(p["total"]?.integer ?? 0) · unresolved \(p["unresolved"]?.integer ?? 0) · changed \(p["resolved_changed"]?.integer ?? 0) · no-change \(p["resolved_no_change"]?.integer ?? 0) · deferred \(p["deferred"]?.integer ?? 0) · stale/conflict \(p["stale_conflict"]?.integer ?? 0) · HIGH \(p["unresolved_high"]?.integer ?? 0) · MEDIUM \(p["unresolved_medium"]?.integer ?? 0)").font(.caption).textSelection(.enabled) }
+    @ViewBuilder private var baselineControls: some View {
+        HStack {
+            Text("Finish without detailed review:").font(.caption.bold())
+            Button("Accept raw Surya baseline…") { model.previewRawSuryaBaseline() }
+                .disabled(model.loading)
+            Text("Records item-level decisions; does not alter raw OCR.").font(.caption).foregroundStyle(.secondary)
+        }
+        if !model.baselinePreview.isEmpty {
+            GroupBox("Raw Surya baseline preview — no decision has been saved") {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("This applies to the whole output, not the current filters.")
+                    Text("Keep Surya: \(model.baselinePreview["keep_surya_count"]?.integer ?? 0) · deferred table fallback evidence: \(model.baselinePreview["deferred_table_fallback_count"]?.integer ?? 0) · existing decisions replaced: \(model.baselinePreview["replaced_existing_decision_count"]?.integer ?? 0)").font(.caption)
+                    Text(model.baselinePreview["policy"]?.string ?? "").font(.caption).foregroundStyle(.secondary)
+                    Button("Final confirmation: accept raw Surya for this whole book") { model.confirmRawSuryaBaseline() }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        HStack {
+            TextField("Raw Surya baseline ID to revert", text: $model.baselineIDToRevert)
+            Button("Revert raw baseline") { model.revertRawSuryaBaseline(model.baselineIDToRevert) }
+                .disabled(model.baselineIDToRevert.isEmpty || model.loading)
+        }
+    }
     @ViewBuilder private var itemView: some View {
         if model.item.isEmpty { ContentUnavailableView("No matching review items", systemImage: "checkmark.circle") }
         else { HSplitView {

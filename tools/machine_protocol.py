@@ -30,7 +30,7 @@ JOB_FILENAME = ".booktext_job.json"
 PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "export")
 EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled")
 EXIT_CODES = {"success": 0, "invalid_input": 2, "preflight_failure": 3, "processing_failure": 4, "validation_failure": 5, "cancelled": 130, "stale_conflict": 6}
-COMMAND_PHASE = {"run": "ocr", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "final-build": "final_build", "cdm": "cdm", "export": "export", "inspect": None}
+COMMAND_PHASE = {"run": "ocr", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "export": "export", "inspect": None}
 
 
 class MachineError(RuntimeError):
@@ -282,6 +282,12 @@ def _handle(args):
         return _invoke(emitter, root, "final_build", "final build", build)
     if args.command == "decision":
         return _invoke(emitter, root, "review", "review decision", lambda: review_decisions.record_decision(decisions_path=Path(root)/"review_decisions.json", priority_path=Path(root)/"review_priority.json", book_path=Path(root)/"book.json", item_id=args.item, action=args.action, replacement_text=args.replacement, note=args.note, replace=args.replace))
+    if args.command == "baseline-preview":
+        return _invoke(emitter, root, "review", "raw Surya baseline preview", lambda: review_decisions.raw_surya_baseline_plan(decisions_path=Path(root)/"review_decisions.json", priority_path=Path(root)/"review_priority.json", book_path=Path(root)/"book.json"))
+    if args.command == "baseline-confirm":
+        return _invoke(emitter, root, "review", "raw Surya baseline confirmation", lambda: review_decisions.apply_raw_surya_baseline(decisions_path=Path(root)/"review_decisions.json", priority_path=Path(root)/"review_priority.json", book_path=Path(root)/"book.json", confirmed=args.confirmed))
+    if args.command == "baseline-revert":
+        return _invoke(emitter, root, "review", "raw Surya baseline revert", lambda: review_decisions.revert_raw_surya_baseline(decisions_path=Path(root)/"review_decisions.json", baseline_id=args.baseline_id))
     if args.command == "review":
         workspace = review_workspace.ReviewWorkspace(root)
         filters = {"priority": args.priority, "status": args.status, "page": args.page}
@@ -340,6 +346,9 @@ def main(argv=None):
     p = sub.add_parser("export"); p.add_argument("output_dir", type=Path); p.add_argument("--format", action="append", choices=[*export_document.FORMATS, "all"])
     p = sub.add_parser("final-build"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("decision"); p.add_argument("output_dir", type=Path); p.add_argument("--item", required=True); p.add_argument("--action", choices=sorted(review_decisions.TEXT_ACTIONS), required=True); p.add_argument("--replacement"); p.add_argument("--note"); p.add_argument("--replace", action="store_true")
+    p = sub.add_parser("baseline-preview"); p.add_argument("output_dir", type=Path)
+    p = sub.add_parser("baseline-confirm"); p.add_argument("output_dir", type=Path); p.add_argument("--confirmed", action="store_true")
+    p = sub.add_parser("baseline-revert"); p.add_argument("output_dir", type=Path); p.add_argument("--baseline-id", required=True)
     def review_filters(p, *, page=True):
         p.add_argument("--priority", choices=("HIGH", "MEDIUM", "LOW", "INFO")); p.add_argument("--status", choices=("unresolved", "resolved_changed", "resolved_no_change", "deferred", "stale", "conflict", "invalid"))
         if page: p.add_argument("--page", type=int)
