@@ -34,7 +34,7 @@ class CanonicalDocumentTests(unittest.TestCase):
         review_decisions.record_decision(decisions_path=self.root / "review_decisions.json", priority_path=self.root / "review_priority.json", book_path=self.root / "book.json", item_id="change", action="accept_vision")
         write(self.root / "surya/surya-input/results.json", {"pages":[
             {"page":1,"blocks":[{"label":"Text","reading_order":1,"html":"<p>alpha foo</p>"},{"label":"Table","reading_order":2,"html":"<table><tr><td>a</td></tr></table>"}]},
-            {"page":2,"blocks":[{"label":"SectionHeader","reading_order":1,"html":"<h1>Heading</h1>"},{"label":"Text","reading_order":2,"html":"<p>body</p>"}]},
+            {"page":2,"blocks":[{"label":"PageHeader","reading_order":1,"html":"<p>46</p>"},{"label":"PageHeader","reading_order":2,"html":"<p>Parasites and contaminants</p>"},{"label":"SectionHeader","reading_order":3,"html":"<h1>Heading</h1>"},{"label":"Text","reading_order":4,"html":"<p>body</p>"}]},
             {"page":3,"blocks":[{"label":"Table","reading_order":1,"html":"<img>"}]},
         ]})
 
@@ -50,6 +50,9 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertEqual(len(corrected["provenance"]["correction_decision_ids"]), 1)
         headings = [b for b in first["blocks"] if b["type"] == "heading"]
         self.assertEqual(headings[0]["text"], "Heading"); self.assertIsNone(headings[0]["level"])
+        publication_text = "\n".join(block.get("text", "") for block in first["blocks"])
+        self.assertNotIn("Parasites and contaminants", publication_text)
+        self.assertNotIn("\n46\n", f"\n{publication_text}\n")
         tables = [b for b in first["blocks"] if b["type"] == "table"]
         self.assertEqual(tables[0]["table_status"], "structured")
         self.assertEqual(set(tables[0]["artifacts"]), {"json","tsv","html"})
@@ -97,6 +100,19 @@ class CanonicalDocumentTests(unittest.TestCase):
         (self.root / "surya/surya-input/results.json").unlink()
         document = build_document(self.root)
         self.assertIn("ambiguous table", [b.get("text") for b in document["blocks"] if b["type"] == "unknown"])
+
+    def test_legacy_page_text_removes_only_repeated_boundary_running_matter(self):
+        (self.root / "surya/surya-input/results.json").unlink()
+        (self.root / "review_decisions.json").unlink()
+        self.book["pages"] = [
+            {"page": number, "text": f"{number}\nParasites and contaminants\nBody text {number}"}
+            for number in (46, 47, 48)
+        ]
+        self.priority["items"] = []
+        write(self.root / "book.json", self.book); write(self.root / "review_priority.json", self.priority)
+        document = build_document(self.root)
+        values = [block["text"] for block in document["blocks"] if block["type"] == "unknown"]
+        self.assertEqual(values, ["Body text 46", "Body text 47", "Body text 48"])
 
     def test_recovered_visual_crop_becomes_a_figure_with_evidence_provenance(self):
         (self.root / "images/recovered.png").write_bytes(b"crop")
