@@ -23,6 +23,32 @@ class ProcessLifecycleTests(unittest.TestCase):
         self.assertTrue(child.cleanup())
         self.assertFalse(child.cleanup())
 
+    def test_cleanup_reaps_recorded_descendant_that_started_new_session(self):
+        registry = LifecycleRegistry()
+        code = (
+            "import subprocess,sys,time; "
+            "child=subprocess.Popen(['sleep','30'], start_new_session=True); "
+            "print(child.pid, flush=True); time.sleep(30)"
+        )
+        owned = registry.spawn([sys.executable, "-c", code], text=True, stdout=subprocess.PIPE)
+        escaped_pid = int(owned.process.stdout.readline().strip())
+        # Give the ownership monitor a deterministic chance to observe the
+        # descendant before its direct parent is terminated.
+        time.sleep(0.1)
+        try:
+            self.assertTrue(registry.cleanup())
+            deadline = time.monotonic() + 2
+            while self._alive(escaped_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(self._alive(escaped_pid))
+        finally:
+            if owned.process.stdout is not None:
+                owned.process.stdout.close()
+            try:
+                os.kill(escaped_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def test_forced_cleanup_and_other_group_survives(self):
         registry = LifecycleRegistry()
         owned = registry.spawn([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, lambda *_: None); time.sleep(30)"])
