@@ -49,6 +49,20 @@ For EN→RU, BookText writes:
 - `translations/history/`: preserved earlier derived revisions when the CDM
   changed.
 
+The validated derivative can be exported without re-running OCR or a model:
+
+```bash
+booktext machine translation-export OUTPUT_DIR \
+  --source-language en --target-language ru --format docx
+```
+
+One or more publication formats can be selected explicitly.  Generated files
+and their separate manifest live under
+`translations/exports/en-ru/`; ordinary book exports remain untouched.  This
+export uses an in-memory translated CDM projection built from the validated
+translation anchors.  It never changes canonical CDM, raw OCR, or review
+artifacts.
+
 Only textual CDM blocks participate. Page breaks, figures, image-only table
 fallbacks and excluded manuscript content never become invented translated
 text. A block already entirely in the target language is explicitly recorded

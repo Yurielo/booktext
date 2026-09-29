@@ -198,6 +198,15 @@ python3 booktext.py translate /path/to/book_output \
 
 Результат находится в `translations/`: block-level provenance, модель и
 настройки, исходный и переводной текст, а также target/bilingual Markdown.
+В приложении либо через machine protocol можно отдельно экспортировать уже
+валидный перевод в один или несколько выбранных форматов (Markdown, HTML,
+DOCX, EPUB, publication PDF и raster PDF), без повторного OCR или обращения
+к модели:
+
+```bash
+python3 booktext.py machine translation-export /path/to/book_output \
+  --source-language en --target-language ru --format docx
+```
 `--validate` проверяет staleness без обращения к модели. Подробный контракт:
 [`docs/architecture/TRANSLATION_LAYER.md`](docs/architecture/TRANSLATION_LAYER.md).
 
@@ -211,6 +220,8 @@ python3 booktext.py machine inspect /path/to/book_output
 python3 booktext.py machine export /path/to/book_output --format html
 python3 booktext.py machine translation /path/to/book_output \
   --source-language en --target-language ru --model qwen3:8b
+python3 booktext.py machine translation-export /path/to/book_output \
+  --source-language en --target-language ru --format docx
 ```
 
 Commands, stable events, exit codes, cancellation, and logical artifact

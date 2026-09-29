@@ -5,7 +5,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from tools.export_document import export_document
+from tools.export_document import export_document, export_translation
 
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACAQAAAABazTCJAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAACYktHRAAB3YoTpAAAAAd0SU1FB+oJHAcpDsplvHsAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDktMjhUMDc6NDE6MTQrMDA6MDAdjJROAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTA5LTI4VDA3OjQxOjE0KzAwOjAwbNEs8gAAACh0RVh0ZGF0ZTp0aW1lc3RhbXAAMjAyNi0wOS0yOFQwNzo0MToxNCswMDowMDvEDS0AAAAMSURBVAjXYzjAcAAAAwQBgcU7oqkAAAAASUVORK5CYII=")
@@ -91,6 +91,26 @@ class ExportDocumentTests(unittest.TestCase):
         self.assertFalse((self.root / "exports/book.md").exists())
         self.assertFalse((self.root / "exports/.book-docx-input.md").exists())
         self.assertFalse((self.root / "exports/.book-image-source.pdf").exists())
+
+    def test_translation_export_uses_valid_anchored_derivative_without_mutating_cdm(self):
+        before = (self.root / "book_document.json").read_bytes()
+        entries = []
+        for block in self.document["blocks"]:
+            if block["type"] not in {"heading", "paragraph", "list", "caption", "unknown"} or not block.get("text"): continue
+            text = block["text"]
+            entries.append({"block_id": block["block_id"], "source_text_sha256": __import__("hashlib").sha256(text.encode()).hexdigest(),
+                            "status": "machine_translated", "translation": "Перевод: " + text})
+        translation_manifest = {"schema_version": "1.0", "artifact_type": "booktext.translation", "translation_id": "translation-test",
+            "source": {"cdm_sha256": __import__("hashlib").sha256(before).hexdigest()}, "provider": {"model": "test"}, "blocks": entries}
+        write(self.root / "translations/en-ru.json", translation_manifest)
+        manifest = export_translation(self.root, ["markdown", "docx"], source_language="en", target_language="ru")
+        self.assertEqual(before, (self.root / "book_document.json").read_bytes())
+        self.assertEqual("booktext.translation_export_manifest", manifest["artifact_type"])
+        self.assertEqual("translations/en-ru.json", manifest["translation"]["path"])
+        self.assertTrue((self.root / "translations/exports/en-ru/book-en-ru.docx").is_file())
+        markdown = (self.root / "translations/exports/en-ru/book-en-ru.md").read_text(encoding="utf-8")
+        self.assertIn("Перевод: Corrected prose", markdown)
+        self.assertNotIn("Unknown layout block", markdown)
 
     def test_invalid_cdm_or_broken_table_fails_without_export_success(self):
         self.document["blocks"][4]["artifacts"]["json"] = "tables/missing.json"; write(self.root / "book_document.json", self.document)
