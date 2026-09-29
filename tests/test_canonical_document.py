@@ -43,6 +43,7 @@ class CanonicalDocumentTests(unittest.TestCase):
     def test_build_is_deterministic_conservative_and_corrected(self):
         first, second = build_document(self.root), build_document(self.root)
         self.assertEqual(first, second)
+        self.assertEqual(first["metadata"]["title"], "source")
         validate_document(first, root=self.root, decisions=review_decisions.load_json(self.root / "review_decisions.json"))
         corrected = [b for b in first["blocks"] if b["provenance"].get("source_page") == 1 and b["type"] == "unknown"][0]
         self.assertEqual(corrected["text"], "alpha bar")

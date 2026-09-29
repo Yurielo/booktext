@@ -22,6 +22,9 @@ class NativePdfTextTests(unittest.TestCase):
             self.assertFalse(book["ocr_performed"])
             self.assertEqual([page["text"] for page in book["pages"]], ["page one", "page two"])
             self.assertEqual(book["pages"][0]["source_provenance"]["kind"], "pdf_embedded_text")
+            self.assertEqual(book["document"]["title"], "digital")
+            self.assertTrue((output / "document_identity.json").is_file())
+            self.assertTrue((output / "deliverables" / "digital — OCR text.txt").is_file())
 
     def test_empty_embedded_text_refuses_silent_ocr_fallback(self):
         with tempfile.TemporaryDirectory() as temp:

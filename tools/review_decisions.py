@@ -322,6 +322,16 @@ def write_final(output_dir, final_text, final_markdown, report):
     (output_dir / "book_final.txt").write_text(final_text, encoding="utf-8")
     (output_dir / "book_final.md").write_text(final_markdown, encoding="utf-8")
     (output_dir / "final_build.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # Preserve stable canonical filenames and add portable user-facing names.
+    from tools import document_identity
+    sources = ()
+    try:
+        book = load_json(output_dir / "book.json")
+        sources = book.get("sources", []) if isinstance(book, dict) else ()
+    except ValueError:
+        pass
+    document_identity.register_deliverable(output_dir, "book_final.txt", "final text", sources=sources)
+    document_identity.register_deliverable(output_dir, "book_final.md", "final Markdown", sources=sources)
 
 
 def record_decision(*, decisions_path, priority_path, book_path, item_id, action, replacement_text=None, note=None, replace=False):

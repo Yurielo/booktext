@@ -17,9 +17,11 @@ from pathlib import Path
 
 try:
     from tools.canonical_document import validate_document
+    from tools import document_identity
 except ModuleNotFoundError:  # helper may be invoked directly by another Python
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from tools.canonical_document import validate_document
+    from tools import document_identity
 
 
 EXPORT_SCHEMA = "1.0"
@@ -170,8 +172,13 @@ def export_document(output_dir, formats):
     if "epub" in requested: _pandoc(paths["markdown"], paths["epub"], root)
     if "pdf" in requested: _render_pdf(document_path, paths["pdf"])
     validations = {fmt: _validate(paths[fmt], fmt, root) for fmt in requested}
+    identity_sources = document.get("metadata", {}).get("source_files") or [document.get("metadata", {}).get("title") or "BookText document"]
+    named = {
+        fmt: str(document_identity.register_deliverable(root, paths[fmt].relative_to(root), f"publication {fmt.upper()}", sources=identity_sources))
+        for fmt in requested
+    }
     block_counts = {kind: sum(block["type"] == kind for block in document["blocks"]) for kind in ("unknown", "table")}
-    manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": document.get("warnings", []), "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
+    manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": document.get("warnings", []), "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
     _write(export_dir / "export_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return manifest
 
