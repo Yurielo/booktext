@@ -98,5 +98,18 @@ class CanonicalDocumentTests(unittest.TestCase):
         document = build_document(self.root)
         self.assertIn("ambiguous table", [b.get("text") for b in document["blocks"] if b["type"] == "unknown"])
 
+    def test_recovered_visual_crop_becomes_a_figure_with_evidence_provenance(self):
+        (self.root / "images/recovered.png").write_bytes(b"crop")
+        write(self.root / "visual_evidence.json", {
+            "schema_version": "1.0", "artifact_type": "booktext.recovered_visual_evidence",
+            "visuals": [{"page": 1, "index": 1, "type": "diagram", "image": "images/recovered.png", "bbox": [.1, .2, .9, .8],
+                         "source_provenance": {"kind": "preserved_surya_layout_visual_crop", "ocr_performed": False}}],
+        })
+        document = build_document(self.root)
+        figure = next(block for block in document["blocks"] if block.get("image") == "images/recovered.png")
+        self.assertEqual(figure["type"], "figure")
+        self.assertEqual(figure["provenance"]["source"]["kind"], "preserved_surya_layout_visual_crop")
+        self.assertEqual(document["source"]["recovered_visual_evidence"]["path"], "visual_evidence.json")
+
 
 if __name__ == "__main__": unittest.main()

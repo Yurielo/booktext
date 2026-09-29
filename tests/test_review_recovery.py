@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image
+
 from tools.review_recovery import recover
 
 
@@ -39,6 +41,38 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertEqual(item["signals"]["surya_bbox_provenance"], "preserved_surya_text_block")
             self.assertEqual(summary["source_location_evidence"]["located_item_count"], 1)
             self.assertEqual(json.loads(review_path.read_text()), review)  # raw evidence remains immutable
+
+    def test_recovery_crops_only_preserved_layout_visuals_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "pages").mkdir()
+            Image.new("RGB", (100, 200), (40, 80, 120)).save(root / "pages/page-0001.png")
+            book = {"pages": [{"page": 1, "text": "plain text", "page_image": "pages/page-0001.png", "visuals": []}]}
+            review = {"pages": [{"page": 1, "agreement": .9, "surya_words": 2, "vision_words": 2}], "review": []}
+            (root / "book.json").write_text(json.dumps(book), encoding="utf-8")
+            review_path = root / "review.json"; review_path.write_text(json.dumps(review), encoding="utf-8")
+            results = root / "results.json"
+            results.write_text(json.dumps({"page-0001": [{"page": 1, "image_bbox": [0, 0, 100, 200], "blocks": [
+                {"label": "Picture", "bbox": [10, 20, 90, 80]},
+                {"label": "Text", "bbox": [0, 80, 100, 190]},
+                {"label": "Caption", "bbox": [10, 81, 90, 99]},
+            ]}]}), encoding="utf-8")
+            raw_book = (root / "book.json").read_bytes(); raw_review = review_path.read_bytes()
+            first = recover(root, surya_results=results)
+            artifact = json.loads((root / "visual_evidence.json").read_text(encoding="utf-8"))
+            self.assertEqual(first["visual_evidence"]["recovered_count"], 1)
+            self.assertEqual(len(artifact["visuals"]), 1)
+            visual = artifact["visuals"][0]
+            self.assertEqual(visual["type"], "picture")
+            self.assertEqual(visual["bbox"], [.1, .1, .9, .4])
+            self.assertEqual(visual["source_provenance"]["layout_label"], "Picture")
+            with Image.open(root / visual["image"]) as crop:
+                self.assertEqual(crop.size, (80, 60))
+            second = recover(root, surya_results=results)
+            self.assertEqual(second["visual_evidence"]["recovered_count"], 1)
+            self.assertEqual(json.loads((root / "visual_evidence.json").read_text(encoding="utf-8")), artifact)
+            self.assertEqual((root / "book.json").read_bytes(), raw_book)
+            self.assertEqual(review_path.read_bytes(), raw_review)
 
 
 if __name__ == "__main__": unittest.main()

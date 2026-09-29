@@ -71,6 +71,21 @@ def _surya_pages(root):
     return index, "surya/surya-input/results.json"
 
 
+def _recovered_visuals(root):
+    """Read offline crop evidence without promoting it to OCR-derived text."""
+    path = root / "visual_evidence.json"
+    if not path.is_file():
+        return {}, None
+    payload = _load(path)
+    if payload.get("schema_version") != "1.0" or payload.get("artifact_type") != "booktext.recovered_visual_evidence":
+        raise ValueError("unsupported recovered visual evidence schema/version")
+    index = {}
+    for visual in payload.get("visuals", []):
+        if isinstance(visual, dict) and isinstance(visual.get("page"), int):
+            index.setdefault(visual["page"], []).append(visual)
+    return index, "visual_evidence.json"
+
+
 def _block_text(block):
     value = block.get("html") or block.get("text") or block.get("markdown") or ""
     text = re.sub(r"<(?:br|/p|/div|/li)\b[^>]*>", "\n", str(value), flags=re.I)
@@ -134,6 +149,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
     decisions = _load(decisions_path) if decisions_path.is_file() else review_decisions.empty_decisions(priority_path, book_path)
     final_pages, final_report = _final_pages(book, priority, decisions, book_path, priority_path, decisions_path, booktext_version)
     surya, raw_surya_ref = _surya_pages(root)
+    recovered_visuals, recovered_visual_ref = _recovered_visuals(root)
     pages = sorted(book.get("pages", []), key=lambda value: value.get("page", 0))
     page_numbers = [value.get("page") for value in pages]
     if any(not isinstance(value, int) for value in page_numbers) or len(set(page_numbers)) != len(page_numbers):
@@ -205,14 +221,15 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                      "provenance": {**page_ref, "layout_label": label, "layout_reading_order": raw.get("reading_order"), "bbox": raw.get("bbox"), "polygon": raw.get("polygon"), "confidence": raw.get("confidence"), "raw_ocr_ref": raw_surya_ref}})
         for table in sorted(tables_by_index.values(), key=lambda value: value.get("index", 0)):
             add_table(table)
-        for visual in record.get("visuals") or []:
+        for visual in [*(record.get("visuals") or []), *recovered_visuals.get(page, [])]:
             image = _relative_if_file(root, visual.get("image"))
             if image is None:
                 warnings.append({"page": page, "kind": "missing_visual_asset", "path": visual.get("image")})
                 continue
-            add({"block_id": _stable_id("figure", f"{document_id}:{page}:{visual.get('index')}"), "type": "figure", "image": image,
+            visual_identity = visual.get("image") or visual.get("index")
+            add({"block_id": _stable_id("figure", f"{document_id}:{page}:{visual_identity}"), "type": "figure", "image": image,
                  "description": visual.get("description"), "description_ref": _relative_if_file(root, visual.get("description_file")), "caption_id": None,
-                 "provenance": {**page_ref, "visual_index": visual.get("index"), "visual_type": visual.get("type"), "bbox": visual.get("bbox")}})
+                 "provenance": {**page_ref, "visual_index": visual.get("index"), "visual_type": visual.get("type"), "bbox": visual.get("bbox"), "recovered_visual_evidence": recovered_visual_ref if visual.get("source_provenance") else None, "source": visual.get("source_provenance")}})
         add({"block_id": _stable_id("break", f"{document_id}:{page}"), "type": "page_break", "provenance": page_ref})
     unresolved = final_report.get("unresolved_priority_counts", {})
     source_document = book.get("document") if isinstance(book.get("document"), dict) else {}
@@ -221,7 +238,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
     document = {
         "schema_version": SCHEMA_VERSION, "artifact_type": ARTIFACT_TYPE, "document_id": document_id,
         "metadata": {"title": document_title, "author": None, "booktext_version": booktext_version, "source_page_count": len(pages), "languages": book.get("ocr_languages"), "ocr_engine": book.get("ocr_engine"), "source_files": source_files, "build_policy": "existing artifacts only; no OCR or model inference"},
-        "source": {"book_json": {"path": "book.json", "sha256": _hash_file(book_path)}, "document_identity": {"path": source_document.get("identity_artifact"), "title": document_title}, "review_priority": {"path": "review_priority.json", "sha256": _hash_file(priority_path)}, "review_decisions": {"path": decisions_path.name, "sha256": _hash_file(decisions_path) if decisions_path.is_file() else None}},
+        "source": {"book_json": {"path": "book.json", "sha256": _hash_file(book_path)}, "document_identity": {"path": source_document.get("identity_artifact"), "title": document_title}, "review_priority": {"path": "review_priority.json", "sha256": _hash_file(priority_path)}, "review_decisions": {"path": decisions_path.name, "sha256": _hash_file(decisions_path) if decisions_path.is_file() else None}, "recovered_visual_evidence": {"path": recovered_visual_ref, "sha256": _hash_file(root / recovered_visual_ref) if recovered_visual_ref else None}},
         "review": {"final_build": {"decision_status_counts": final_report.get("decision_status_counts", {}), "applied_text_changes": final_report.get("applied_text_changes", 0), "stale_or_conflict_count": final_report.get("stale_or_conflict_count", 0)}, "unresolved_priority_counts": {"HIGH": unresolved.get("HIGH", 0), "MEDIUM": unresolved.get("MEDIUM", 0)}},
         "source_pages": source_pages, "blocks": blocks, "notes": [], "warnings": warnings,
     }
