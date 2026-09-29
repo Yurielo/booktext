@@ -134,6 +134,55 @@ class ReviewOutputTests(unittest.TestCase):
 
 
 class SuryaOutputSafetyTests(unittest.TestCase):
+    def test_figure_only_page_is_a_valid_empty_ocr_result(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first, second = root / "page-0001.png", root / "page-0002.png"
+            first.write_bytes(b"figure")
+            second.write_bytes(b"text")
+            output, work = root / "surya", root / "work"
+
+            def write_surya_result(command):
+                staging = Path(command[command.index("--output_dir") + 1])
+                result_dir = staging / "surya-input"
+                result_dir.mkdir(parents=True)
+                (result_dir / "results.json").write_text(json.dumps({
+                    "page-0001": [{}],
+                    "page-0002": [{"text": "Recovered text"}],
+                }), encoding="utf-8")
+
+            with patch.object(booktext, "require_surya"), patch.object(
+                booktext, "run", side_effect=write_surya_result
+            ):
+                texts = booktext._recognize_pages_surya_batch(
+                    [(1, first), (2, second)], output, work
+                )
+
+            self.assertEqual(texts, {1: "", 2: "Recovered text"})
+            self.assertTrue((output / "surya-input" / "results.json").is_file())
+
+    def test_missing_surya_page_record_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first, second = root / "page-0001.png", root / "page-0002.png"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+
+            def write_incomplete_result(command):
+                staging = Path(command[command.index("--output_dir") + 1])
+                result_dir = staging / "surya-input"
+                result_dir.mkdir(parents=True)
+                (result_dir / "results.json").write_text(
+                    json.dumps({"page-0001": [{"text": "one"}]}), encoding="utf-8"
+                )
+
+            with patch.object(booktext, "require_surya"), patch.object(
+                booktext, "run", side_effect=write_incomplete_result
+            ), self.assertRaisesRegex(RuntimeError, "страниц: 2"):
+                booktext._recognize_pages_surya_batch(
+                    [(1, first), (2, second)], root / "surya", root / "work"
+                )
+
     def test_failed_rerun_keeps_previous_raw_output(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
