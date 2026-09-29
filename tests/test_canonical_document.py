@@ -45,7 +45,7 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first["metadata"]["title"], "source")
         validate_document(first, root=self.root, decisions=review_decisions.load_json(self.root / "review_decisions.json"))
-        corrected = [b for b in first["blocks"] if b["provenance"].get("source_page") == 1 and b["type"] == "unknown"][0]
+        corrected = [b for b in first["blocks"] if b["provenance"].get("source_page") == 1 and b["type"] == "paragraph"][0]
         self.assertEqual(corrected["text"], "alpha bar")
         self.assertEqual(len(corrected["provenance"]["correction_decision_ids"]), 1)
         headings = [b for b in first["blocks"] if b["type"] == "heading"]
@@ -96,10 +96,20 @@ class CanonicalDocumentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reading order"):
             validate_document(broken, root=self.root, decisions=decisions)
 
-    def test_missing_layout_preserves_page_text_as_unknown(self):
+    def test_missing_layout_projects_plain_text_as_paragraphs(self):
         (self.root / "surya/surya-input/results.json").unlink()
         document = build_document(self.root)
-        self.assertIn("ambiguous table", [b.get("text") for b in document["blocks"] if b["type"] == "unknown"])
+        self.assertIn("ambiguous table", [b.get("text") for b in document["blocks"] if b["type"] == "paragraph"])
+
+    def test_missing_layout_only_promotes_strong_textual_headings(self):
+        (self.root / "surya/surya-input/results.json").unlink()
+        self.book["pages"] = [{"page": 1, "text": "DOCUMENT TITLE\n\nOrdinary prose.\n\nArticle 12\n\nMore prose."}]
+        self.priority["items"] = []
+        write(self.root / "book.json", self.book); write(self.root / "review_priority.json", self.priority)
+        document = build_document(self.root)
+        page_blocks = [block for block in document["blocks"] if block["type"] != "page_break"]
+        self.assertEqual([block["type"] for block in page_blocks], ["heading", "paragraph", "heading", "paragraph"])
+        self.assertEqual([block["text"] for block in page_blocks], ["DOCUMENT TITLE", "Ordinary prose.", "Article 12", "More prose."])
 
     def test_legacy_page_text_removes_only_repeated_boundary_running_matter(self):
         (self.root / "surya/surya-input/results.json").unlink()
@@ -111,7 +121,7 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.priority["items"] = []
         write(self.root / "book.json", self.book); write(self.root / "review_priority.json", self.priority)
         document = build_document(self.root)
-        values = [block["text"] for block in document["blocks"] if block["type"] == "unknown"]
+        values = [block["text"] for block in document["blocks"] if block["type"] == "paragraph"]
         self.assertEqual(values, ["Body text 46", "Body text 47", "Body text 48"])
 
     def test_recovered_visual_crop_becomes_a_figure_with_evidence_provenance(self):

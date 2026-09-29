@@ -130,6 +130,21 @@ def inspect_output(root):
             "run_summary": summary.get("pages")}
 
 
+def _table_preview(root, block):
+    """Return bounded verified cells for presentation, never reconstructed data."""
+    if block.get("table_status") != "structured":
+        return None
+    json_path = (block.get("artifacts") or {}).get("json")
+    if not isinstance(json_path, str):
+        return None
+    payload = _load(Path(root) / json_path)
+    grid = payload.get("grid") if isinstance(payload, dict) else None
+    if not isinstance(grid, list) or not all(isinstance(row, list) for row in grid):
+        return None
+    # This is only a bounded projection of the already verified table artifact.
+    return [[str(cell) for cell in row[:12]] for row in grid[:30]]
+
+
 def document_preview(root, *, index=0, limit=25):
     """Return a bounded slice of an existing CDM for native UI navigation.
 
@@ -146,9 +161,16 @@ def document_preview(root, *, index=0, limit=25):
         raise MachineError("validation_failure", str(error)) from error
     blocks = document["blocks"]
     index, limit = min(max(index, 0), len(blocks)), min(max(limit, 1), 100)
-    public_keys = ("block_id", "type", "text", "table_status", "review_required", "image", "description", "reading_order", "provenance")
+    public_keys = ("block_id", "type", "text", "table_status", "review_required", "image", "description", "artifacts", "rows", "columns", "reading_order", "provenance")
     counts = {kind: sum(block.get("type") == kind for block in blocks) for kind in canonical_document.BLOCK_TYPES}
-    return {"document_id": document.get("document_id"), "metadata": document.get("metadata", {}), "review": document.get("review", {}), "warnings": document.get("warnings", []), "block_counts": counts, "count": len(blocks), "index": index, "limit": limit, "blocks": [{key: block.get(key) for key in public_keys} for block in blocks[index:index + limit]]}
+    public_blocks = []
+    for block in blocks[index:index + limit]:
+        value = {key: block.get(key) for key in public_keys}
+        table = _table_preview(root, block)
+        if table is not None:
+            value["table_preview"] = table
+        public_blocks.append(value)
+    return {"document_id": document.get("document_id"), "metadata": document.get("metadata", {}), "review": document.get("review", {}), "warnings": document.get("warnings", []), "block_counts": counts, "count": len(blocks), "index": index, "limit": limit, "blocks": public_blocks}
 
 
 def _dependency(name, *, path=None):

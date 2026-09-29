@@ -43,6 +43,10 @@ import BookTextCore
         refresh()
     }
     func openArtifact(_ key: String) { guard let path = inspection["artifacts"]?.object?[key]?.object?["path"]?.string, let url = safeFile(path) else { return }; NSWorkspace.shared.open(url) }
+    func localImage(_ block: [String: JSONValue]) -> NSImage? {
+        guard let path = block["image"]?.string, let url = safeFile(path) else { return nil }
+        return NSImage(contentsOf: url)
+    }
     private func safeFile(_ relative: String) -> URL? {
         guard !relative.isEmpty, !relative.contains("..") else { return nil }
         let root = outputURL.standardizedFileURL; let candidate = root.appendingPathComponent(relative).standardizedFileURL
@@ -52,6 +56,7 @@ import BookTextCore
 
 struct FinalBookView: View {
     @StateObject private var model: FinalBookModel
+    @State private var showStructure = false
     @Environment(\.dismiss) private var dismiss
     init(outputURL: URL, configuration: CoreConfiguration) { _model = StateObject(wrappedValue: FinalBookModel(outputURL: outputURL, configuration: configuration)) }
     var body: some View { VStack(alignment: .leading, spacing: 12) {
@@ -62,7 +67,8 @@ struct FinalBookView: View {
         HStack { Button("Open final text") { model.openArtifact("final_text") }.disabled(model.loading); Button("Open final Markdown") { model.openArtifact("final_markdown") }.disabled(model.loading); Button("Reveal exports") { model.openArtifact("exports") }.disabled(model.loading) }
         if model.loading { ProgressView() }
         if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
-        Divider(); preview
+        Divider(); readerPreview
+        DisclosureGroup("Technical structure / diagnostics", isExpanded: $showStructure) { structureInspector }
     }.padding(20).frame(minWidth: 900, minHeight: 650).onAppear { model.refresh() } }
 
     @ViewBuilder private var summary: some View {
@@ -73,13 +79,56 @@ struct FinalBookView: View {
         if let warnings = model.preview["warnings"]?.values, !warnings.isEmpty { Text("Warnings: \(warnings.count) (fallback/unknown content remains explicit in CDM and exports)").font(.caption).foregroundStyle(.orange) }
     }
 
-    @ViewBuilder private var preview: some View {
+    @ViewBuilder private var readerPreview: some View {
         let blocks = model.preview["blocks"]?.values ?? []
         let index = model.preview["index"]?.integer ?? 0
         let total = model.preview["count"]?.integer ?? 0
-        HStack { Text("Canonical structure").font(.headline); Spacer(); Button("Previous") { model.loadPreview(index: max(0, index - 20)) }.disabled(index == 0 || model.loading); Button("Next") { model.loadPreview(index: index + 20) }.disabled(index + blocks.count >= total || model.loading); Text("\(min(index + 1, total))–\(min(index + blocks.count, total)) of \(total)").font(.caption) }
-        ScrollView { LazyVStack(alignment: .leading, spacing: 8) { ForEach(Array(blocks.enumerated()), id: \.offset) { _, value in
-            if let block = value.object { VStack(alignment: .leading, spacing: 3) { Text("\(block["type"]?.string ?? "unknown") · source page \(block["provenance"]?.object?["source_page"]?.integer ?? 0)").font(.caption.bold()); Text(block["text"]?.string ?? (block["table_status"]?.string == "fallback_review" ? "Unverified fallback table — no cells are displayed." : "Figure / non-text block")).lineLimit(4); if block["table_status"]?.string == "fallback_review" { Text("Fallback evidence, not verified table data.").font(.caption).foregroundStyle(.orange) } }.padding(.vertical, 4).frame(maxWidth: .infinity, alignment: .leading) }
-        } } }
+        HStack { Text("Book preview").font(.headline); Spacer(); Button("Previous") { model.loadPreview(index: max(0, index - 20)) }.disabled(index == 0 || model.loading); Button("Next") { model.loadPreview(index: index + 20) }.disabled(index + blocks.count >= total || model.loading); Text("\(min(index + 1, total))–\(min(index + blocks.count, total)) of \(total)").font(.caption) }
+        ScrollView { LazyVStack(alignment: .leading, spacing: 14) {
+            if index == 0, let title = model.preview["metadata"]?.object?["title"]?.string, !title.isEmpty {
+                VStack(spacing: 8) { Spacer(minLength: 28); Text(title).font(.title.bold()).multilineTextAlignment(.center); Spacer(minLength: 20) }.frame(maxWidth: .infinity)
+            }
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, value in if let block = value.object { readerBlock(block) } }
+        }.frame(maxWidth: 760, alignment: .leading).padding(.horizontal, 32).padding(.vertical, 12) }
+    }
+
+    @ViewBuilder private func readerBlock(_ block: [String: JSONValue]) -> some View {
+        let type = block["type"]?.string ?? "unknown"
+        switch type {
+        case "heading": Text(block["text"]?.string ?? "").font(.title3.weight(.semibold)).padding(.top, 12)
+        case "paragraph", "unknown": Text(block["text"]?.string ?? "").font(.body).fixedSize(horizontal: false, vertical: true)
+        case "list": Text(block["text"]?.string ?? "").font(.body).padding(.leading, 20).fixedSize(horizontal: false, vertical: true)
+        case "page_break":
+            VStack(spacing: 6) { Divider(); Text("Source page \(block["provenance"]?.object?["source_page"]?.integer ?? 0)").font(.caption).foregroundStyle(.secondary) }.padding(.vertical, 10)
+        case "figure":
+            VStack(alignment: .leading, spacing: 6) {
+                if let image = model.localImage(block) { Image(nsImage: image).resizable().scaledToFit().frame(maxWidth: 680) }
+                if let description = block["description"]?.string, !description.isEmpty { Text(description).font(.caption).foregroundStyle(.secondary) }
+            }.frame(maxWidth: .infinity, alignment: .center)
+        case "table": tableBlock(block)
+        case "caption": Text(block["text"]?.string ?? "").font(.caption).foregroundStyle(.secondary).italic()
+        default: Text(block["text"]?.string ?? "").font(.body)
+        }
+    }
+
+    @ViewBuilder private func tableBlock(_ block: [String: JSONValue]) -> some View {
+        if block["table_status"]?.string == "fallback_review" {
+            Text("Table preserved as review evidence; no unverified cells are shown.").font(.caption).foregroundStyle(.orange).padding(8).frame(maxWidth: .infinity, alignment: .leading).background(Color.orange.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 6))
+        } else {
+            let rows = block["table_preview"]?.values ?? []
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, value in
+                    HStack(spacing: 0) { ForEach(Array((value.values ?? []).enumerated()), id: \.offset) { _, cell in Text(cell.string ?? "").font(.body).frame(minWidth: 80, maxWidth: .infinity, alignment: .leading).padding(6).overlay(Rectangle().stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)) } }
+                        .fontWeight(rowIndex == 0 ? .semibold : .regular)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder private var structureInspector: some View {
+        let blocks = model.preview["blocks"]?.values ?? []
+        ScrollView { LazyVStack(alignment: .leading, spacing: 5) { ForEach(Array(blocks.enumerated()), id: \.offset) { _, value in
+            if let block = value.object { Text("\(block["type"]?.string ?? "unknown") · source page \(block["provenance"]?.object?["source_page"]?.integer ?? 0)").font(.caption.monospaced()); Text(block["text"]?.string ?? "").font(.caption).lineLimit(2).foregroundStyle(.secondary) }
+        } }.padding(.top, 4) }.frame(maxHeight: 180)
     }
 }

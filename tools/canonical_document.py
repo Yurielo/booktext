@@ -152,6 +152,30 @@ def _without_running_matter(text, repeated_lines):
     return "\n".join(kept).strip()
 
 
+def _fallback_text_blocks(text):
+    """Project page text without saved layout blocks conservatively.
+
+    Native-text and Tesseract-only runs retain paragraph breaks, even when they
+    do not retain Surya layout blocks.  Those breaks are sufficient evidence for
+    ordinary prose paragraphs; representing every page as ``unknown`` makes a
+    readable final book look like a developer diagnostic.  We only promote a
+    paragraph to a heading when its textual form is independently strong.  All
+    other content remains a paragraph rather than acquiring invented semantics.
+    """
+    for value in re.split(r"\n\s*\n", str(text or "").strip()):
+        value = value.strip()
+        if not value:
+            continue
+        compact = " ".join(line.strip() for line in value.splitlines() if line.strip())
+        letters = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", compact)
+        explicit_article = re.fullmatch(r"(?:статья|article)\s+\d+[A-Za-zА-Яа-яЁё.-]*", compact, flags=re.I)
+        uppercase_short = (
+            len(compact) <= 120 and bool(letters) and letters == letters.upper()
+            and len(letters) >= 3
+        )
+        yield ("heading" if explicit_article or uppercase_short else "paragraph"), value
+
+
 def _final_pages(book, priority, decisions, book_path, priority_path, decisions_path, version):
     """Use the existing #33 semantics, then recover only final per-page text."""
     if not Path(decisions_path).is_file():
@@ -247,9 +271,11 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                 add({"block_id": _stable_id("table", f"{document_id}:{page}:{index}"), "type": "table", "table_status": "fallback_review", "review_required": True, "diagnostic": table.get("diagnostic"), "provenance": provenance})
         if has_changed_text or not isinstance(page_blocks, list):
             text = _without_running_matter(final_pages.get(page, str(record.get("text", ""))), repeated_running_lines)
-            if text:
-                add({"block_id": _stable_id("block", f"{document_id}:{page}:page-text"), "type": "unknown", "text": text,
-                     "provenance": {**page_ref, "raw_page_text_sha256": _hash_bytes(str(record.get("text", "")).encode()), "correction_decision_ids": [did for _item, did in changed_by_page.get(page, []) if did], "fallback_reason": "valid_corrections_require_page_text_projection" if has_changed_text else "layout_blocks_unavailable"}})
+            fallback_reason = "valid_corrections_require_page_text_projection" if has_changed_text else "layout_blocks_unavailable"
+            for fallback_index, (kind, fragment) in enumerate(_fallback_text_blocks(text), start=1):
+                add({"block_id": _stable_id("block", f"{document_id}:{page}:page-text:{fallback_index}"), "type": kind, "text": fragment,
+                     "level": None if kind == "heading" else None,
+                     "provenance": {**page_ref, "raw_page_text_sha256": _hash_bytes(str(record.get("text", "")).encode()), "correction_decision_ids": [did for _item, did in changed_by_page.get(page, []) if did], "fallback_reason": fallback_reason}})
         else:
             raw_table_index = 0
             for index, raw in enumerate(sorted((value for value in page_blocks if isinstance(value, dict)), key=lambda value: value.get("reading_order", 0)), start=1):
