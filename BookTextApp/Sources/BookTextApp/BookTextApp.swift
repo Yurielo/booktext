@@ -26,6 +26,7 @@ import BookTextCore
     @Published var includePDF = false
     @Published var nativeTextOnly = false
     @Published var docxBusy = false
+    @Published var cleanupBusy = false
     private var bridge: CoreProcessBridge?
     private var startedAt: Date?
     private var preflightGeneration = 0
@@ -156,6 +157,25 @@ import BookTextCore
     func openPrimary() { guard let outputURL, let artifacts = result["artifacts"]?.object else { return }; let key = artifacts["clean_text"]?.object?["exists"]?.bool == true ? "clean_text" : "markdown"; if let relative = artifacts[key]?.object?["path"]?.string { NSWorkspace.shared.open(outputURL.appendingPathComponent(relative)) } }
     func openReview() { guard outputURL != nil else { return }; reviewPresented = true }
     func openFinalBook() { guard outputURL != nil else { return }; finalPresented = true }
+    /// Core owns the cleanup policy and validates its authenticated workspace.
+    /// The native app never enumerates or removes temporary files itself.
+    func cleanTemporaryFiles() {
+        guard let outputURL, !cleanupBusy else { return }
+        cleanupBusy = true
+        let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
+        do { try client.start(arguments: ["cleanup", outputURL.path], event: { [weak self] event in Task { @MainActor in
+            guard let self else { return }
+            if event.eventType == .cleanupCompleted || event.eventType == .jobCompleted {
+                let result = event.details.object?["result"]?.object ?? event.details.object ?? [:]
+                let deleted = result["bytes_deleted"]?.integer ?? 0
+                self.warningText = "Temporary files cleaned: \(deleted) bytes."
+                self.cleanupBusy = false
+            }
+            if event.eventType == .cleanupWarning { self.warningText = event.message; self.cleanupBusy = false }
+            if event.eventType == .jobFailed { self.cleanupBusy = false; self.errorText = "cleanup_failure: \(event.message)" }
+        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] _ in Task { @MainActor in self?.cleanupBusy = false } }) }
+        catch { cleanupBusy = false; errorText = error.localizedDescription }
+    }
 }
 
 struct ContentView: View {
@@ -182,7 +202,7 @@ struct ContentView: View {
         case .ready: Button("Start BookText") { model.start() }.buttonStyle(.borderedProminent).disabled(model.sourceURLs.isEmpty)
         case .running, .cancelling: VStack(alignment: .leading) { ProgressView(value: Double(model.presentation.current ?? 0), total: Double(max(model.presentation.total ?? 1, 1))); Text("\(model.presentation.phase ?? "working")  page \(model.presentation.page.map(String.init) ?? "—")  \(model.elapsed)"); Button(model.presentation.state == .cancelling ? "Cancelling…" : "Cancel") { model.cancel() }.disabled(model.presentation.state == .cancelling) }
         case .cancelled: Label("Cancelled — Core cleanup completed.", systemImage: "xmark.circle").foregroundStyle(.orange)
-        case .completed: VStack(alignment: .leading) { Label("Completed", systemImage: "checkmark.circle.fill").foregroundStyle(.green); if let url = model.outputURL { Text(url.path).textSelection(.enabled) }; resultSummary; HStack { Button("Reveal in Finder") { model.reveal() }; Button("Open Primary Result") { model.openPrimary() }; Button("Open Review") { model.openReview() }; Button("Final Book & Export") { model.openFinalBook() }; Button(model.docxBusy ? "Building DOCX…" : "Export & Open DOCX") { model.exportAndOpenDocx() }.disabled(model.docxBusy) } }
+        case .completed: VStack(alignment: .leading) { Label("Completed", systemImage: "checkmark.circle.fill").foregroundStyle(.green); if let url = model.outputURL { Text(url.path).textSelection(.enabled) }; resultSummary; HStack { Button("Reveal in Finder") { model.reveal() }; Button("Open Primary Result") { model.openPrimary() }; Button("Open Review") { model.openReview() }; Button("Final Book & Export") { model.openFinalBook() }; Button(model.docxBusy ? "Building DOCX…" : "Export & Open DOCX") { model.exportAndOpenDocx() }.disabled(model.docxBusy); Button(model.cleanupBusy ? "Cleaning temporary files…" : "Clean Temporary Files") { model.cleanTemporaryFiles() }.disabled(model.cleanupBusy) } }
         case .failed: VStack(alignment: .leading) { Label("\(model.errorText)", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).textSelection(.enabled); Button("Retry Preflight") { model.preflight() } }
         }
         if !model.warningText.isEmpty { Text(model.warningText).font(.caption).foregroundStyle(.orange).lineLimit(4).textSelection(.enabled) }

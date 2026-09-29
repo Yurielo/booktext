@@ -154,6 +154,21 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertEqual("job_cancelled", payload[-1]["event_type"])
             self.assertEqual("cancelled", protocol._load(root / protocol.JOB_FILENAME)["status"])
 
+    def test_cleanup_operation_reports_safe_chunk_lifecycle_result(self):
+        from tools import chunk_lifecycle
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = chunk_lifecycle.create_or_load_plan(root, job_id="job-clean", source_fp="source", operation="surya_ocr", page_numbers=[1], options={"engine": "surya"})
+            chunk = plan["chunks"][0]
+            chunk_lifecycle.begin_attempt(root, plan, chunk)
+            chunk_lifecycle.commit_checkpoint(root, plan, chunk, {"page-0001": [{"text": "source"}]}, duration_seconds=.1)
+            chunk_lifecycle.mark_assembly(root, plan, complete=True, validation={"pages": "PASS"})
+            code, payload = events(lambda: protocol.main(["cleanup", str(root)]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            self.assertEqual("cleanup_started", payload[0]["event_type"])
+            self.assertEqual("cleanup_completed", payload[1]["event_type"])
+            self.assertTrue(payload[1]["details"]["cleanup_allowed"])
+
     def test_protocol_fixtures_are_valid_jsonl(self):
         fixture_dir = Path(__file__).parent / "fixtures" / "machine_protocol"
         for fixture in fixture_dir.glob("*.jsonl"):

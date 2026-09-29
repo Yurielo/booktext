@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tools import canonical_document, export_document, review_decisions, review_workspace, review_recovery, translation
+from tools import canonical_document, chunk_lifecycle, export_document, review_decisions, review_workspace, review_recovery, translation
 from tools.process_lifecycle import ManagedProcess
 
 
@@ -28,9 +28,9 @@ PROTOCOL_VERSION = "1.0"
 JOB_SCHEMA_VERSION = "1.0"
 JOB_FILENAME = ".booktext_job.json"
 PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "translation", "export")
-EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled")
+EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled", "chunk_plan_created", "chunk_started", "chunk_progress", "chunk_completed", "chunk_failed", "chunk_retry", "job_resumed", "assembly_started", "assembly_completed", "cleanup_started", "cleanup_progress", "cleanup_completed", "cleanup_warning")
 EXIT_CODES = {"success": 0, "invalid_input": 2, "preflight_failure": 3, "processing_failure": 4, "validation_failure": 5, "cancelled": 130, "stale_conflict": 6}
-COMMAND_PHASE = {"run": "ocr", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "export": "export", "inspect": None}
+COMMAND_PHASE = {"run": "ocr", "cleanup": "prepare", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "export": "export", "inspect": None}
 
 
 class MachineError(RuntimeError):
@@ -262,11 +262,22 @@ def _run_existing(emitter, sources, core_args):
     emitter.emit("phase_completed", phase="preflight", message="Preflight completed")
     update_job(root, status="running", last_phase="prepare", launcher_pid=os.getpid())
     emitter.emit("phase_started", phase="prepare", message="Preparing source pages")
-    command = [sys.executable, str(Path(__file__).resolve().parents[1] / "booktext.py"), *sources, *core_args]
+    command = [sys.executable, str(Path(__file__).resolve().parents[1] / "booktext.py"), *sources, *core_args, "--machine-events"]
     child = ManagedProcess(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
     try:
         for line in iter(child.process.stdout.readline, ""):
             line = line.rstrip()
+            if line.startswith("BOOKTEXT_CHUNK_EVENT "):
+                try:
+                    chunk_event = json.loads(line.removeprefix("BOOKTEXT_CHUNK_EVENT "))
+                    kind, details = chunk_event["kind"], chunk_event.get("details", {})
+                    event_type = kind if kind in EVENT_TYPES else "warning"
+                    pages = details.get("pages") if isinstance(details, dict) else None
+                    page = pages[0] if isinstance(pages, list) and pages else None
+                    emitter.emit(event_type, phase="ocr" if kind != "cleanup_completed" else "prepare", current=details.get("current") if isinstance(details, dict) else None, total=details.get("total") if isinstance(details, dict) else None, page=page, code=kind, message=kind.replace("_", " "), details=details)
+                    continue
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    emitter.emit("warning", phase="ocr", code="invalid_chunk_event", message="Ignoring invalid Core chunk event")
             if line: print(line, file=sys.stderr, flush=True)
             match = __import__("re").search(r"страниц: (\d+) из (\d+)|страницы (\d+)/(\d+)", line)
             if match:
@@ -312,6 +323,15 @@ def _handle(args):
         args.output_dir = source.parent / f"{source.stem}_book" if source else None
         return _run_existing(Emitter("pending"), args.sources, args.core_args)
     state = ensure_job(root); emitter = Emitter(state["job_id"])
+    if args.command == "cleanup":
+        emitter.emit("cleanup_started", phase="prepare", message="Calculating safe temporary-file cleanup")
+        try:
+            result = chunk_lifecycle.compact(root)
+        except chunk_lifecycle.ChunkPlanError as error:
+            raise MachineError("validation_failure", str(error)) from error
+        emitter.emit("cleanup_completed" if result.get("cleanup_allowed") else "cleanup_warning", phase="prepare", code="cleanup_complete" if result.get("cleanup_allowed") else "cleanup_not_allowed", message="Temporary-file cleanup completed" if result.get("cleanup_allowed") else "Temporary-file cleanup not yet allowed", details=result)
+        emitter.emit("job_completed", phase="prepare", message="Safe cleanup operation completed", details={"result": result, "artifacts": artifact_map(root)})
+        return 0
     if args.command == "recover":
         return _invoke(emitter, root, "review", "offline review recovery", lambda: review_recovery.recover(root, surya_results=args.surya_results))
     if args.command == "cdm":
@@ -404,6 +424,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("preflight"); p.add_argument("--operation", choices=("status", "run", "native-text", "export", "cdm", "final-build", "review", "translation"), default="status")
     p = sub.add_parser("inspect"); p.add_argument("output_dir", type=Path)
+    p = sub.add_parser("cleanup"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("document-preview"); p.add_argument("output_dir", type=Path); p.add_argument("--index", type=int, default=0); p.add_argument("--limit", type=int, default=25)

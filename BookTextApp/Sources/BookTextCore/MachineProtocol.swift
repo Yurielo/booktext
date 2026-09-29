@@ -7,6 +7,12 @@ public enum MachineEventType: String, Codable, CaseIterable, Sendable {
     case artifactCreated = "artifact_created", reviewSummary = "review_summary"
     case phaseCompleted = "phase_completed", jobCompleted = "job_completed"
     case jobFailed = "job_failed", jobCancelled = "job_cancelled", unknown
+    case chunkPlanCreated = "chunk_plan_created", chunkStarted = "chunk_started"
+    case chunkProgress = "chunk_progress", chunkCompleted = "chunk_completed"
+    case chunkFailed = "chunk_failed", chunkRetry = "chunk_retry", jobResumed = "job_resumed"
+    case assemblyStarted = "assembly_started", assemblyCompleted = "assembly_completed"
+    case cleanupStarted = "cleanup_started", cleanupProgress = "cleanup_progress"
+    case cleanupCompleted = "cleanup_completed", cleanupWarning = "cleanup_warning"
 
     public init(from decoder: Decoder) throws {
         let value = try decoder.singleValueContainer().decode(String.self)
