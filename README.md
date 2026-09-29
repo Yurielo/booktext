@@ -210,9 +210,15 @@ python3 booktext.py machine translation-export /path/to/book_output \
 `--validate` проверяет staleness без обращения к модели. Подробный контракт:
 [`docs/architecture/TRANSLATION_LAYER.md`](docs/architecture/TRANSLATION_LAYER.md).
 
-### Machine protocol for the future native app
+### Native macOS app and machine protocol
 
-The future macOS app uses the versioned JSONL contract, never terminal prose:
+The native SwiftUI app presents a document-centric workflow: choose a document,
+follow processing progress, review only when required, then open, translate, or
+export the ready book. Core configuration, processing options, diagnostics,
+and manual storage cleanup remain under **Settings** instead of the routine
+document screen.
+
+The app uses the versioned JSONL contract, never terminal prose:
 
 ```bash
 python3 booktext.py machine preflight --operation export

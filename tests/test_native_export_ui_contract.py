@@ -26,7 +26,7 @@ class NativeExportUIContractTests(unittest.TestCase):
         source = SOURCE.read_text(encoding="utf-8")
         self.assertIn('Button("Export translation")', source)
         self.assertIn('call(["translation-export", outputURL.path', source)
-        self.assertIn('formats: Self.exportFormats.map(\\.id).filter(selectedFormats.contains)', source)
+        self.assertIn('formats: ExportFormatSelection.ordered(selectedFormats)', source)
 
 
 if __name__ == "__main__":
