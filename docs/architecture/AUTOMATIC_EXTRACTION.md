@@ -70,13 +70,45 @@ result hash and reasons. Single physical line breaks in evidenced prose become
 spaces. Lists, numeric columns, tables and short verse are protected. Letter/comma/
 letter spacing does not touch numeric commas. No glued word is guessed apart.
 
-A line-end or cross-page hyphen is removed only when the unhyphenated whole word
-occurs at least twice in the source and the competing compound is not attested.
-Otherwise the hyphen is retained. Cross-page joins require adjacent paragraph
-blocks on consecutive source pages; the continuation retains its block ID,
-consumed-by link and reversible original text. This avoids translating a fragment
-such as `dance` independently from `accor-`. Rebuild is deterministic; changed CDM
-fingerprints correctly make old translation checkpoints stale, not silently reusable.
+A discretionary soft hyphen followed by a physical line break is explicit source
+evidence. For a hard line-end or cross-page hyphen, one independent unbroken
+occurrence of the whole word is sufficient, provided the competing compound is
+not attested. Otherwise the hard hyphen is retained, not guessed from a dictionary
+or a suffix. `normalization.review_candidates` records ambiguous within-page
+hyphens with block/page identity, original span/text/hash and a warning visible
+beside the paragraph in Native Preview. A unique `biomagnetical-ly` therefore
+still requires human judgment; geometry alone cannot prove a spelling.
+
+Saved native first-line indents and gaps reconstruct paragraph boundaries offline.
+Ordinary cross-page continuation requires consecutive source pages, adjacent prose
+blocks, compatible wide body geometry at the page bottom/top, a full last line,
+an unindented lowercase continuation and no sentence-final punctuation. Headings,
+figures, tables, narrow columns, lists and absent geometry prevent this join.
+Continuations retain every block ID, source page and consumed-by link; the log
+reverses chains across multiple pages. No join crosses an omitted page.
+
+Lowercase `i. e.` / `e. g.` spacing is normalized only in Latin prose with a
+lowercase following word (or paragraph end). Initials, numbers, scientific
+hyphens, paths and structural blocks are not globally rewritten. These typography
+changes are versioned/reversible, not semantic corrections.
+
+`selection` validates actual pages against stored requested pages and source
+total (or saved legacy include/exclude evidence). Missing, duplicate, unexpected
+or out-of-order pages fail closed. Legacy outputs without a known selection remain
+explicitly unverifiable, not falsely complete. Intentional omissions are allowed:
+their `page_break` blocks carry `boundary_kind: excerpt_gap`, exact omitted range
+and a reader-facing notice in native Preview, Markdown, HTML, DOCX, EPUB and PDF.
+Ordinary consecutive page boundaries remain provenance, not artificial rules or
+paragraph breaks. Acceptance samples must use contiguous ranges; separate excerpts
+must be visibly separated.
+Partial selections also carry a title-level notice listing selected source ranges;
+the first/last excerpt may start/end within a paragraph, not a complete chapter.
+
+Rebuild is deterministic; changed CDM fingerprints correctly make old translation
+checkpoints stale, not silently reusable. Use `booktext document build OUTPUT`
+(or `booktext machine cdm OUTPUT`) then export to regenerate publication output
+from existing evidence without OCR. Previously exported files do not change merely
+because the application was updated; preserve earlier outputs before rebuilding.
 
 Existing translation checkpoints and the bounded model lease remain unchanged.
 Validation adds review-only signals for numeric changes, mixed scripts inside a

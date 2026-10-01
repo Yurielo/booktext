@@ -14,7 +14,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from tools import review_decisions, text_normalization
+from tools import review_decisions, text_normalization, document_continuity
 
 
 SCHEMA_VERSION = "1.0"
@@ -219,6 +219,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
     if not book_path.is_file() or not priority_path.is_file():
         raise ValueError("CDM build requires book.json and review_priority.json")
     book, priority = _load(book_path), _load(priority_path)
+    selection = document_continuity.selection(root, book)
     if book.get("extraction_policy") == "automatic-extraction-1" and (root / "extraction/source.json").is_file():
         expected_artifacts = _load(root / "extraction/artifacts.json")
         for relative,digest in expected_artifacts.items():
@@ -242,6 +243,9 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
         if isinstance(item, dict) and isinstance(item.get("page"), int):
             review_by_page.setdefault(item["page"], []).append((item.get("item_id"), status_by_item.get(item.get("item_id"), "unresolved")))
     blocks, source_pages, warnings = [], [], []
+    warnings.extend({"kind": "intentional_excerpt_gap", **gap, "message": document_continuity.gap_label(gap)} for gap in selection["gaps"])
+    if selection["completeness"] != "verified":
+        warnings.append({"kind": "unverifiable_legacy_selection", "message": "Original requested page selection is unavailable; completeness cannot be verified."})
     order = 0
     document_id = _stable_id("document", _hash_file(book_path))
 
@@ -328,9 +332,20 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                 if not text:
                     continue
                 kind = _type_for_label(label)
-                add({"block_id": _stable_id("block", f"{document_id}:{page}:raw:{index}"), "type": kind, "text": text,
-                     "level": None if kind == "heading" else None,
-                     "provenance": {**page_ref, "layout_label": label, "layout_reading_order": raw.get("reading_order"), "bbox": raw.get("bbox"), "polygon": raw.get("polygon"), "confidence": raw.get("confidence"), "raw_ocr_ref": raw_surya_ref}})
+                fragments = [raw]
+                dimensions = (record.get("source_provenance") or {}).get("page_size_points")
+                if kind == "paragraph" and raw.get("extraction") == "native_pdf_words" and raw.get("lines") and dimensions:
+                    # Reuse saved word geometry, even for an older output. Raw
+                    # OCR/native artifacts and human decision anchors stay put.
+                    from tools.automatic_extraction import native_layout
+                    fragments = native_layout({"blocks": [raw]}, [])
+                for part, fragment in enumerate(fragments):
+                    suffix = "" if part == 0 else f":paragraph:{part+1}"
+                    add({"block_id": _stable_id("block", f"{document_id}:{page}:raw:{index}{suffix}"), "type": kind, "text": _block_text(fragment),
+                         "level": None if kind == "heading" else None,
+                         "provenance": {**page_ref, "layout_label": label, "layout_reading_order": raw.get("reading_order"), "bbox": fragment.get("bbox"), "polygon": raw.get("polygon"), "confidence": raw.get("confidence"), "raw_ocr_ref": raw_surya_ref,
+                                        "native_paragraph_part": part+1 if len(fragments)>1 else None,
+                                        "line_geometry": text_normalization.line_geometry(fragment.get("lines"), dimensions, fragment.get("bbox")) if raw.get("extraction") == "native_pdf_words" else None}})
         for table in sorted(tables_by_index.values(), key=lambda value: value.get("index", 0)):
             add_table(table)
         for visual in [*(record.get("visuals") or []), *recovered_visuals.get(page, [])]:
@@ -356,7 +371,9 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                 content.insert(position, figure)
             blocks[page_start:] = content
             for i,block in enumerate(blocks, 1): block["reading_order"] = i
-        add({"block_id": _stable_id("break", f"{document_id}:{page}"), "type": "page_break", "provenance": page_ref})
+        gap = next((gap for gap in selection["gaps"] if gap["after_page"] == page), None)
+        add({"block_id": _stable_id("break", f"{document_id}:{page}"), "type": "page_break", "provenance": page_ref,
+             **({"boundary_kind": "excerpt_gap", "text": document_continuity.gap_label(gap), "gap": gap} if gap else {})})
     reference_texts = [final_pages.get(record["page"], record.get("text", "")) for record in pages]
     native_evidence = root / "extraction/native.xml"
     if book.get("extraction_policy") == "automatic-extraction-1" and native_evidence.is_file():
@@ -364,6 +381,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
         reference_texts = [" ".join(word["text"] for block in native["blocks"] for line in block["lines"] for word in line["words"])
                             for native in parse_native(native_evidence.read_text())]
     normalization = text_normalization.project(blocks, reference_texts)
+    warnings.extend(normalization["review_candidates"])
     if native_evidence.is_file(): normalization["reference_evidence"] = {"path": "extraction/native.xml", "sha256": _hash_file(native_evidence)}
     unresolved = final_report.get("unresolved_priority_counts", {})
     source_document = book.get("document") if isinstance(book.get("document"), dict) else {}
@@ -374,8 +392,9 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
         "metadata": {"title": document_title, "author": None, "booktext_version": booktext_version, "source_page_count": len(pages), "languages": book.get("ocr_languages"), "ocr_engine": book.get("ocr_engine"), "source_files": source_files, "build_policy": "existing artifacts only; no OCR or model inference"},
         "source": {"book_json": {"path": "book.json", "sha256": _hash_file(book_path)}, "document_identity": {"path": source_document.get("identity_artifact"), "title": document_title}, "review_priority": {"path": "review_priority.json", "sha256": _hash_file(priority_path)}, "review_decisions": {"path": decisions_path.name, "sha256": _hash_file(decisions_path) if decisions_path.is_file() else None}, "recovered_visual_evidence": {"path": recovered_visual_ref, "sha256": _hash_file(root / recovered_visual_ref) if recovered_visual_ref else None}},
         "review": {"final_build": {"decision_status_counts": final_report.get("decision_status_counts", {}), "applied_text_changes": final_report.get("applied_text_changes", 0), "stale_or_conflict_count": final_report.get("stale_or_conflict_count", 0)}, "unresolved_priority_counts": {"HIGH": unresolved.get("HIGH", 0), "MEDIUM": unresolved.get("MEDIUM", 0)}},
-        "source_pages": source_pages, "blocks": blocks, "normalization": normalization, "notes": [], "warnings": warnings,
+        "source_pages": source_pages, "selection": selection, "blocks": blocks, "normalization": normalization, "notes": [], "warnings": warnings,
     }
+    document["metadata"]["selection_notice"] = document_continuity.selection_notice(selection)
     validate_document(document, root=root, decisions=decisions)
     return document
 
@@ -389,6 +408,25 @@ def validate_document(document, *, root=None, decisions=None):
     source_pages = set(source_page_order)
     if any(not isinstance(page, int) for page in source_page_order) or source_page_order != sorted(source_page_order) or len(source_pages) != len(source_page_order):
         raise ValueError("invalid source page provenance")
+    selection = document.get("selection")
+    if selection:
+        expected = selection.get("requested_pages")
+        if selection.get("actual_pages") != source_page_order or (expected is not None and expected != source_page_order):
+            raise ValueError("CDM page completeness failure")
+        expected_gaps = [{"after_page": a, "before_page": b, "omitted_start": a+1, "omitted_end": b-1}
+                         for a,b in zip(source_page_order, source_page_order[1:]) if b > a+1]
+        if selection.get("gaps") != expected_gaps:
+            raise ValueError("invalid excerpt gap provenance")
+        breaks = [block for block in document["blocks"] if block.get("type") == "page_break"]
+        if [block.get("provenance", {}).get("source_page") for block in breaks] != source_page_order:
+            raise ValueError("missing/duplicate source page boundary")
+        if [block.get("gap") for block in breaks if block.get("boundary_kind") == "excerpt_gap"] != expected_gaps:
+            raise ValueError("missing/invalid excerpt boundary")
+        for block in breaks:
+            if block.get("boundary_kind") == "excerpt_gap":
+                gap = block["gap"]
+                if block.get("text") != document_continuity.gap_label(gap) or block["provenance"]["source_page"] != gap["after_page"]:
+                    raise ValueError("invalid excerpt boundary label/provenance")
     ids, expected_order = set(), 1
     decision_ids = {(entry.get("decision_id") or f"item:{entry.get('item_id')}") for entry in (decisions or {}).get("decisions", []) if isinstance(entry, dict)}
     for block in document["blocks"]:
@@ -424,6 +462,24 @@ def validate_document(document, *, root=None, decisions=None):
                 raise ValueError("broken artifact reference")
         if block.get("type") == "figure" and root is not None and not (Path(root) / block.get("image", "")).is_file():
             raise ValueError("broken figure artifact reference")
+    by_id = {block["block_id"]: block for block in document["blocks"]}
+    for block in document["blocks"]:
+        provenance = block["provenance"]
+        owner_id = provenance.get("text_consumed_by")
+        if owner_id:
+            owner = by_id.get(owner_id)
+            if (not owner or block.get("text") or not owner.get("text")
+                    or block["block_id"] not in owner["provenance"].get("continuation_block_ids", [])
+                    or provenance["source_page"] not in owner["provenance"].get("source_pages", [])):
+                raise ValueError("invalid paragraph continuation ownership")
+        continuations = provenance.get("continuation_block_ids", [])
+        if continuations:
+            page_chain = provenance.get("source_pages", [])
+            if (len(continuations) != len(set(continuations)) or len(page_chain) != len(continuations)+1
+                    or page_chain != list(range(provenance["source_page"], provenance["source_page"]+len(page_chain)))
+                    or any(identifier not in by_id or by_id[identifier]["provenance"].get("text_consumed_by") != block["block_id"] for identifier in continuations)
+                    or [by_id[identifier]["provenance"]["source_page"] for identifier in continuations] != page_chain[1:]):
+                raise ValueError("broken/cross-gap paragraph continuation provenance")
     return {"valid": True, "block_count": len(document["blocks"]), "warnings": len(document.get("warnings", []))}
 
 

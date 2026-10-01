@@ -170,7 +170,7 @@ def document_preview(root, *, index=0, limit=25):
         raise MachineError("validation_failure", str(error)) from error
     blocks = document["blocks"]
     index, limit = min(max(index, 0), len(blocks)), min(max(limit, 1), 100)
-    public_keys = ("block_id", "type", "text", "table_status", "review_required", "image", "description", "artifacts", "rows", "columns", "reading_order", "provenance")
+    public_keys = ("block_id", "type", "text", "table_status", "review_required", "image", "description", "artifacts", "rows", "columns", "reading_order", "provenance", "boundary_kind", "gap", "normalization_warnings")
     counts = {kind: sum(block.get("type") == kind for block in blocks) for kind in canonical_document.BLOCK_TYPES}
     public_blocks = []
     for block in blocks[index:index + limit]:

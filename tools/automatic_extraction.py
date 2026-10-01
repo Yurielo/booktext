@@ -213,7 +213,12 @@ def native_layout(page, exclusions):
             previous = chunks[-1][-1] if chunks else None
             gap = line["bbox"][1] - previous["bbox"][3] if previous else 0
             indent = line["bbox"][0] - raw["bbox"][0]
-            if not previous or gap > body_height or (indent > body_height and re.search(r"[.!?:]$", previous["text"])):
+            # A first-line indent is often smaller than one character height.
+            # Requiring terminal punctuation loses real paragraphs after a
+            # quotation/comma; requiring >1 height misses common book indents.
+            first_line_indent = (previous and indent > body_height*.65
+                                 and previous["bbox"][0]-raw["bbox"][0] <= body_height*.5)
+            if not previous or gap > body_height or first_line_indent:
                 chunks.append([])
             chunks[-1].append(line)
         for lines in chunks:
