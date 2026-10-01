@@ -69,6 +69,22 @@ class TranslationTests(unittest.TestCase):
         translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
         self.assertTrue(list((self.root / "translations/history").glob("en-ru-*.json")))
 
+    @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
+    @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
+    def test_publication_normalization_invalidates_old_translation_without_inference(self, _metadata, _translate):
+        from tools import text_normalization
+        self.document["blocks"][1]["text"] = "An example, i. e. the explanation in ordinary prose."
+        self.document["blocks"][1]["provenance"]["layout_label"] = "Text"
+        (self.root / "book_document.json").write_text(json.dumps(self.document))
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+        calls = _translate.call_count
+        raw_translation = (self.root / "translations/en-ru.json").read_bytes()
+        text_normalization.project(self.document["blocks"], [b.get("text", "") for b in self.document["blocks"]])
+        (self.root / "book_document.json").write_text(json.dumps(self.document))
+        self.assertTrue(translation.validate_translation(self.root, source_language="en", target_language="ru")["stale"])
+        self.assertEqual(_translate.call_count, calls)
+        self.assertEqual(raw_translation, (self.root / "translations/en-ru.json").read_bytes())
+
     @mock.patch("tools.translation._translate_ollama", return_value=("Значение 12.6 mg на 1/2 странице.", {}))
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     def test_numeric_changes_are_never_silently_verified(self, _metadata, _translate):

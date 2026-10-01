@@ -64,6 +64,8 @@ def _markdown_table(grid):
 def render_markdown(document, root, asset_map=None):
     asset_map = asset_map or {}
     lines = [f"# {document['metadata'].get('title') or 'BookText export'}", "", "<!-- Generated from BookText CDM; CDM remains the machine source. -->"]
+    if document["metadata"].get("selection_notice"):
+        lines.extend(["", "*" + document["metadata"]["selection_notice"] + "*"])
     for block in document["blocks"]:
         kind, provenance = block["type"], block.get("provenance", {})
         page = provenance.get("source_page")
@@ -71,6 +73,8 @@ def render_markdown(document, root, asset_map=None):
             # Provenance remains in CDM; a source-page boundary is not a
             # publication rule and must not draw a line in Word/Pandoc output.
             lines.extend(["", f"<!-- source-page: {page} -->"])
+            if block.get("boundary_kind") == "excerpt_gap":
+                lines.extend(["", "*" + block["text"] + "*"])
         elif kind == "heading": lines.extend(["", "## " + block.get("text", "")])
         elif kind == "paragraph": lines.extend(["", block.get("text", "")])
         elif kind == "list": lines.extend(["", "- " + block.get("text", "")])
@@ -91,10 +95,15 @@ def render_markdown(document, root, asset_map=None):
 def render_html(document, root, asset_map=None):
     asset_map = asset_map or {}
     parts = ["<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><title>BookText export</title>", "<style>body{font:18px system-ui;max-width:900px;margin:2em auto;line-height:1.5}table{border-collapse:collapse}td,th{border:1px solid #999;padding:.3em}.unknown,.fallback{border-left:4px solid #b87900;padding:.6em;background:#fff8e8}img{max-width:100%}</style><body>"]
+    if document["metadata"].get("selection_notice"):
+        parts.append("<p><em>" + html.escape(document["metadata"]["selection_notice"]) + "</em></p>")
     for block in document["blocks"]:
         kind, provenance = block["type"], block.get("provenance", {}); page = provenance.get("source_page")
         text = html.escape(str(block.get("text", ""))).replace("\n", "<br>\n")
-        if kind == "page_break": parts.append(f"<!-- source-page: {page} -->")
+        if kind == "page_break":
+            parts.append(f"<!-- source-page: {page} -->")
+            if block.get("boundary_kind") == "excerpt_gap":
+                parts.append(f'<p class="excerpt-gap"><em>{text}</em></p>')
         elif kind == "heading": parts.append(f"<h2 data-source-page=\"{page}\">{text}</h2>")
         elif kind == "paragraph": parts.append(f"<p data-source-page=\"{page}\">{text}</p>")
         elif kind == "list": parts.append(f"<ul data-source-page=\"{page}\"><li>{text}</li></ul>")
@@ -377,9 +386,14 @@ def _pdf_main(document_path, destination):
     styles = getSampleStyleSheet()
     for style in styles.byName.values(): style.fontName = "BookTextUnicode" if Path(font).is_file() else "Helvetica"
     story = []
+    if document["metadata"].get("selection_notice"):
+        story.extend([Paragraph(html.escape(document["metadata"]["selection_notice"]), styles["Italic"]), Spacer(1, 12)])
     for block in document["blocks"]:
         kind = block["type"]
-        if kind == "page_break": story.append(PageBreak())
+        if kind == "page_break":
+            if block.get("boundary_kind") == "excerpt_gap":
+                story.extend([Spacer(1, 12), Paragraph(html.escape(block["text"]), styles["Italic"]), Spacer(1, 12)])
+            # Physical source page boundaries do not break the reflowed book.
         elif kind == "heading": story.extend([Paragraph(block.get("text", ""), styles["Heading2"]), Spacer(1, 8)])
         elif kind in {"paragraph", "list", "unknown"}:
             prefix = "• " if kind == "list" else ""

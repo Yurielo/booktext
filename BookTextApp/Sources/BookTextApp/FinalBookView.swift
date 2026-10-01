@@ -198,6 +198,9 @@ struct FinalBookView: View {
             if index == 0, let title = model.preview["metadata"]?.object?["title"]?.string, !title.isEmpty {
                 VStack(spacing: 8) { Spacer(minLength: 28); Text(title).font(.title.bold()).multilineTextAlignment(.center); Spacer(minLength: 20) }.frame(maxWidth: .infinity)
             }
+            if index == 0, let notice = model.preview["metadata"]?.object?["selection_notice"]?.string {
+                Text(notice).font(.callout.italic()).foregroundStyle(.secondary)
+            }
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, value in if let block = value.object { readerBlock(block) } }
         }.frame(maxWidth: 760, alignment: .leading).padding(.horizontal, 32).padding(.vertical, 12) }
     }
@@ -209,7 +212,9 @@ struct FinalBookView: View {
         case "paragraph", "unknown": Text(block["text"]?.string ?? "").font(.body).fixedSize(horizontal: false, vertical: true)
         case "list": Text(block["text"]?.string ?? "").font(.body).padding(.leading, 20).fixedSize(horizontal: false, vertical: true)
         case "page_break":
-            VStack(spacing: 6) { Divider(); Text("Source page \(block["provenance"]?.object?["source_page"]?.integer ?? 0)").font(.caption).foregroundStyle(.secondary) }.padding(.vertical, 10)
+            if let notice = ReaderBlockPresentation.excerptNotice(block) {
+                Text(notice).font(.callout.italic()).foregroundStyle(.secondary).padding(.vertical, 16)
+            }
         case "figure":
             VStack(alignment: .leading, spacing: 6) {
                 if let image = model.localImage(block) { Image(nsImage: image).resizable().scaledToFit().frame(maxWidth: 680) }
@@ -218,6 +223,9 @@ struct FinalBookView: View {
         case "table": tableBlock(block)
         case "caption": Text(block["text"]?.string ?? "").font(.caption).foregroundStyle(.secondary).italic()
         default: Text(block["text"]?.string ?? "").font(.body)
+        }
+        ForEach(ReaderBlockPresentation.warnings(block), id: \.self) { warning in
+            Label(warning, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
         }
     }
 

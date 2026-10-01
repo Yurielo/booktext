@@ -116,7 +116,18 @@ func unwrap<T>(_ value: T?, _ message: String) throws -> T {
     return value
 }
 
+func readerBoundariesAndWarningsUseOnlyCoreEvidence() throws {
+    let normal: [String: JSONValue] = ["type": .string("page_break"), "text": .string("internal")]
+    try check(ReaderBlockPresentation.excerptNotice(normal) == nil, "ordinary source page must not look like a content gap")
+    let gap: [String: JSONValue] = ["type": .string("page_break"), "boundary_kind": .string("excerpt_gap"), "text": .string("Pages omitted")]
+    try check(ReaderBlockPresentation.excerptNotice(gap) == "Pages omitted", "reader must show Core-supplied gap notice")
+    let warned: [String: JSONValue] = ["normalization_warnings": .array([.object(["message": .string("Check line-end hyphen")])])]
+    try check(ReaderBlockPresentation.warnings(warned) == ["Check line-end hyphen"], "ambiguous normalization evidence must remain visible")
+    try check(ReaderBlockPresentation.warnings([:]).isEmpty, "no invented warnings")
+}
+
 do {
+    try readerBoundariesAndWarningsUseOnlyCoreEvidence()
     try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping(); try reviewPayloadFixtureDecodesWithoutTerminalParsing(); try shortLivedCoreDeliversItsFinalJSONLEvent(); try documentCentricStateMapping(); try recentsAndExportSelectionArePresentationOnly()
     print("BookTextProtocolTests: PASS")
 } catch { fputs("BookTextProtocolTests: FAIL \(error.localizedDescription)\n", stderr); exit(1) }

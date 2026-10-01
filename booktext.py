@@ -22,6 +22,7 @@ from tools.review_clusters import build_clusters
 from tools import document_identity
 from tools.owned_workspace import OwnedWorkspace
 from tools import chunk_lifecycle
+from tools.document_continuity import parse_page_spec
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -69,41 +70,6 @@ def require(command, optional=False):
         print(f"Ошибка: не найдена программа {command}")
         sys.exit(1)
     return True
-
-
-def parse_page_spec(spec):
-    if not spec:
-        return None
-
-    pages = set()
-    for raw_part in spec.split(","):
-        part = raw_part.strip()
-        if not part:
-            continue
-
-        if "-" in part:
-            bits = part.split("-", 1)
-            try:
-                start = int(bits[0])
-                end = int(bits[1])
-            except ValueError:
-                raise ValueError(f"Некорректный диапазон страниц: {part}")
-
-            if start < 1 or end < 1 or end < start:
-                raise ValueError(f"Некорректный диапазон страниц: {part}")
-
-            pages.update(range(start, end + 1))
-        else:
-            try:
-                page = int(part)
-            except ValueError:
-                raise ValueError(f"Некорректный номер страницы: {part}")
-
-            if page < 1:
-                raise ValueError(f"Номер страницы должен быть >= 1: {part}")
-            pages.add(page)
-
-    return pages
 
 
 def get_pdf_page_count(source):
@@ -370,6 +336,7 @@ def run_native_text_pdf(source, args, started_at):
         "limitations": ["Text inside images, scans, and figures was intentionally not extracted; embedded PDF images are preserved without OCR."],
         "qa_enabled": False, "qa_pages": [], "pages_filter": args.pages,
         "excluded_pages": args.exclude_pages, "pages": records,
+        "page_selection": {"source_total": total, "requested_pages": selected},
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     priority = write_review_priority_outputs(output_dir / "review_priority.json", output_dir / "review_priority.txt", [], [], records)
     clusters = build_clusters(priority)
@@ -2168,6 +2135,7 @@ def main():
                 "qa_pages": qa_pages,
                 "pages_filter": args.pages,
                 "excluded_pages": args.exclude_pages,
+                "page_selection": {"source_total": total_pages, "requested_pages": [number for number, _path in pages]},
                 "region_map": str(args.region_map) if args.region_map else None,
                 "pages": json_records,
             },
