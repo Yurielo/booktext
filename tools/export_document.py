@@ -32,6 +32,8 @@ EXPORT_SCHEMA = "1.0"
 # selected or copied from it.  It is not a source-page facsimile.
 FORMATS = ("markdown", "html", "docx", "epub", "pdf", "pdf_image")
 WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 
 def _load(path): return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -80,7 +82,7 @@ def render_markdown(document, root, asset_map=None):
             if block.get("table_status") == "structured": lines.append(_markdown_table(_grid(root, block)))
             else: continue
         elif kind == "figure":
-            lines.extend(["", f"![figure]({asset_map.get(block.get('image'), _asset_path(block.get('image')))})"])
+            lines.extend(["", f"![]({asset_map.get(block.get('image'), _asset_path(block.get('image')))})"])
             if block.get("caption_id"): lines.append(block["caption_id"])
             elif block.get("description"): lines.append(f"\n*Description (auxiliary): {block['description']}*")
     return "\n".join(lines).rstrip() + "\n"
@@ -120,7 +122,7 @@ def _pandoc(markdown, destination, root):
 
 
 def _enable_docx_text_wrapping(destination):
-    """Convert embedded CDM figures to floating Word drawings with wrap text.
+    """Wrap small figures; keep large illustrations in the paginated flow.
 
     Pandoc creates valid inline drawings, but Word lays those out as text
     characters.  This post-processing affects only image layout in the DOCX;
@@ -132,11 +134,38 @@ def _enable_docx_text_wrapping(destination):
     if xml is None:
         raise ValueError("DOCX has no word/document.xml")
     root = ET.fromstring(xml)
+    parents = {child: parent for parent in root.iter() for child in parent}
+    section = root.find(f".//{W}sectPr")
+    size = section.find(f"{W}pgSz") if section is not None else None
+    margins = section.find(f"{W}pgMar") if section is not None else None
+    def twips(node, key, default):
+        return int(node.get(f"{W}{key}", default)) if node is not None else default
+    # Twips -> EMU. Reserve a little height for the image paragraph itself.
+    width = (twips(size, "w", 12240) - twips(margins, "left", 1440) - twips(margins, "right", 1440)) * 635
+    height = (twips(size, "h", 15840) - twips(margins, "top", 1440) - twips(margins, "bottom", 1440) - 240) * 635
     converted = 0
     for inline in root.findall(f".//{WP}inline"):
+        extent = inline.find(f"{WP}extent")
+        if extent is None:
+            raise ValueError("DOCX drawing has no size")
+        cx, cy = int(extent.get("cx")), int(extent.get("cy"))
+        if min(cx, cy, width, height) <= 0:
+            raise ValueError("DOCX drawing/page has invalid size")
+        scale = min(1, width / cx, height / cy)
+        extent.set("cx", str(round(cx * scale))); extent.set("cy", str(round(cy * scale)))
+        for transform in inline.findall(f".//{A}xfrm/{A}ext"):
+            transform.set("cx", extent.get("cx")); transform.set("cy", extent.get("cy"))
+        if cx > width * .45 or cy > height * .5:
+            # Floating book-sized illustrations can overlap one another or
+            # run beyond the page. Word paginates inline illustrations safely.
+            # Clear any preceding small float before this drawing.
+            drawing = parents[inline]
+            run = parents[drawing]
+            run.insert(list(run).index(drawing), ET.Element(f"{W}br", {f"{W}type": "textWrapping", f"{W}clear": "all"}))
+            converted += 1
+            continue
         inline.tag = f"{WP}anchor"
-        inline.attrib.update({"distT": "0", "distB": "0", "distL": "114300", "distR": "114300", "simplePos": "0", "relativeHeight": "251658240", "behindDoc": "0", "locked": "0", "layoutInCell": "1", "allowOverlap": "1"})
-        children = list(inline)
+        inline.attrib.update({"distT": "0", "distB": "0", "distL": "114300", "distR": "114300", "simplePos": "0", "relativeHeight": "251658240", "behindDoc": "0", "locked": "0", "layoutInCell": "1", "allowOverlap": "0"})
         simple = ET.Element(f"{WP}simplePos", {"x": "0", "y": "0"})
         horizontal = ET.Element(f"{WP}positionH", {"relativeFrom": "column"})
         ET.SubElement(horizontal, f"{WP}posOffset").text = "0"

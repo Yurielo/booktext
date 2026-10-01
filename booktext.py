@@ -42,7 +42,7 @@ MAX_AUTOMATIC_HANDWRITING_AREA_PERCENT = 20.0
 OWNED_CHILDREN = LifecycleRegistry()
 
 
-def run(command, check=True, capture=False, quiet=False):
+def run(command, check=True, capture=False, quiet=False, timeout=None):
     command = [str(x) for x in command]
     if not quiet:
         print("→", " ".join(command))
@@ -52,8 +52,10 @@ def run(command, check=True, capture=False, quiet=False):
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
     )
-    stdout, stderr = child.process.communicate()
-    child.cleanup()
+    try:
+        stdout, stderr = child.process.communicate(timeout=timeout)
+    finally:
+        child.cleanup()
     result = subprocess.CompletedProcess(command, child.process.returncode, stdout, stderr)
     if check and result.returncode:
         raise subprocess.CalledProcessError(result.returncode, command, stdout, stderr)
@@ -327,7 +329,8 @@ def run_native_text_pdf(source, args, started_at):
         raise RuntimeError("native-text-only mode requires pdftotext and pdfimages (Poppler)")
     total = get_pdf_page_count(source)
     selected = choose_pages(total, args.pages, args.exclude_pages)
-    output_dir = source.parent / f"{source.stem}_book"
+    output_dir = getattr(args, "output_dir", None) or source.parent / f"{source.stem}_book"
+    output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     identity = document_identity.initialize(output_dir, [source])
     images_dir = output_dir / "images"
@@ -1216,19 +1219,18 @@ def vision_qa_page(page, page_number, surya_text, vision_dir):
     vision_dir.mkdir(parents=True, exist_ok=True)
     vision_json = vision_dir / f"page-{page_number:04d}.json"
 
-    process = subprocess.run(
-        [str(VISION_OCR), str(page)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        process = run([str(VISION_OCR), str(page)], check=False, capture=True, quiet=True, timeout=120)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Vision QA timed out; owned process tree cleaned") from error
 
     if process.returncode != 0:
-        error = process.stderr.decode("utf-8", errors="replace").strip()
+        error = process.stderr.strip()
         raise RuntimeError(
             f"Vision OCR завершился с кодом {process.returncode}: {error}"
         )
 
-    raw = process.stdout.decode("utf-8", errors="replace")
+    raw = process.stdout
 
     try:
         payload = json.loads(raw)
@@ -1617,11 +1619,11 @@ def main():
 
     parser.add_argument(
         "--ocr",
-        choices=("surya", "tesseract"),
-        default=DEFAULT_OCR_ENGINE,
+        choices=("auto", "surya", "tesseract"),
+        default="auto",
         help=(
-            "Движок основного OCR: surya (по умолчанию) "
-            "или tesseract (старый режим)"
+            "auto (по умолчанию): прямой текст PDF или Surya по содержимому; "
+            "surya/tesseract — явные совместимые режимы"
         )
     )
 
@@ -1647,6 +1649,7 @@ def main():
     # Used only by the versioned machine adapter.  Human CLI output remains
     # readable; machine mode converts these records to protocol JSONL.
     parser.add_argument("--machine-events", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--output-dir", type=Path, help="Отдельная папка результата; существующие несовместимые данные не перезаписываются")
 
     parser.add_argument(
         "--region-map",
@@ -1689,6 +1692,7 @@ def main():
         action="store_true",
         help="Не создавать поисковый PDF"
     )
+    parser.add_argument("--searchable-pdf", action="store_true", help="Явно запросить поисковый PDF в автоматическом режиме")
 
     parser.add_argument(
         "--no-qa",
@@ -1722,6 +1726,14 @@ def main():
 
     source = sources[0]
 
+    from tools import automatic_extraction
+    automatic = args.ocr == "auto" and not args.native_text_only
+    automatic_pdf = automatic and source.suffix.lower() == ".pdf"
+    if automatic:
+        args.ocr = "surya"
+        if not args.searchable_pdf: args.no_pdf = True
+    output_dir = automatic_extraction.output_directory(source, automatic=automatic, explicit=args.output_dir)
+
     if args.native_text_only:
         try:
             run_native_text_pdf(source, args, started_at)
@@ -1738,7 +1750,7 @@ def main():
             print(f"Ошибка: {error}")
             sys.exit(1)
 
-    if args.ocr == "surya":
+    if args.ocr == "surya" and not automatic_pdf:
         try:
             require_surya()
 
@@ -1753,7 +1765,8 @@ def main():
     if args.ocr == "tesseract" or not args.no_pdf:
         require("tesseract")
 
-    require("magick")
+    if not automatic_pdf:
+        require("magick")
 
     if not args.no_pdf:
         require("ocrmypdf")
@@ -1766,7 +1779,6 @@ def main():
         require("ddjvu")
         require("djvused")
 
-    output_dir = source.parent / f"{source.stem}_book"
     pages_dir = output_dir / "pages"
     images_dir = output_dir / "images"
     descriptions_dir = output_dir / "descriptions"
@@ -1836,7 +1848,22 @@ def main():
     with OwnedWorkspace() as temp_dir:
 
         try:
-            pages, total_pages = prepare_pages(
+            automatic_pages = {}
+            if automatic_pdf:
+                for dependency in ("pdftotext", "pdfimages", "mutool"):
+                    require(dependency)
+                selected = choose_pages(get_pdf_page_count(source), args.pages, args.exclude_pages)
+                def emit_prepare(details):
+                    if args.machine_events:
+                        print("BOOKTEXT_CHUNK_EVENT " + json.dumps({"kind": "progress", "details": details}), flush=True)
+                automatic_pages, total_pages = automatic_extraction.prepare_pdf(source, output_dir, selected, run, event=emit_prepare,
+                    options={"lang": args.lang, "qa": not args.no_qa, "manual_regions": manual_regions, "raw_ocr": args.raw_ocr})
+                pages = [(number, data["image"]) for number, data in automatic_pages.items()]
+                if any(value["needs_ocr"] or number in manual_regions for number,value in automatic_pages.items()):
+                    require_surya()
+                    if not args.no_qa: require_vision()
+            else:
+                pages, total_pages = prepare_pages(
                 sources,
                 pages_dir,
                 temp_dir,
@@ -1869,6 +1896,10 @@ def main():
                 # and therefore takes precedence over heuristic detection.
                 if page_number in manual_regions:
                     regions = manual_regions[page_number]
+                elif automatic_pdf:
+                    automatic_page = automatic_pages[page_number]
+                    page_work[page_number] = {"regions": [], "visuals": automatic_page["visuals"], "ocr_page": automatic_page["ocr_page"]}
+                    continue
                 elif not args.raw_ocr:
                     regions = detect_visual_regions(page, args.model)
 
@@ -1901,7 +1932,9 @@ def main():
         surya_texts = {}
         adaptive_batching = None
 
-        if args.ocr == "surya":
+        ocr_pages = [(number, page) for number, page in pages
+                     if not automatic_pdf or automatic_pages[number]["needs_ocr"] or number in manual_regions]
+        if args.ocr == "surya" and ocr_pages:
             try:
                 def emit_chunk_event(kind, details):
                     if args.machine_events:
@@ -1909,7 +1942,7 @@ def main():
 
                 surya_texts = recognize_pages_surya(
                     [(page_number, page_work[page_number]["ocr_page"])
-                     for page_number, _page in pages],
+                     for page_number, _page in ocr_pages],
                     surya_dir,
                     temp_dir,
                     chunk_size=args.chunk_size,
@@ -1928,10 +1961,23 @@ def main():
                 sys.exit(1)
 
         table_pages = {}
-        if args.ocr == "surya":
+        if automatic_pdf and ocr_pages:
+            from tools.canonical_document import _surya_pages
+            raw_pages, _raw_ref = _surya_pages(output_dir)
+            for number,_page in ocr_pages:
+                if number in manual_regions: continue
+                raw_page = raw_pages.get(number, {})
+                automatic_extraction.retain_scanned_figures(output_dir, automatic_pages[number], raw_page)
+                page_work[number]["ocr_page"] = automatic_pages[number]["ocr_page"]
+                if any(str(block.get("label", "")).casefold() == "figure" for block in raw_page.get("blocks", [])):
+                    # Figure lettering remains raw evidence, not body text to
+                    # translate. Existing explicit OCR modes are unchanged.
+                    body_blocks = [block for block in raw_page["blocks"] if str(block.get("label", "")).casefold() != "figure"]
+                    surya_texts[number] = _surya_page_text({"blocks":body_blocks})
+        if args.ocr == "surya" and ocr_pages:
             try:
                 table_pages = extract_structured_tables(
-                    surya_dir, tables_dir, [page_number for page_number, _page in pages]
+                    surya_dir, tables_dir, [page_number for page_number, _page in ocr_pages]
                 )
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
                 print(f"Предупреждение: структурированные таблицы не извлечены: {error}")
@@ -1946,12 +1992,13 @@ def main():
             visual_records = page_work[page_number]["visuals"]
             ocr_page = page_work[page_number]["ocr_page"]
 
+            native_record = automatic_pages.get(page_number) if page_number not in manual_regions else None
             if args.ocr == "surya":
                 text = surya_texts.get(page_number, "")
             else:
                 text = recognize_page(ocr_page, args.lang)
 
-            if args.ocr == "surya" and not args.no_qa:
+            if args.ocr == "surya" and not args.no_qa and (not native_record or native_record["needs_ocr"]):
                 try:
                     qa_result = vision_qa_page(
                         ocr_page,
@@ -1991,13 +2038,16 @@ def main():
                         "error": str(error),
                     })
 
+            # QA refers to the OCR-only substring; native text is never a Vision
+            # replacement. Mixed-page items cannot silently target another span.
+            if native_record and native_record["text"]:
+                text = "\n\n".join(part for part in (text, native_record["text"]) if part)
+
             for visual in visual_records:
                 image_abs = Path(visual["image"])
 
                 if visual.get("ocr_action") == "exclude":
-                    description = (
-                        "Описание исключено: область не передаётся в OCR или LLM."
-                    )
+                    description = ""
                 elif args.no_descriptions:
                     description = "Описание отключено параметром --no-descriptions."
                 else:
@@ -2019,7 +2069,7 @@ def main():
                 )
                 visual["image"] = str(image_abs.relative_to(output_dir))
 
-            records.append({
+            record = {
                 "page": page_number,
                 "page_image": str(page.relative_to(output_dir)),
                 "page_image_absolute": str(page),
@@ -2030,7 +2080,12 @@ def main():
                     if region.get("ocr_action") == "exclude"
                 ],
                 "tables": table_pages.get(page_number, {"status": "NOT_APPLICABLE", "tables": []}),
-            })
+            }
+            if native_record:
+                record["source_provenance"] = native_record["source_provenance"]
+                record["layout_blocks"] = native_record["layout_blocks"]
+                record["extraction_warnings"] = native_record["warnings"]
+            records.append(record)
 
         if not args.no_pdf:
             create_searchable_pdf(
@@ -2101,7 +2156,8 @@ def main():
             {
                 "sources": [str(x) for x in sources],
                 "document": {"title": identity["title"], "identity_artifact": document_identity.FILENAME},
-                "ocr_engine": args.ocr,
+                "ocr_engine": "auto" if automatic else args.ocr,
+                "extraction_policy": automatic_extraction.POLICY if automatic else "legacy_explicit",
                 "ocr_languages": args.lang,
                 "vision_model": args.model,
                 "raw_ocr": args.raw_ocr,
@@ -2154,6 +2210,11 @@ def main():
         input_source_count=len(sources),
         adaptive_batching=adaptive_batching,
     )
+    if automatic:
+        run_summary["extraction_policy"] = automatic_extraction.POLICY
+        run_summary["extraction"] = {"ocr_pages": len(ocr_pages), "pages_without_ocr": len(records)-len(ocr_pages),
+                                     "native_text_pages": sum(bool(page.get("layout_blocks")) for page in records)}
+        run_summary["warnings"].extend(warning for record in records for warning in record.get("extraction_warnings", []))
     run_summary_path.write_text(
         json.dumps(run_summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -2165,7 +2226,7 @@ def main():
     # artifacts have been committed.  Compact only verified per-chunk payloads;
     # manifests and canonical raw evidence remain available for audit.
     chunk_cleanup = None
-    if args.ocr == "surya":
+    if args.ocr == "surya" and ocr_pages:
         try:
             if args.machine_events:
                 print("BOOKTEXT_CHUNK_EVENT " + json.dumps({"kind": "cleanup_started", "details": {}}, ensure_ascii=False, sort_keys=True), flush=True)

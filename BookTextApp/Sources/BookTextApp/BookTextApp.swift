@@ -24,9 +24,7 @@ import BookTextCore
     @Published var reviewPresented = false
     @Published var finalPresented = false
     @Published var finalSection: FinalBookSection = .preview
-    @Published var useTesseract = true
     @Published var includePDF = false
-    @Published var nativeTextOnly = false
     @Published var cleanupBusy = false
     @Published private(set) var recentOutputPaths: [String] = []
     @Published private(set) var resumedRun = false
@@ -77,7 +75,7 @@ import BookTextCore
         let generation = preflightGeneration
         presentation.state = .preflighting; errorText = ""; ready = false
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
-        let operation = nativeTextOnly ? "native-text" : "run"
+        let operation = "run"
         do { try client.start(arguments: ["preflight", "--operation", operation], event: { [weak self] event in Task { @MainActor in self?.receivePreflight(event, generation: generation) } }, stderr: { [weak self] text in Task { @MainActor in guard self?.preflightGeneration == generation else { return }; self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in
             guard let self, self.preflightGeneration == generation else { return }
             if status != 0 && self.errorText.isEmpty { self.errorText = "BookText requirements could not be verified (exit \(status))."; self.presentation.state = .failed }
@@ -95,7 +93,7 @@ import BookTextCore
     func start() {
         guard !sourceURLs.isEmpty, ready else { return }
         presentation = JobPresentation(state: .running); errorText = ""; warningText = ""; resumedRun = false; startedAt = Date()
-        let coreOptions = nativeTextOnly ? ["--native-text-only"] : ((useTesseract ? ["--ocr", "tesseract"] : []) + ["--no-qa"] + (includePDF ? [] : ["--no-pdf"]) + ["--raw-ocr"])
+        let coreOptions = AutomaticProcessingOptions.arguments(includeSearchablePDF: includePDF)
         let arguments = ["run"] + sourceURLs.map(\.path) + ["--"] + coreOptions
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
         do { try client.start(arguments: arguments, event: { [weak self] event in Task { @MainActor in self?.receiveRun(event) } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in self?.finishRun(status) } }) } catch { errorText = error.localizedDescription; presentation.state = .failed }
@@ -305,12 +303,12 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("General") { LabeledContent("Recent documents") { Text("Up to 5 local outputs") }; Button("Clear Recent Documents", action: model.clearRecents).disabled(model.recentOutputPaths.isEmpty) }
-            Section("Processing") { Toggle("Fast local recognition (Tesseract)", isOn: $model.useTesseract).disabled(model.nativeTextOnly); Toggle("Create searchable PDF", isOn: $model.includePDF).disabled(model.nativeTextOnly); Toggle("Use embedded PDF text only", isOn: $model.nativeTextOnly); Text("Automatic processing and automatic chunk sizing remain the defaults.").font(.caption).foregroundStyle(.secondary) }
+            Section("Processing") { Toggle("Create searchable PDF", isOn: $model.includePDF); Text("BookText automatically extracts usable PDF text and recognizes scanned text where needed. Images are preserved. Uncertain regions are flagged for review.").font(.caption).foregroundStyle(.secondary) }
             Section("Advanced and Diagnostics") {
                 DisclosureGroup("BookText Core", isExpanded: $showDiagnostics) { TextField("Path to booktext.py", text: $model.corePath).textFieldStyle(.roundedBorder); HStack { Button("Check Requirements", action: model.preflight); Text("Machine protocol \(machineProtocolVersion)").foregroundStyle(.secondary) }; if !model.diagnostics.isEmpty { ScrollView { Text(model.diagnostics).font(.caption.monospaced()).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 100) } }
                 Button(model.cleanupBusy ? "Cleaning…" : "Clean Temporary Files", action: model.cleanTemporaryFiles).disabled(model.outputURL == nil || model.cleanupBusy)
                 Text("Cleanup policy is validated and executed by BookText Core for the current output.").font(.caption).foregroundStyle(.secondary)
             }
-        }.formStyle(.grouped).padding().onChange(of: model.nativeTextOnly) { _, _ in model.preflight() }
+        }.formStyle(.grouped).padding()
     }
 }

@@ -87,11 +87,11 @@ class VisionQATests(unittest.TestCase):
             ]
         }
         process = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=json.dumps(payload).encode(), stderr=b""
+            args=[], returncode=0, stdout=json.dumps(payload), stderr=""
         )
         with tempfile.TemporaryDirectory() as temp, patch.object(
             booktext, "require_vision"
-        ), patch.object(booktext.subprocess, "run", return_value=process):
+        ), patch.object(booktext, "run", return_value=process):
             return booktext.vision_qa_page(
                 Path(temp) / "page.png", 1, surya, Path(temp) / "vision"
             )

@@ -1,6 +1,10 @@
 import Foundation
 import BookTextCore
 
+assert(AutomaticProcessingOptions.arguments(includeSearchablePDF: false) == ["--ocr", "auto", "--no-descriptions", "--no-pdf"])
+assert(!AutomaticProcessingOptions.arguments(includeSearchablePDF: true).contains("--no-qa"))
+assert(!AutomaticProcessingOptions.arguments(includeSearchablePDF: true).contains("--raw-ocr"))
+
 private final class EventCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var values: [MachineEvent] = []

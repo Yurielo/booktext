@@ -19,6 +19,12 @@ cp "$build_dir/BookText" "$app_dir/Contents/MacOS/BookText"
 cp "$repo_root/BookTextApp/Resources/BookText.icns" "$app_dir/Contents/Resources/BookText.icns"
 # Local-only BookText.app uses macOS's supported ad-hoc identity.  This is
 # deliberately after all Contents mutations and verification is mandatory.
+# Finder/iCloud may attach FinderInfo to a newly created .app directory even
+# when no source resource carries it. Remove only these signature-incompatible
+# metadata fields from the just-assembled owned bundle, never quarantine or
+# system/user directories. Signature verification below remains fail-closed.
+xattr -dr com.apple.FinderInfo "$app_dir" 2>/dev/null || true
+xattr -dr com.apple.ResourceFork "$app_dir" 2>/dev/null || true
 codesign --force --deep --sign - --timestamp=none "$app_dir"
 codesign --verify --deep --strict --verbose=4 "$app_dir"
 echo "$app_dir"

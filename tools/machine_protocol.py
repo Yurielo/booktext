@@ -111,6 +111,7 @@ def artifact_map(root):
         "cdm": "book_document.json", "exports": "exports/export_manifest.json", "book_manifest": "book.json",
         "clean_text": "book_clean.txt", "markdown": "book.md", "document_identity": "document_identity.json", "deliverables": "deliverables", "page_images": "pages", "images": "images", "descriptions": "descriptions",
         "translations": "translations",
+        "extraction_report": "extraction/report.json", "source_inventory": "extraction/inventory.json",
     }
     return {name: {"path": value, "exists": (root / value).exists()} for name, value in candidates.items()}
 
@@ -192,7 +193,7 @@ def preflight(operation="status"):
     required = []
     optional = []
     if operation in {"run", "status"}:
-        required = [_dependency("magick")] if operation == "run" else []
+        required = []  # Actual source routing validates only the tools it uses.
         optional = [_dependency("surya_ocr", path=SURYA_CLI), _dependency("llama-server"), _dependency("visionocr", path=VISION_OCR), _dependency("tesseract"), _dependency("ocrmypdf")]
     elif operation == "export":
         required = [] ; optional = [_dependency("pandoc"), _dependency("pdfinfo")]
@@ -227,7 +228,15 @@ def processing_preflight(sources, core_args):
             required.append({"name": "PDF input", "available": False, "path": None})
         missing = [item for item in required if not item["available"]]
         return {"required": required, "missing": missing, "ocr": "native_pdf_text", "qa_enabled": False, "pdf_enabled": False}
-    ocr, no_qa, no_pdf = selected("--ocr", "surya"), "--no-qa" in options, "--no-pdf" in options
+    ocr, no_qa, no_pdf = selected("--ocr", "auto"), "--no-qa" in options, "--no-pdf" in options
+    if ocr == "auto" and "--searchable-pdf" not in options: no_pdf = True
+    if ocr == "auto" and Path(sources[0]).suffix.lower() == ".pdf":
+        required = [_dependency(name) for name in ("pdftotext", "pdfimages", "pdftoppm", "pdfinfo", "mutool")]
+        if not no_pdf: required.extend([_dependency("tesseract"), _dependency("ocrmypdf")])
+        return {"required": required, "missing": [item for item in required if not item["available"]],
+                "ocr": "auto", "qa_enabled": not no_qa, "pdf_enabled": not no_pdf,
+                "deferred_dependencies": "Surya/Vision required only if source analysis finds OCR regions"}
+    if ocr == "auto": ocr = "surya"
     required = [_dependency("magick")]
     if ocr == "surya": required.extend([_dependency("surya_ocr", path=SURYA_CLI), _dependency("llama-server")])
     if ocr == "surya" and not no_qa: required.append(_dependency("visionocr", path=VISION_OCR))
@@ -259,7 +268,12 @@ def _run_existing(emitter, sources, core_args):
     if not sources: raise MachineError("invalid_input", "at least one source is required")
     source = Path(sources[0]).expanduser().resolve()
     if not source.exists(): raise MachineError("invalid_input", "source does not exist", details={"source": str(source)})
-    root = source.parent / f"{source.stem}_book"; state = ensure_job(root, status="running", source=[str(Path(value).expanduser().resolve()) for value in sources]); emitter.job_id = state["job_id"]
+    from tools.automatic_extraction import output_directory
+    def option(name, default=None):
+        try: return core_args[core_args.index(name)+1]
+        except (ValueError, IndexError): return default
+    root = output_directory(source, automatic=option("--ocr", "auto") == "auto" and "--native-text-only" not in core_args, explicit=option("--output-dir"))
+    state = ensure_job(root, status="running", source=[str(Path(value).expanduser().resolve()) for value in sources]); emitter.job_id = state["job_id"]
     emitter.emit("job_started", phase="preflight", message="Processing job started", details={"source": state["source"], "output_dir": str(root)})
     emitter.emit("phase_started", phase="preflight", message="Checking processing prerequisites")
     pf = processing_preflight(sources, core_args)
@@ -281,7 +295,7 @@ def _run_existing(emitter, sources, core_args):
                     event_type = kind if kind in EVENT_TYPES else "warning"
                     pages = details.get("pages") if isinstance(details, dict) else None
                     page = pages[0] if isinstance(pages, list) and pages else None
-                    emitter.emit(event_type, phase="ocr" if kind != "cleanup_completed" else "prepare", current=details.get("current") if isinstance(details, dict) else None, total=details.get("total") if isinstance(details, dict) else None, page=page, code=kind, message=kind.replace("_", " "), details=details)
+                    emitter.emit(event_type, phase=details.get("phase", "ocr" if kind != "cleanup_completed" else "prepare"), current=details.get("current") if isinstance(details, dict) else None, total=details.get("total") if isinstance(details, dict) else None, page=page, code=kind, message=kind.replace("_", " "), details=details)
                     continue
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     emitter.emit("warning", phase="ocr", code="invalid_chunk_event", message="Ignoring invalid Core chunk event")

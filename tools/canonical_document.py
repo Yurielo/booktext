@@ -14,7 +14,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from tools import review_decisions
+from tools import review_decisions, text_normalization
 
 
 SCHEMA_VERSION = "1.0"
@@ -88,7 +88,9 @@ def _recovered_visuals(root):
 
 
 def _block_text(block):
-    value = block.get("html") or block.get("text") or block.get("markdown") or ""
+    if not block.get("html"):
+        return str(block.get("text") or block.get("markdown") or "").strip()
+    value = block["html"]
     text = re.sub(r"<(?:br|/p|/div|/li)\b[^>]*>", "\n", str(value), flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
     return "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines() if line.strip())
@@ -217,6 +219,12 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
     if not book_path.is_file() or not priority_path.is_file():
         raise ValueError("CDM build requires book.json and review_priority.json")
     book, priority = _load(book_path), _load(priority_path)
+    if book.get("extraction_policy") == "automatic-extraction-1" and (root / "extraction/source.json").is_file():
+        expected_artifacts = _load(root / "extraction/artifacts.json")
+        for relative,digest in expected_artifacts.items():
+            path = (root / relative).resolve()
+            if not path.is_relative_to(root) or not path.is_file() or _hash_file(path) != digest:
+                raise ValueError(f"stale extraction evidence: {relative}")
     decisions_path = root / "review_decisions.json"
     decisions = _load(decisions_path) if decisions_path.is_file() else review_decisions.empty_decisions(priority_path, book_path)
     final_pages, final_report = _final_pages(book, priority, decisions, book_path, priority_path, decisions_path, booktext_version)
@@ -245,12 +253,38 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
 
     for record in pages:
         page = record["page"]
+        warnings.extend(record.get("extraction_warnings", []))
         page_ref = {"source_page": page, "prepared_page": _relative_if_file(root, record.get("page_image")), "raw_ocr_ref": raw_surya_ref}
+        if record.get("layout_blocks") is not None:
+            page_ref["raw_native_ref"] = _relative_if_file(root, (record.get("source_provenance") or {}).get("native_evidence"))
+            page_ref["source_sha256"] = (record.get("source_provenance") or {}).get("source_sha256")
         item_states = review_by_page.get(page, [])
         source_pages.append({**page_ref, "review": {"item_ids": [item_id for item_id, _status in item_states], "status_counts": dict(Counter(status for _item_id, status in item_states))}})
         if record.get("page_image") and page_ref["prepared_page"] is None:
             warnings.append({"page": page, "kind": "missing_prepared_page_asset", "path": record["page_image"]})
         page_blocks = (surya.get(page) or {}).get("blocks")
+        native_blocks = record.get("layout_blocks")
+        if isinstance(native_blocks, list):
+            page_blocks = [*(page_blocks or []), *native_blocks]
+            # Native points and OCR pixels need a common coordinate system.
+            dimensions = (record.get("source_provenance") or {}).get("page_size_points")
+            if dimensions and page_ref["prepared_page"]:
+                from PIL import Image
+                with Image.open(root / page_ref["prepared_page"]) as image:
+                    image_box = (surya.get(page) or {}).get("image_bbox") or [0,0,image.width,image.height]
+                    sx,sy = dimensions[0]/(image_box[2]-image_box[0]), dimensions[1]/(image_box[3]-image_box[1])
+                page_blocks = [{**raw, "bbox": [v*(sx if i%2==0 else sy) for i,v in enumerate(raw["bbox"])]}
+                               if raw.get("bbox") and raw not in native_blocks else raw for raw in page_blocks]
+            # Preserve per-column native flow; insert OCR regions by vertical location.
+            if native_blocks and len(page_blocks) == len(native_blocks):
+                page_blocks = native_blocks
+            else:
+                page_blocks = sorted(page_blocks, key=lambda raw: ((raw.get("bbox") or [0,0])[1], (raw.get("bbox") or [0,0])[0]))
+            page_blocks = [{**raw, "reading_order": i} for i,raw in enumerate(page_blocks, 1)]
+            if not page_blocks and record.get("text", "").strip():
+                # An OCR engine/version without blocks still owns real text.
+                # Empty native layout must not suppress the safe text fallback.
+                page_blocks = None
         has_changed_text = bool(changed_by_page.get(page))
         table_entries = (record.get("tables") or {}).get("tables") or []
         tables_by_index = {value.get("index"): value for value in table_entries if isinstance(value, dict)}
@@ -269,6 +303,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                 add({"block_id": _stable_id("table", f"{document_id}:{page}:{index}"), "type": "table", "table_status": "structured", "rows": table.get("rows"), "columns": table.get("columns"), "artifacts": {name: f"tables/{value}" for name, value in artifacts.items()}, "provenance": provenance})
             elif status == "fallback_review":
                 add({"block_id": _stable_id("table", f"{document_id}:{page}:{index}"), "type": "table", "table_status": "fallback_review", "review_required": True, "diagnostic": table.get("diagnostic"), "provenance": provenance})
+        page_start = len(blocks)
         if has_changed_text or not isinstance(page_blocks, list):
             text = _without_running_matter(final_pages.get(page, str(record.get("text", ""))), repeated_running_lines)
             fallback_reason = "valid_corrections_require_page_text_projection" if has_changed_text else "layout_blocks_unavailable"
@@ -307,7 +342,29 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
             add({"block_id": _stable_id("figure", f"{document_id}:{page}:{visual_identity}"), "type": "figure", "image": image,
                  "description": visual.get("description"), "description_ref": _relative_if_file(root, visual.get("description_file")), "caption_id": None,
                  "provenance": {**page_ref, "visual_index": visual.get("index"), "visual_type": visual.get("type"), "bbox": visual.get("bbox"), "recovered_visual_evidence": recovered_visual_ref if visual.get("source_provenance") else None, "source": visual.get("source_provenance")}})
+        if isinstance(native_blocks, list) and not has_changed_text:
+            page_content = blocks[page_start:]
+            figures = [block for block in page_content if block["type"] == "figure"]
+            content = [block for block in page_content if block["type"] != "figure"]
+            for figure in figures:
+                bounds = figure["provenance"].get("bbox")
+                position = len(content)
+                if bounds:
+                    for i,block in enumerate(content):
+                        other = block["provenance"].get("bbox")
+                        if other and other[1] >= bounds[3]: position = i; break
+                content.insert(position, figure)
+            blocks[page_start:] = content
+            for i,block in enumerate(blocks, 1): block["reading_order"] = i
         add({"block_id": _stable_id("break", f"{document_id}:{page}"), "type": "page_break", "provenance": page_ref})
+    reference_texts = [final_pages.get(record["page"], record.get("text", "")) for record in pages]
+    native_evidence = root / "extraction/native.xml"
+    if book.get("extraction_policy") == "automatic-extraction-1" and native_evidence.is_file():
+        from tools.automatic_extraction import parse_native
+        reference_texts = [" ".join(word["text"] for block in native["blocks"] for line in block["lines"] for word in line["words"])
+                            for native in parse_native(native_evidence.read_text())]
+    normalization = text_normalization.project(blocks, reference_texts)
+    if native_evidence.is_file(): normalization["reference_evidence"] = {"path": "extraction/native.xml", "sha256": _hash_file(native_evidence)}
     unresolved = final_report.get("unresolved_priority_counts", {})
     source_document = book.get("document") if isinstance(book.get("document"), dict) else {}
     source_files = [Path(value).name for value in book.get("sources", []) if isinstance(value, str)]
@@ -317,7 +374,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
         "metadata": {"title": document_title, "author": None, "booktext_version": booktext_version, "source_page_count": len(pages), "languages": book.get("ocr_languages"), "ocr_engine": book.get("ocr_engine"), "source_files": source_files, "build_policy": "existing artifacts only; no OCR or model inference"},
         "source": {"book_json": {"path": "book.json", "sha256": _hash_file(book_path)}, "document_identity": {"path": source_document.get("identity_artifact"), "title": document_title}, "review_priority": {"path": "review_priority.json", "sha256": _hash_file(priority_path)}, "review_decisions": {"path": decisions_path.name, "sha256": _hash_file(decisions_path) if decisions_path.is_file() else None}, "recovered_visual_evidence": {"path": recovered_visual_ref, "sha256": _hash_file(root / recovered_visual_ref) if recovered_visual_ref else None}},
         "review": {"final_build": {"decision_status_counts": final_report.get("decision_status_counts", {}), "applied_text_changes": final_report.get("applied_text_changes", 0), "stale_or_conflict_count": final_report.get("stale_or_conflict_count", 0)}, "unresolved_priority_counts": {"HIGH": unresolved.get("HIGH", 0), "MEDIUM": unresolved.get("MEDIUM", 0)}},
-        "source_pages": source_pages, "blocks": blocks, "notes": [], "warnings": warnings,
+        "source_pages": source_pages, "blocks": blocks, "normalization": normalization, "notes": [], "warnings": warnings,
     }
     validate_document(document, root=root, decisions=decisions)
     return document
@@ -361,7 +418,7 @@ def validate_document(document, *, root=None, decisions=None):
         for decision_id in provenance.get("correction_decision_ids", []):
             if decision_id not in decision_ids:
                 raise ValueError("decision provenance points to nonexistent decision")
-        for key in ("prepared_page", "raw_ocr_ref"):
+        for key in ("prepared_page", "raw_ocr_ref", "raw_native_ref"):
             value = provenance.get(key)
             if value and root is not None and not (Path(root) / value).is_file():
                 raise ValueError("broken artifact reference")
