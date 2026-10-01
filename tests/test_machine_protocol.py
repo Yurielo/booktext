@@ -108,7 +108,7 @@ class MachineProtocolTests(unittest.TestCase):
     def test_translation_uses_versioned_machine_operation_without_ocr(self, translate):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.fixture(temporary)
-            code, payload = events(lambda: protocol.main(["translation", str(root), "--source-language", "en", "--target-language", "ru", "--model", "qwen3:8b"]))
+            code, payload = events(lambda: protocol.main(["translation", str(root), "--source-language", "en", "--target-language", "ru", "--model", "qwen3:8b", "--block-id", "unit-2", "--block-id", "unit-5"]))
             self.assertEqual(0, code); self.assert_protocol(payload)
             self.assertEqual("translation", payload[-1]["phase"])
             translate.assert_called_once()
@@ -117,6 +117,7 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertEqual("en", kwargs["source_language"])
             self.assertEqual("ru", kwargs["target_language"])
             self.assertEqual("30s", kwargs["keep_alive"])
+            self.assertEqual(["unit-2", "unit-5"], kwargs["block_ids"])
 
     @mock.patch("tools.machine_protocol.export_document.export_translation", return_value={"generated": {"docx": {}}})
     def test_translation_export_uses_validated_derivative_operation(self, exported):

@@ -368,7 +368,7 @@ def _handle(args):
         return _invoke(emitter, root, "translation", "translation", lambda: translation.translate_document(root,
             source_language=args.source_language, target_language=args.target_language, provider=args.provider, model=args.model,
             glossary_path=args.glossary, endpoint=args.endpoint, timeout=args.timeout, keep_alive=args.keep_alive,
-            chunk_size=args.chunk_size, restart=args.restart, progress=translation_progress))
+            chunk_size=args.chunk_size, restart=args.restart, block_ids=args.block_ids, progress=translation_progress))
     if args.command == "translation-validate":
         return _invoke(emitter, root, "translation", "translation validation", lambda: translation.validate_translation(root,
             source_language=args.source_language, target_language=args.target_language))
@@ -461,7 +461,7 @@ def main(argv=None):
     def translation_options(p, *, provider=True):
         p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru"))
         if provider:
-            p.add_argument("--provider", default="ollama", choices=("ollama",)); p.add_argument("--model", required=True); p.add_argument("--glossary"); p.add_argument("--endpoint", default="http://127.0.0.1:11434"); p.add_argument("--timeout", type=int, default=120); p.add_argument("--keep-alive", default=translation.DEFAULT_MODEL_KEEP_ALIVE); p.add_argument("--chunk-size", type=int, default=translation.DEFAULT_LOGICAL_UNIT_CHUNK_SIZE); p.add_argument("--restart", action="store_true")
+            p.add_argument("--provider", default="ollama", choices=("ollama",)); p.add_argument("--model", required=True); p.add_argument("--glossary"); p.add_argument("--endpoint", default="http://127.0.0.1:11434"); p.add_argument("--timeout", type=int, default=120); p.add_argument("--keep-alive", default=translation.DEFAULT_MODEL_KEEP_ALIVE); p.add_argument("--chunk-size", type=int, default=translation.DEFAULT_LOGICAL_UNIT_CHUNK_SIZE); p.add_argument("--block-id", action="append", dest="block_ids", help="Translate only a source-ordered logical-unit pilot; repeat for each owned unit"); p.add_argument("--restart", action="store_true")
     translation_options(sub.add_parser("translation"))
     translation_options(sub.add_parser("translation-validate"), provider=False)
     p = sub.add_parser("translation-export"); p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru")); p.add_argument("--format", action="append", required=True, choices=[*export_document.FORMATS, "all"])

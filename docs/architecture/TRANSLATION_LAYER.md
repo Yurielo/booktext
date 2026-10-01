@@ -18,6 +18,11 @@ python3 booktext.py translate OUTPUT_DIR \
 The reverse direction uses `--source-language ru --target-language en`.  A
 JSON glossary can be supplied with `--glossary glossary.json`; it maps source
 terms to required target terms and is fingerprinted in the result.
+Glossary values may also be `{ "target": "…", "variants": ["…"] }`, so
+approved Russian inflections or alternatives can be checked without rewriting
+the model's sentence.  A repeatable bounded pilot can use one or more
+`--block-id` values; those units retain their original document order and use
+the full CDM only for read-only neighbouring context.
 
 `booktext machine translation …` exposes the same operation to BookText.app
 or another local client. `booktext machine translation-validate …` checks an
@@ -69,9 +74,14 @@ text. A block already entirely in the target language is explicitly recorded
 as skipped rather than sent to a model. Mixed-language blocks are still
 source-anchored and their direction is recorded.
 
-The layer verifies numeric tokens before a translation receives
-`machine_translated` status. A changed number, fraction or compact unit yields
-`needs_numeric_review`; it never becomes human-reviewed automatically.
+The layer separates request/JSON success, checkpoint integrity, automated
+quality signals and human semantic acceptance. It checks numeric tokens,
+provider completion reason, mixed-script words, repeated output, unchanged
+headings, applicable glossary terms and possible read-only-context leakage.
+A changed number, fraction or compact unit yields `needs_numeric_review`; an
+unresolved quality signal yields `needs_quality_review`. Neither state becomes
+human-reviewed automatically. A clean `machine_translated` state is still a
+machine result, not semantic acceptance.
 
 Each result fingerprints its source CDM and every source block. If the CDM or
 a participating block changes, validation reports `stale: true`; a new run
@@ -93,11 +103,15 @@ For every owned chunk BookText performs:
 
 `translate → validate → atomic checkpoint → verify → release transient request state`.
 
-Completed, hash-verified chunks are resumed without provider calls.  The final
-assembly checks exact source-unit coverage, duplicate absence, source order,
-and context-only exclusion before publishing the versioned translation
-artifact.  After successful assembly, checkpoint payloads are compacted while
-the source-anchored final artifact, plan metadata, and provenance remain.
+Each completed logical unit is atomically retained as a verified prefix while
+its chunk is running. Therefore a failure in a neighbouring unit does not
+retranslate completed units on resume. Completed, hash-verified chunks are
+also resumed without provider calls. The final assembly proves exact
+source-unit coverage, duplicate absence and source order; it explicitly marks
+read-only-context exclusion as `NOT_SEMANTICALLY_VERIFIED`, because ID coverage
+alone cannot prove semantic correctness. After successful assembly, checkpoint
+payloads are compacted while the source-anchored final artifact, plan metadata,
+attempts and provenance remain.
 
 `--chunk-size` is measured in complete logical units, not pages.  `--restart`
 is explicit: it archives an existing derived translation before restarting its
