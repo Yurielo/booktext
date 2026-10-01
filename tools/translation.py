@@ -322,6 +322,21 @@ def _numbers(text):
     return NUMBER_RE.findall(text)
 
 
+def quality_signals(source, translated, *, source_language, target_language, kind="paragraph"):
+    """Review evidence only; neither fixes text nor certifies model semantics."""
+    signals = []
+    if _numbers(source) != _numbers(translated): signals.append("numeric_tokens_changed")
+    tokens = re.findall(r"[A-Za-zА-Яа-яЁё]+", translated)
+    if any(re.search(r"[A-Za-z]", token) and re.search(r"[А-Яа-яЁё]", token) for token in tokens):
+        signals.append("mixed_scripts_inside_word")
+    if kind == "paragraph" and len(tokens) >= 12:
+        target_pattern = r"[А-Яа-яЁё]" if target_language == "ru" else r"[A-Za-z]"
+        target_count = sum(bool(re.search(target_pattern, token)) for token in tokens)
+        if target_count / len(tokens) < .2: signals.append("possible_untranslated_prose")
+    if re.search(r"[A-Za-zА-Яа-яЁё]-\s*$", source): signals.append("source_boundary_hyphen_requires_review")
+    return signals
+
+
 def _entry(block, *, source_language, target_language, text, before, after, glossary, provider, timeout, keep_alive, document_context=None):
     detected = _script_language(text)
     base = {"block_id": block["block_id"], "block_type": block["type"], "source_page": block.get("provenance", {}).get("source_page"),
@@ -336,7 +351,8 @@ def _entry(block, *, source_language, target_language, text, before, after, glos
     original_numbers, translated_numbers = _numbers(text), _numbers(translated)
     status = "machine_translated" if original_numbers == translated_numbers else "needs_numeric_review"
     return {**base, "status": status, "translation": translated, "translation_sha256": _sha_bytes(translated.encode("utf-8")),
-            "validation": {"numeric_tokens": "PASS" if status == "machine_translated" else "FAIL", "source": original_numbers, "translation": translated_numbers},
+            "validation": {"numeric_tokens": "PASS" if status == "machine_translated" else "FAIL", "source": original_numbers, "translation": translated_numbers,
+                           "quality_signals": quality_signals(text, translated, source_language=source_language, target_language=target_language, kind=block["type"])},
             "provider_settings": settings}
 
 
@@ -368,16 +384,23 @@ def _validate_manifest(manifest, document, *, cdm_sha=None):
     if not isinstance(observed, list) or len(observed) != len(expected) or [item.get("block_id") for item in observed if isinstance(item, dict)] != [block["block_id"] for block in _eligible(document)]:
         raise ValueError("translation does not cover the current eligible CDM blocks")
     invalid = []
+    quality = []
     for item in observed:
         block = expected[item["block_id"]]
         if item.get("source_text_sha256") != _sha_bytes(block["text"].encode("utf-8")):
             stale = True
         if item.get("status") in {"machine_translated", "needs_numeric_review"} and not isinstance(item.get("translation"), str):
             invalid.append(item["block_id"])
+        if isinstance(item.get("translation"), str):
+            direction = manifest.get("direction") or {}
+            signals = quality_signals(block["text"], item["translation"], source_language=direction.get("source_language", "en"),
+                                      target_language=direction.get("target_language", "ru"), kind=block["type"])
+            if signals: quality.append({"block_id": block["block_id"], "source_page": block.get("provenance", {}).get("source_page"), "signals": signals})
     return {"valid": not invalid, "stale": stale, "invalid_block_ids": invalid,
             "machine_translated": sum(item.get("status") == "machine_translated" for item in observed),
             "needs_numeric_review": sum(item.get("status") == "needs_numeric_review" for item in observed),
-            "skipped": sum(str(item.get("status", "")).startswith("skipped_") for item in observed)}
+            "skipped": sum(str(item.get("status", "")).startswith("skipped_") for item in observed),
+            "quality_policy": "signals are human-review evidence, not automatic corrections", "quality_review": quality, "quality_review_count": len(quality)}
 
 
 def _reset_translation_workspace(root):

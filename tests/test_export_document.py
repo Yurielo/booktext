@@ -3,9 +3,10 @@ import json
 import tempfile
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from tools.export_document import export_document, export_translation
+from tools.export_document import export_document, export_translation, _enable_docx_text_wrapping, WP, W, A
 
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACAQAAAABazTCJAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAACYktHRAAB3YoTpAAAAAd0SU1FB+oJHAcpDsplvHsAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDktMjhUMDc6NDE6MTQrMDA6MDAdjJROAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTA5LTI4VDA3OjQxOjE0KzAwOjAwbNEs8gAAACh0RVh0ZGF0ZTp0aW1lc3RhbXAAMjAyNi0wOS0yOFQwNzo0MToxNCswMDowMDvEDS0AAAAMSURBVAjXYzjAcAAAAwQBgcU7oqkAAAAASUVORK5CYII=")
@@ -59,6 +60,8 @@ class ExportDocumentTests(unittest.TestCase):
             self.assertTrue(any(name.startswith("word/media/") for name in archive.namelist()))
             xml = archive.read("word/document.xml")
             self.assertIn(b"wrapSquare", xml)
+            self.assertIn(b'allowOverlap="0"', xml)
+            self.assertNotIn(b'allowOverlap="1"', xml)
             self.assertNotIn(b"Unknown layout", xml)
             self.assertNotIn(b"Table fallback review", xml)
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive:
@@ -91,6 +94,28 @@ class ExportDocumentTests(unittest.TestCase):
         self.assertFalse((self.root / "exports/book.md").exists())
         self.assertFalse((self.root / "exports/.book-docx-input.md").exists())
         self.assertFalse((self.root / "exports/.book-image-source.pdf").exists())
+
+    def test_large_illustrations_remain_inline_and_fit_the_printable_page(self):
+        path = self.root / "layout.docx"
+        root = ET.Element(f"{W}document")
+        body = ET.SubElement(root, f"{W}body")
+        for size in ((1000000, 1500000), (15000000, 20000000)):
+            drawing = ET.SubElement(ET.SubElement(ET.SubElement(body, f"{W}p"), f"{W}r"), f"{W}drawing")
+            inline = ET.SubElement(drawing, f"{WP}inline")
+            ET.SubElement(inline, f"{WP}extent", {"cx":str(size[0]), "cy":str(size[1])})
+            ET.SubElement(ET.SubElement(inline, f"{A}xfrm"), f"{A}ext", {"cx":str(size[0]), "cy":str(size[1])})
+        with zipfile.ZipFile(path,"w") as archive:
+            archive.writestr("word/document.xml", ET.tostring(root))
+        _enable_docx_text_wrapping(path)
+        with zipfile.ZipFile(path) as archive: root = ET.fromstring(archive.read("word/document.xml"))
+        self.assertEqual(len(root.findall(f".//{WP}anchor")), 1)
+        self.assertEqual(len(root.findall(f".//{WP}inline")), 1)
+        extent = root.find(f".//{WP}inline/{WP}extent")
+        self.assertLessEqual(int(extent.get("cx")), 5943600)
+        self.assertLessEqual(int(extent.get("cy")), 8077200)
+        self.assertAlmostEqual(int(extent.get("cx"))/int(extent.get("cy")), .75, places=5)
+        self.assertEqual(root.find(f".//{WP}inline/{A}xfrm/{A}ext").attrib, extent.attrib)
+        self.assertIsNotNone(root.find(f'.//{W}br[@{W}clear="all"]'))
 
     def test_translation_export_uses_valid_anchored_derivative_without_mutating_cdm(self):
         before = (self.root / "book_document.json").read_bytes()

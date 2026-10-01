@@ -63,6 +63,8 @@ enum FinalBookSection: String, CaseIterable, Identifiable {
             let result = detail["result"]?.object ?? [:]
             let reused = result["reused"]?.bool == true
             self?.message = reused ? "Existing source-matched translation is available." : "Translation created from CDM; it is machine-translated, not human-reviewed."
+            let qualityCount = result["validation"]?.object?["quality_review_count"]?.integer ?? 0
+            if qualityCount > 0 { self?.message += " Quality review signals: \(qualityCount). See translation validation before accepting the text." }
             self?.refresh()
         }
     }

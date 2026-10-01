@@ -137,5 +137,15 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertEqual(figure["provenance"]["source"]["kind"], "preserved_surya_layout_visual_crop")
         self.assertEqual(document["source"]["recovered_visual_evidence"]["path"], "visual_evidence.json")
 
+    def test_empty_native_layout_does_not_drop_ocr_text_and_warnings(self):
+        (self.root / "surya/surya-input/results.json").unlink()
+        (self.root / "review_decisions.json").unlink()
+        self.book["pages"] = [{"page":1, "text":"Scanned text survives.", "layout_blocks":[],
+                               "extraction_warnings":[{"page":1,"kind":"source_render_diagnostic"}]}]
+        write(self.root / "book.json", self.book)
+        doc = build_document(self.root)
+        self.assertIn("Scanned text survives.", [block.get("text") for block in doc["blocks"]])
+        self.assertIn({"page":1,"kind":"source_render_diagnostic"}, doc["warnings"])
+
 
 if __name__ == "__main__": unittest.main()

@@ -19,6 +19,11 @@
 
 ## Возможности
 
+- единый автоматический путь: встроенный текст PDF → прямое извлечение,
+  сканированный текст → Surya, иллюстрации → сохранённые изображения;
+- отдельный новый результат `_book_auto`, без перезаписи прежних решений и перевода;
+- обратимая нормализация абзацев и диагностические сигналы качества перевода;
+
 - пакетный OCR выбранных страниц через Surya;
 - legacy-режим Tesseract;
 - TXT, Markdown, JSON и searchable PDF;
@@ -30,6 +35,12 @@
   данных.
 
 ## Установка и preflight (macOS)
+
+Автоматическая обработка PDF требует Poppler (`pdftotext`, `pdfimages`,
+`pdftoppm`, `pdfinfo`), MuPDF (`mutool`) и Python Pillow. OCR-зависимости нужны
+только если обнаружены области распознавания. В приложении выбор OCR-движка
+не требуется. Подробности, ограничения и provenance:
+[Automatic extraction](docs/architecture/AUTOMATIC_EXTRACTION.md).
 
 Booktext `0.1.0` рассчитан на macOS, особенно Apple Silicon. Версию проверяйте
 командой `python3 booktext.py --version`. Требуется Python 3.11+ и ImageMagick
