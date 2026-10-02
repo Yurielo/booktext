@@ -35,7 +35,11 @@ func progressCompletionFailureAndCancellationTransitions() throws {
         state.consume(try event("warning")); try check(state.warnings == ["message"], "warning transition")
         state.consume(try event("job_completed")); try check(state.state == .completed, "completion transition")
         state.consume(try event("job_failed", code: "processing_failure")); try check(state.state == .failed && state.errorCode == "processing_failure", "failure transition")
-        state.consume(try event("job_cancelled", code: "cancelled")); try check(state.state == .cancelled, "cancellation transition")
+    state.consume(try event("job_cancelled", code: "cancelled")); try check(state.state == .cancelled, "cancellation transition")
+    state.consume(try event("pipeline_started")); try check(state.state == .running, "pipeline start transition")
+    state.consume(try event("stage_progress", phase: "translation")); try check(state.state == .running && state.phase == "translation", "pipeline stage progress")
+    state.consume(try event("pipeline_paused", code: "cancelled")); try check(state.state == .cancelled, "pipeline pause transition")
+    state.consume(try event("pipeline_completed", phase: "export")); try check(state.state == .completed, "pipeline completion transition")
 }
 
 func safeArgumentArrayAndArtifactMapping() throws {

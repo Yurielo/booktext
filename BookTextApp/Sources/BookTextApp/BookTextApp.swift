@@ -25,6 +25,11 @@ import BookTextCore
     @Published var finalPresented = false
     @Published var finalSection: FinalBookSection = .preview
     @Published var includePDF = false
+    @Published var workflowReviewPolicy = "skip_human_review"
+    @Published var workflowTranslate = false
+    @Published var workflowTranslationSource = "en"
+    @Published var workflowTranslationModel = "qwen3:8b"
+    @Published var workflowExportFormats: Set<String> = ["docx"]
     @Published var cleanupBusy = false
     @Published private(set) var recentOutputPaths: [String] = []
     @Published private(set) var projects: [ProjectHistoryEntry] = []
@@ -114,13 +119,38 @@ import BookTextCore
         }
         if event.eventType == .jobFailed { errorText = "\(event.code): \(event.message)" }
     }
+    private func pipelineDefinitionJSON(coreOptions: [String]) -> String? {
+        var stages: [[String: Any]] = [
+            ["stage_id": "process", "type": "PROCESS", "config": ["core_args": coreOptions]],
+            ["stage_id": "review", "type": "REVIEW_POLICY", "config": ["policy": workflowReviewPolicy]],
+            ["stage_id": "final-build", "type": "FINAL_BUILD", "config": [:]],
+            ["stage_id": "cdm", "type": "CDM", "config": [:]],
+        ]
+        if workflowTranslate {
+            stages.append(["stage_id": "translate", "type": "TRANSLATE", "config": ["source_language": workflowTranslationSource, "target_language": workflowTranslationSource == "en" ? "ru" : "en", "provider": "ollama", "model": workflowTranslationModel]])
+        }
+        if !workflowExportFormats.isEmpty {
+            stages.append(["stage_id": "export", "type": "EXPORT", "config": ["formats": ExportFormatSelection.ordered(workflowExportFormats), "document": workflowTranslate ? "TRANSLATION" : "ORIGINAL"]])
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: ["schema_version": "1.0", "stages": stages]), let value = String(data: data, encoding: .utf8) else { return nil }
+        return value
+    }
     func start() {
         guard !sourceURLs.isEmpty, ready else { return }
         presentation = JobPresentation(state: .running); errorText = ""; warningText = ""; resumedRun = false; startedAt = Date()
         let coreOptions = AutomaticProcessingOptions.arguments(includeSearchablePDF: includePDF)
-        let arguments = ["run"] + sourceURLs.map(\.path) + ["--"] + coreOptions
+        guard let definition = pipelineDefinitionJSON(coreOptions: coreOptions), let source = sourceURLs.first else { errorText = "workflow configuration is invalid"; presentation.state = .failed; return }
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
-        do { try client.start(arguments: arguments, event: { [weak self] event in Task { @MainActor in self?.receiveRun(event) } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in self?.finishRun(status) } }) } catch { errorText = error.localizedDescription; presentation.state = .failed }
+        do { try client.start(arguments: ["pipeline-create", "--definition-json", definition, source.path], event: { [weak self] event in Task { @MainActor in
+            guard let self else { return }; self.presentation.consume(event)
+            if event.eventType == .jobCompleted, let path = event.details.object?["output_dir"]?.string { self.outputURL = URL(fileURLWithPath: path); self.rememberOutput(self.outputURL!); self.runPipeline(resume: false) }
+            if event.eventType == .jobFailed { self.errorText = "\(event.code): \(event.message)" }
+        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in if status != 0 { self?.presentation.state = .failed; self?.errorText = "workflow configuration failed" } } }) } catch { errorText = error.localizedDescription; presentation.state = .failed }
+    }
+    func runPipeline(resume: Bool) {
+        guard let outputURL else { return }
+        let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
+        do { try client.start(arguments: [resume ? "pipeline-resume" : "pipeline-start", outputURL.path], event: { [weak self] event in Task { @MainActor in self?.receiveRun(event) } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in self?.finishRun(status) } }) } catch { errorText = error.localizedDescription; presentation.state = .failed }
     }
     private func receiveRun(_ event: MachineEvent) {
         presentation.consume(event)
@@ -216,8 +246,9 @@ struct ContentView: View {
         switch model.snapshot.state {
         case .noDocument: chooser
         case .readyToProcess: selectedDocument
-        case .processing, .translating: processing
-        case .interruptedResumable: interrupted
+        case .pipelinePlanned: interrupted
+        case .processing, .pipelineRunning, .translating: processing
+        case .interruptedResumable, .pipelinePaused: interrupted
         case .reviewRequired, .readyForFinalBuild, .bookReady, .translationReady: completedDocument
         case .failed: failed
         }
@@ -261,9 +292,24 @@ struct ContentView: View {
     private var selectedDocument: some View {
         VStack(alignment: .leading, spacing: 18) {
             documentCard(status: model.ready ? "Ready" : "Checking requirements…", symbol: model.ready ? "checkmark.circle.fill" : "hourglass")
+            workflowConfiguration
             if model.presentation.state == .preflighting { ProgressView().controlSize(.small) }
-            HStack { Button("Start Processing", action: model.start).buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.ready); Button("Choose Another Document", action: chooseFiles); SettingsLink { Text("Options…") } }
+            HStack { Button("Start", action: model.start).buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.ready); Button("Choose Another Document", action: chooseFiles); SettingsLink { Text("Options…") } }
         }.frame(maxWidth: 680, alignment: .leading)
+    }
+    private var workflowConfiguration: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Workflow").font(.headline)
+            Label("1  Process document", systemImage: "1.circle")
+            HStack { Label("2  Review", systemImage: "2.circle"); Picker("Review", selection: $model.workflowReviewPolicy) { Text("Skip review").tag("skip_human_review"); Text("Review when required").tag("review_when_required") }.labelsHidden().frame(width: 190) }
+            Toggle("3  Translate English → Russian", isOn: $model.workflowTranslate)
+            if model.workflowTranslate { HStack { Picker("Source", selection: $model.workflowTranslationSource) { Text("English → Russian").tag("en"); Text("Russian → English").tag("ru") }.labelsHidden(); TextField("Local model", text: $model.workflowTranslationModel).textFieldStyle(.roundedBorder).frame(width: 170) } }
+            HStack { Label("4  Export", systemImage: "4.circle"); ForEach([("docx", "DOCX"), ("pdf", "PDF"), ("epub", "EPUB"), ("html", "HTML"), ("markdown", "Markdown")], id: \.0) { format in Toggle(format.1, isOn: workflowFormatBinding(format.0)).toggleStyle(.checkbox) } }
+            Text("BookText validates and saves this sequential plan before work starts. Completed stages resume safely after an interruption.").font(.caption).foregroundStyle(.secondary)
+        }.padding(14).background(Color.secondary.opacity(0.06)).clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+    private func workflowFormatBinding(_ format: String) -> Binding<Bool> {
+        Binding(get: { model.workflowExportFormats.contains(format) }, set: { selected in if selected { model.workflowExportFormats.insert(format) } else { model.workflowExportFormats.remove(format) } })
     }
     private var processing: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -276,7 +322,7 @@ struct ContentView: View {
         }.frame(maxWidth: 720, alignment: .leading)
     }
     private var interrupted: some View {
-        VStack(alignment: .leading, spacing: 16) { documentCard(status: "Processing paused", symbol: "pause.circle"); Text("Completed work is saved. Choose the same source to resume without repeating finished pages.").foregroundStyle(.secondary); Button("Choose Source to Resume…", action: chooseFiles).buttonStyle(.borderedProminent); Button("Back to Documents", action: model.resetToChooser) }
+        VStack(alignment: .leading, spacing: 16) { documentCard(status: model.snapshot.state == .pipelinePlanned ? "Workflow ready" : "Workflow paused", symbol: model.snapshot.state == .pipelinePlanned ? "checkmark.circle" : "pause.circle"); Text("Completed work is saved. Resume continues from the current stage without repeating completed stages or chunks.").foregroundStyle(.secondary); if model.snapshot.state == .pipelinePaused || model.snapshot.state == .pipelinePlanned { Button(model.snapshot.state == .pipelinePlanned ? "Start Workflow" : "Resume Workflow") { model.runPipeline(resume: model.snapshot.state == .pipelinePaused) }.buttonStyle(.borderedProminent) } else { Button("Choose Source to Resume…", action: chooseFiles).buttonStyle(.borderedProminent) }; Button("Back to Documents", action: model.resetToChooser) }
     }
     private var completedDocument: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -294,6 +340,7 @@ struct ContentView: View {
         case .createFinalBook: Button(model.buildingFinalBook ? "Creating Final Book…" : "Create Final Book", action: model.createFinalBook).buttonStyle(.borderedProminent).controlSize(.large).disabled(model.buildingFinalBook)
         case .openBook: Button("Open Book") { model.showFinal(.preview) }.buttonStyle(.borderedProminent).controlSize(.large)
         case .openTranslation: HStack { Button("Open Translation") { model.showFinal(.translation) }.buttonStyle(.borderedProminent).controlSize(.large); Button("Open Book") { model.showFinal(.preview) } }
+        case .resumePipeline: Button("Resume Workflow") { model.runPipeline(resume: true) }.buttonStyle(.borderedProminent).controlSize(.large)
         default: EmptyView()
         }
     }
@@ -311,7 +358,7 @@ struct ContentView: View {
             else { Text("The book is ready to open, translate, or export."); if model.snapshot.translationAvailable { Label("Translation available", systemImage: "character.book.closed") } }
         }.foregroundStyle(.secondary)
     }
-    private var lifecycleTitle: String { switch model.snapshot.state { case .reviewRequired: "Review required"; case .readyForFinalBuild: "Ready for final book"; case .translationReady: "Book and translation ready"; default: "Book ready" } }
+    private var lifecycleTitle: String { switch model.snapshot.state { case .reviewRequired: "Review required"; case .readyForFinalBuild: "Ready for final book"; case .translationReady: "Book and translation ready"; case .pipelinePaused: "Workflow paused"; default: "Book ready" } }
     private var lifecycleSymbol: String { model.snapshot.state == .reviewRequired ? "exclamationmark.circle.fill" : "checkmark.circle.fill" }
     private var progressDescription: String { if let current = model.presentation.current, let total = model.presentation.total { return "\(current) of \(total)" + (model.presentation.page.map { " · page \($0)" } ?? "") }; return model.presentation.page.map { "Page \($0)" } ?? "Working…" }
     private func refreshCurrentOutput() { if let output = model.outputURL { model.inspect(output) } }

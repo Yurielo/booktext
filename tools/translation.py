@@ -35,8 +35,16 @@ SUPPORTED_LANGUAGES = ("en", "ru")
 TEXT_TYPES = {"heading", "paragraph", "list", "caption", "unknown"}
 DEFAULT_LOGICAL_UNIT_CHUNK_SIZE = 12
 PROMPT_VERSION = "qwen-document-translation-v2"
+RESPONSE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {"translation": {"type": "string"}},
+    "required": ["translation"],
+    "additionalProperties": False,
+}
 QUALITY_POLICY_VERSION = "translation-quality-v2"
 MAX_UNIT_ATTEMPTS = 3
+MAX_PROVIDER_REQUEST_ATTEMPTS = 3
+MAX_PROVIDER_REQUEST_TIMEOUT_SECONDS = 300
 CONTEXT_CHAR_BUDGET = 900
 MAX_RETRY_SOURCE_CHARS = 1000
 MAX_OUTPUT_TOKENS = 2048
@@ -125,6 +133,22 @@ def _validate_keep_alive(value):
     return value
 
 
+def _effective_request_keep_alive(requested, timeout):
+    """Keep the bounded Ollama lease alive for the longest bounded retry.
+
+    Ollama begins its keep-alive countdown while a request is in flight on
+    some local builds.  A 30 second lease can therefore evict a model during
+    a legitimate 120 second translation request.  This remains a finite
+    lease, never an unload/kill operation, and is recorded separately from
+    the user's requested idle lease.
+    """
+    match = re.fullmatch(r"(\d+)(ms|s|m)", requested)
+    amount, unit = int(match.group(1)), match.group(2)
+    requested_seconds = amount / 1000 if unit == "ms" else amount * (60 if unit == "m" else 1)
+    required_seconds = min(MAX_MODEL_KEEP_ALIVE_SECONDS, int(timeout) * MAX_PROVIDER_REQUEST_ATTEMPTS)
+    return f"{int(max(requested_seconds, required_seconds))}s"
+
+
 def translation_path(root, source_language, target_language):
     return Path(root).expanduser().resolve() / "translations" / f"{pair_name(source_language, target_language)}.json"
 
@@ -185,6 +209,31 @@ def _extract_translation(content):
     if not isinstance(translation, str) or not translation.strip():
         raise ValueError("provider response has no non-empty translation")
     return translation.strip()
+
+
+def _strip_model_thinking(content):
+    """Remove only an explicit Qwen-style hidden-thinking envelope."""
+    return re.sub(r"^\s*<think>.*?</think>\s*", "", content or "", flags=re.DOTALL)
+
+
+def _max_output_tokens_for_source(source):
+    """A logical-unit-sized completion cap prevents headings using prose budget."""
+    return min(MAX_OUTPUT_TOKENS, max(128, len(source) * 2))
+
+
+def _is_short_heading_request(source, document_context):
+    return isinstance(document_context, dict) and document_context.get("block_type") == "heading" and len(source.strip()) <= 120
+
+
+def _safe_plain_provider_translation(content, *, source, target_language):
+    """Accept a narrowly safe non-JSON answer only as review evidence."""
+    candidate = (content or "").strip()
+    if not candidate or "\n" in candidate or len(candidate) > max(120, len(source) * 4):
+        return None
+    if re.search(r"\b(i cannot|sorry|translation|here is|ответ|перевод)\b", candidate, re.IGNORECASE):
+        return None
+    expected = CYRILLIC_RE if target_language == "ru" else re.compile(r"[A-Za-z]")
+    return candidate if expected.search(candidate) else None
 
 
 def _sentences(text, *, tail=False, limit=CONTEXT_CHAR_BUDGET):
@@ -252,6 +301,8 @@ def _target_term_present(text, term):
 
 def _response_quality(source, translated, *, source_language, target_language, kind, glossary, before, after, response):
     signals = quality_signals(source, translated, source_language=source_language, target_language=target_language, kind=kind)
+    if isinstance(response, dict) and response.get("response_format_fallback"):
+        signals.append("provider_response_format_requires_review")
     completion = response.get("done_reason") if isinstance(response, dict) else None
     if completion and completion not in {"stop"}:
         signals.append("provider_completion_requires_review")
@@ -291,6 +342,15 @@ def _retryable_quality_signals(signals):
     return [signal for signal in signals if signal in retryable or signal.startswith("required_glossary_term_missing:")]
 
 
+class TranslationProviderRequestError(ValueError):
+    """A transient local-provider request failure safe to retry for one unit.
+
+    This deliberately represents a request, not a process.  BookText never
+    reaches into Ollama's shared daemon or models: a caller can retry the same
+    source-anchored unit, while checkpoints keep every completed unit intact.
+    """
+
+
 def _translate_ollama(*, endpoint, model, source, source_language, target_language, before, after, glossary, timeout, keep_alive=DEFAULT_MODEL_KEEP_ALIVE, document_context=None):
     glossary_text = json.dumps(glossary, ensure_ascii=False, sort_keys=True) if glossary else "{}"
     prompt = {
@@ -310,22 +370,55 @@ def _translate_ollama(*, endpoint, model, source, source_language, target_langua
     # Qwen3 and other thinking-capable local models can otherwise spend the
     # whole bounded request window on hidden analysis before producing JSON.
     # This remains an explicit provider setting in the resulting provenance.
-    payload = {"model": model, "stream": False, "format": "json", "think": False, "keep_alive": keep_alive,
-               "options": {"temperature": 0, "num_predict": MAX_OUTPUT_TOKENS},
-               "messages": [{"role": "system", "content": "You are a faithful document translator."},
-                            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}]}
+    short_heading = _is_short_heading_request(source, document_context)
+    if short_heading:
+        # Qwen can loop while trying to fill a JSON schema for a one-word
+        # heading.  This is still a source-anchored model request, but its
+        # contract is deliberately simple and bounded to a heading-sized
+        # answer. Context remains read-only evidence in provenance.
+        payload = {"model": model, "stream": False, "think": False, "keep_alive": keep_alive,
+                   "options": {"temperature": 0, "num_predict": 64},
+                   "messages": [{"role": "system", "content": "You are a faithful document translator. Return only the translated heading. No explanation, no JSON, no markdown."},
+                                {"role": "user", "content": f"Source language: {source_language}\nTarget language: {target_language}\nOwned heading: {source}\nRead-only context before: {before}\nRead-only context after: {after}"}]}
+    else:
+        payload = {"model": model, "stream": False, "format": RESPONSE_JSON_SCHEMA, "think": False, "keep_alive": keep_alive,
+                   "options": {"temperature": 0, "num_predict": _max_output_tokens_for_source(source)},
+                   "messages": [{"role": "system", "content": "You are a faithful document translator."},
+                                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}]}
     request = urllib.request.Request(endpoint.rstrip("/") + "/api/chat", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
-        raise ValueError("local Ollama translation request failed") from error
+        raise TranslationProviderRequestError(
+            f"local Ollama translation request failed: {type(error).__name__}: {error}"
+        ) from error
     content = (((result.get("message") or {}).get("content")) if isinstance(result, dict) else None)
     if not isinstance(content, str):
-        raise ValueError("local Ollama response is missing message content")
-    return _extract_translation(content), {"temperature": 0, "max_output_tokens": MAX_OUTPUT_TOKENS, "thinking": False, "response_format": "json", "prompt_version": PROMPT_VERSION,
+        raise TranslationProviderRequestError("local Ollama response is missing message content")
+    content = _strip_model_thinking(content)
+    if short_heading:
+        extracted = _safe_plain_provider_translation(content, source=source, target_language=target_language)
+        if extracted is None:
+            diagnostic = re.sub(r"\s+", " ", content).strip()[:160]
+            raise TranslationProviderRequestError(f"provider did not return a safe short-heading translation; response_sample={diagnostic!r}")
+        return extracted, {"temperature": 0, "max_output_tokens": 64, "thinking": False, "response_format": "plain_short_heading", "prompt_version": PROMPT_VERSION,
+                           "glossary_json": glossary_text, "keep_alive": keep_alive,
+                           "done_reason": result.get("done_reason"), "eval_count": result.get("eval_count"),
+                           "response_format_fallback": False}
+    response_format_fallback = False
+    try:
+        extracted = _extract_translation(content)
+    except ValueError as error:
+        extracted = _safe_plain_provider_translation(content, source=source, target_language=target_language)
+        if extracted is None:
+            diagnostic = re.sub(r"\s+", " ", content).strip()[:160]
+            raise TranslationProviderRequestError(f"{error}; response_sample={diagnostic!r}") from error
+        response_format_fallback = True
+    return extracted, {"temperature": 0, "max_output_tokens": _max_output_tokens_for_source(source), "thinking": False, "response_format": "json_schema", "prompt_version": PROMPT_VERSION,
                                            "glossary_json": glossary_text, "keep_alive": keep_alive,
-                                           "done_reason": result.get("done_reason"), "eval_count": result.get("eval_count")}
+                                           "done_reason": result.get("done_reason"), "eval_count": result.get("eval_count"),
+                                           "response_format_fallback": response_format_fallback}
 
 
 def _eligible(document):
@@ -527,13 +620,26 @@ def _entry(block, *, source_language, target_language, text, before, after, glos
     for attempt_number in range(1, attempt_limit + 1):
         scoped_context = {**(document_context or {}), "block_type": block["type"], "heading_lineage": lineage or [],
                           "attempt": attempt_number, "retry_reason": retry_reason}
-        candidate, candidate_settings = _translate_ollama(endpoint=provider["endpoint"], model=provider["model"], source=text,
-            source_language=source_language, target_language=target_language, before=before[1] if before else "", after=after[1] if after else "", glossary=glossary, timeout=timeout, keep_alive=keep_alive, document_context=scoped_context)
+        request_failures = []
+        for request_attempt in range(1, MAX_PROVIDER_REQUEST_ATTEMPTS + 1):
+            # A loaded local model can need longer than the normal request
+            # timeout for an unusually dense unit.  Escalate only retries of
+            # that same source-anchored unit, with a documented hard bound.
+            request_timeout = min(int(timeout) * request_attempt, MAX_PROVIDER_REQUEST_TIMEOUT_SECONDS)
+            try:
+                candidate, candidate_settings = _translate_ollama(endpoint=provider["endpoint"], model=provider["model"], source=text,
+                    source_language=source_language, target_language=target_language, before=before[1] if before else "", after=after[1] if after else "", glossary=glossary, timeout=request_timeout, keep_alive=keep_alive, document_context=scoped_context)
+                break
+            except TranslationProviderRequestError as error:
+                request_failures.append({"number": request_attempt, "timeout_seconds": request_timeout, "error": str(error)})
+                if request_attempt == MAX_PROVIDER_REQUEST_ATTEMPTS:
+                    raise
         signals = _response_quality(text, candidate, source_language=source_language, target_language=target_language,
                                     kind=block["type"], glossary=glossary, before=before[1] if before else "", after=after[1] if after else "", response=candidate_settings)
         attempts.append({"number": attempt_number, "translation": candidate, "translation_sha256": _sha_bytes(candidate.encode("utf-8")),
             "provider_settings": candidate_settings, "quality_signals": signals, "retry_reason": retry_reason,
-            "attempt_limit": attempt_limit})
+            "attempt_limit": attempt_limit, "provider_request_attempts": request_attempt,
+            "provider_request_timeout_seconds": request_timeout, "provider_request_failures": request_failures})
         translated, settings = candidate, candidate_settings
         retry_reason = _retryable_quality_signals(signals)
         if not retry_reason:
@@ -636,9 +742,11 @@ def translate_document(output_dir, *, source_language, target_language, provider
     glossary, glossary_provenance = _glossary(glossary_path)
     cdm_sha = sha_file(root / "book_document.json")
     keep_alive = _validate_keep_alive(keep_alive)
+    execution_keep_alive = _effective_request_keep_alive(keep_alive, timeout)
     metadata = {**_model_info(endpoint, model, timeout), "resource_lifecycle": {
-        "keep_alive": keep_alive,
-        "policy": "BookText requests a bounded Ollama model lease; it never stops the shared daemon or unloads a model by process name.",
+        "requested_idle_keep_alive": keep_alive,
+        "execution_keep_alive": execution_keep_alive,
+        "policy": "BookText requests a bounded Ollama model lease for active work; it never stops the shared daemon or unloads a model by process name.",
     }}
     all_blocks = _eligible(document)
     if block_ids is None:
@@ -717,7 +825,7 @@ def translate_document(output_dir, *, source_language, target_language, provider
                 before = (all_blocks[index - 1]["block_id"], _sentences(all_blocks[index - 1]["text"], tail=True)) if index else None
                 after = (all_blocks[index + 1]["block_id"], _sentences(all_blocks[index + 1]["text"])) if index + 1 < len(all_blocks) else None
                 entries.append(_entry(block, source_language=source_language, target_language=target_language, text=block["text"], before=before, after=after,
-                    glossary=glossary, provider=metadata, timeout=timeout, keep_alive=keep_alive, document_context=context, lineage=_heading_lineage(all_blocks, index)))
+                    glossary=glossary, provider=metadata, timeout=timeout, keep_alive=execution_keep_alive, document_context=context, lineage=_heading_lineage(all_blocks, index)))
                 _commit_partial_translation_checkpoint(root, chunk, entries)
             _commit_translation_checkpoint(root, plan, chunk, entries, duration_seconds=round(time.monotonic() - started, 3))
             if progress: progress("chunk_completed", {"chunk_id": chunk["chunk_id"], "current": plan["chunks"].index(chunk) + 1, "total": len(plan["chunks"]), "logical_units": len(entries), "checkpoint": chunk["artifacts"]["checkpoint"]})

@@ -6,6 +6,9 @@ import Foundation
 public enum DocumentLifecycleState: String, Equatable, Sendable {
     case noDocument
     case readyToProcess
+    case pipelinePlanned
+    case pipelineRunning
+    case pipelinePaused
     case processing
     case interruptedResumable
     case reviewRequired
@@ -19,6 +22,8 @@ public enum DocumentLifecycleState: String, Equatable, Sendable {
 public enum DocumentPrimaryAction: String, Equatable, Sendable {
     case chooseDocument
     case startProcessing
+    case startPipeline
+    case resumePipeline
     case cancelProcessing
     case resumeProcessing
     case reviewItems
@@ -130,6 +135,9 @@ public enum DocumentPresentationMapper {
         switch state {
         case .noDocument: .chooseDocument
         case .readyToProcess: .startProcessing
+        case .pipelinePlanned: .startPipeline
+        case .pipelineRunning: .cancelProcessing
+        case .pipelinePaused: .resumePipeline
         case .processing: .cancelProcessing
         case .interruptedResumable: .resumeProcessing
         case .reviewRequired: .reviewItems
@@ -153,6 +161,7 @@ public enum DocumentPresentationMapper {
         case "cdm": "Preparing book structure"
         case "export": "Exporting book"
         case "translation": "Translating book"
+        case "pipeline": "Running workflow"
         default: "Processing document"
         }
     }
@@ -164,6 +173,9 @@ public enum DocumentPresentationMapper {
     private static func projectState(_ value: String) -> DocumentLifecycleState? {
         switch value {
         case "READY_TO_PROCESS": .readyToProcess
+        case "PIPELINE_PLANNED": .pipelinePlanned
+        case "PIPELINE_RUNNING": .pipelineRunning
+        case "PIPELINE_PAUSED": .pipelinePaused
         case "PROCESSING": .processing
         case "INTERRUPTED_RESUMABLE": .interruptedResumable
         case "REVIEW_REQUIRED": .reviewRequired

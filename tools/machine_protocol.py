@@ -20,17 +20,17 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tools import canonical_document, chunk_lifecycle, export_document, project_history, review_decisions, review_workspace, review_recovery, translation
+from tools import canonical_document, chunk_lifecycle, export_document, project_history, review_decisions, review_workspace, review_recovery, sequential_pipeline, translation
 from tools.process_lifecycle import ManagedProcess
 
 
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "1.1"
 JOB_SCHEMA_VERSION = "1.0"
 JOB_FILENAME = ".booktext_job.json"
 PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "translation", "export")
-EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled", "chunk_plan_created", "chunk_started", "chunk_progress", "chunk_completed", "chunk_failed", "chunk_retry", "job_resumed", "assembly_started", "assembly_completed", "cleanup_started", "cleanup_progress", "cleanup_completed", "cleanup_warning")
+EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled", "chunk_plan_created", "chunk_started", "chunk_progress", "chunk_completed", "chunk_failed", "chunk_retry", "job_resumed", "assembly_started", "assembly_completed", "cleanup_started", "cleanup_progress", "cleanup_completed", "cleanup_warning", "pipeline_started", "stage_started", "stage_progress", "stage_completed", "stage_failed", "pipeline_paused", "pipeline_resumed", "pipeline_completed")
 EXIT_CODES = {"success": 0, "invalid_input": 2, "preflight_failure": 3, "processing_failure": 4, "validation_failure": 5, "cancelled": 130, "stale_conflict": 6}
-COMMAND_PHASE = {"run": "ocr", "cleanup": "prepare", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "translation-export": "export", "export": "export", "inspect": None, "project-history": None, "project-remove": None}
+COMMAND_PHASE = {"run": "ocr", "cleanup": "prepare", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "translation-export": "export", "export": "export", "pipeline-create": "prepare", "pipeline-validate": "prepare", "pipeline-start": "prepare", "pipeline-status": None, "pipeline-resume": "prepare", "pipeline-cancel": "prepare", "inspect": None, "project-history": None, "project-remove": None}
 
 
 class MachineError(RuntimeError):
@@ -132,7 +132,15 @@ def artifact_map(root):
         "translations": "translations",
         "extraction_report": "extraction/report.json", "source_inventory": "extraction/inventory.json",
     }
-    return {name: {"path": value, "exists": (root / value).exists()} for name, value in candidates.items()}
+    result = {name: {"path": value, "exists": (root / value).exists()} for name, value in candidates.items()}
+    # A translated derivative is intentionally namespaced by language pair.
+    # Expose it through the same stable logical artifact name as original
+    # exports so native Project History never has to hard-code filenames.
+    if not result["exports"]["exists"]:
+        translated = sorted((root / "translations" / "exports").glob("*/export_manifest.json"))
+        if translated:
+            result["exports"] = {"path": str(translated[0].relative_to(root)), "exists": True}
+    return result
 
 
 def _has_booktext_evidence(artifacts, state):
@@ -176,7 +184,7 @@ def _translation_state(root, artifacts):
     return "NOT_STARTED"
 
 
-def _project_projection(root, state, artifacts, counts, summary, final, document, export):
+def _project_projection(root, state, artifacts, counts, summary, final, document, export, pipeline=None):
     """Classify only already-recorded job/artifact truth; never start work."""
     sources = state.get("source") if isinstance(state.get("source"), list) else []
     source_unavailable = bool(sources) and any(not Path(value).exists() for value in sources if isinstance(value, str))
@@ -186,7 +194,15 @@ def _project_projection(root, state, artifacts, counts, summary, final, document
     # The source is required only for resume/processing, not for reopening a
     # completed book, review queue, final build, or already-created translation.
     availability = "SOURCE_UNAVAILABLE" if source_unavailable else "AVAILABLE"
-    if job_status == "running":
+    if isinstance(pipeline, dict) and pipeline.get("status") == "PLANNED":
+        current, action = "PIPELINE_PLANNED", "Start pipeline"
+    elif isinstance(pipeline, dict) and pipeline.get("status") == "RUNNING":
+        current, action, availability = "PIPELINE_RUNNING", "Resume pipeline", "AVAILABLE"
+    elif isinstance(pipeline, dict) and pipeline.get("status") == "PAUSED":
+        current, action = "PIPELINE_PAUSED", "Resume pipeline"
+    elif isinstance(pipeline, dict) and pipeline.get("status") == "FAILED":
+        current, action = "FAILED", "Retry pipeline"
+    elif job_status == "running":
         current, action, availability = ("TRANSLATING", "Resume Translation", "AVAILABLE") if phase == "translation" else ("PROCESSING", "Resume Processing", "AVAILABLE")
     elif job_status == "cancelled":
         if source_unavailable:
@@ -212,9 +228,14 @@ def _project_projection(root, state, artifacts, counts, summary, final, document
     pages = (summary.get("pages") or {}).get("processed") if isinstance(summary.get("pages"), dict) else None
     if not isinstance(pages, int):
         pages = len((_load(Path(root) / "book.json", {}) or {}).get("pages", []))
-    return {"state": current, "action": action, "availability": availability, "page_count": pages or None,
+    projection = {"state": current, "action": action, "availability": availability, "page_count": pages or None,
             "translation_state": translation_state, "last_phase": phase, "source_unavailable": source_unavailable,
             "reopen_available": True}
+    if isinstance(pipeline, dict):
+        projection["pipeline_status"] = pipeline.get("status")
+        projection["pipeline_current_stage"] = pipeline.get("current_stage_id")
+        projection["pipeline_completed_stages"] = list(pipeline.get("completed_stage_ids") or [])
+    return projection
 
 
 def inspect_output(root):
@@ -226,7 +247,18 @@ def inspect_output(root):
     artifacts = artifact_map(root)
     if not _has_booktext_evidence(artifacts, state):
         return _unavailable_inspection(root, detail="BookText project evidence is unavailable")
-    summary, final, document, export = (_load(root / name, {}) or {} for name in ("run_summary.json", "final_build.json", "book_document.json", "exports/export_manifest.json"))
+    # Publication exports of translations live under their language pair.  Do
+    # not make callers (including the native app) guess that implementation
+    # detail: artifact_map() is the single discovery authority.
+    export_path = artifacts.get("exports", {}).get("path")
+    summary, final, document = (_load(root / name, {}) or {} for name in ("run_summary.json", "final_build.json", "book_document.json"))
+    export = _load(root / export_path, {}) if export_path else {}
+    export = export or {}
+    # Job records written by older Core versions can retain an obsolete static
+    # export path.  Inspection is deliberately non-mutating, but its returned
+    # artifact view must always reflect the current on-disk project.
+    state = dict(state or {})
+    state["artifacts"] = artifacts
     priority = _load(root / "review_priority.json", {}) or {}
     counts = (final.get("unresolved_priority_counts") or document.get("review", {}).get("unresolved_priority_counts")
               or priority.get("counts") or {})
@@ -237,12 +269,16 @@ def inspect_output(root):
         (bool(summary) or artifacts["cdm"]["exists"] or artifacts["exports"]["exists"])
         and state.get("status") not in {"running", "cancelled", "failed"}
     )
-    project = _project_projection(root, state, artifacts, counts, summary, final, document, export)
+    try:
+        pipeline = sequential_pipeline._load(root)
+    except sequential_pipeline.PipelineError as error:
+        raise MachineError("validation_failure", str(error)) from error
+    project = _project_projection(root, state, artifacts, counts, summary, final, document, export, pipeline=pipeline)
     return {"protocol_version": PROTOCOL_VERSION, "job": {**state, "complete": complete, "incomplete": not complete},
             "artifacts": artifacts, "review": {"unresolved_priority_counts": {"HIGH": counts.get("HIGH", 0), "MEDIUM": counts.get("MEDIUM", 0)}, "stale_or_conflict_count": stale},
             "cdm": {"present": artifacts["cdm"]["exists"], "schema_version": document.get("schema_version")},
             "exports": {"present": artifacts["exports"]["exists"], "validation": export.get("validation")},
-            "run_summary": summary.get("pages"), "project": project}
+            "run_summary": summary.get("pages"), "pipeline": pipeline, "project": project}
 
 
 def _table_preview(root, block):
@@ -371,7 +407,7 @@ def _invoke(emitter, root, phase, operation, fn):
     return EXIT_CODES["success"]
 
 
-def _run_existing(emitter, sources, core_args):
+def _run_existing(emitter, sources, core_args, *, complete_job=True):
     if not sources: raise MachineError("invalid_input", "at least one source is required")
     source = Path(sources[0]).expanduser().resolve()
     if not source.exists(): raise MachineError("invalid_input", "source does not exist", details={"source": str(source)})
@@ -422,7 +458,7 @@ def _run_existing(emitter, sources, core_args):
     if code:
         update_job(root, status="failed", last_phase="ocr", partial=True, exit_code=code)
         raise MachineError("processing_failure", "processing core exited unsuccessfully", details={"exit_code": code})
-    completed_state = update_job(root, status="completed", last_phase="review", partial=False, artifacts=artifact_map(root))
+    completed_state = update_job(root, status="completed" if complete_job else "running", last_phase="review", partial=False, artifacts=artifact_map(root))
     project_history.record(root, completed_state)
     emitter.emit("phase_completed", phase="review", message="Processing and review completed")
     summary = _load(root / "run_summary.json", {}) or {}
@@ -431,7 +467,219 @@ def _run_existing(emitter, sources, core_args):
     emitter.emit("review_summary", phase="review", message="Review summary available", details=summary.get("review_priority", {}))
     for name, value in artifact_map(root).items():
         if value["exists"]: emitter.emit("artifact_created", phase="review", message=f"Artifact available: {name}", details={"name": name, **value})
-    emitter.emit("job_completed", phase="review", message="Processing completed", details={"output_dir": str(root)})
+    if complete_job:
+        emitter.emit("job_completed", phase="review", message="Processing completed", details={"output_dir": str(root)})
+    return EXIT_CODES["success"]
+
+
+def _pipeline_phase(item):
+    return {"PROCESS": "ocr", "REVIEW_POLICY": "review", "FINAL_BUILD": "final_build", "CDM": "cdm", "TRANSLATE": "translation", "EXPORT": "export"}[item["type"]]
+
+
+def _pipeline_refs(root, names):
+    artifacts = artifact_map(root)
+    refs = {name: artifacts[name] for name in names if name in artifacts and artifacts[name]["exists"]}
+    # Translation exports are deliberately namespaced by language pair rather
+    # than stored in the original-document exports directory.  The pipeline's
+    # logical EXPORT artifact is valid in either production location.
+    if "exports" in names and "exports" not in refs:
+        translated = sorted((Path(root) / "translations" / "exports").glob("*/export_manifest.json"))
+        if translated:
+            manifest = translated[0]
+            refs["exports"] = {"path": str(manifest.relative_to(root)), "exists": True}
+    return refs
+
+
+def _final_build(root):
+    book, priority = review_decisions.load_json(Path(root) / "book.json"), review_decisions.load_json(Path(root) / "review_priority.json")
+    decisions_path = Path(root) / "review_decisions.json"
+    if decisions_path.exists():
+        decisions = review_decisions.load_json(decisions_path)
+    else:
+        decisions = review_decisions.empty_decisions(Path(root) / "review_priority.json", Path(root) / "book.json")
+        review_decisions.atomic_write_json(decisions_path, decisions)
+    text, markdown, report = review_decisions.build_final(book, priority, decisions, book_path=Path(root) / "book.json", priority_path=Path(root) / "review_priority.json", decisions_path=decisions_path, booktext_version="0.1.0")
+    review_decisions.write_final(root, text, markdown, report)
+    if report["stale_or_conflict_count"]:
+        raise MachineError("stale_conflict", "final build has stale or conflicting decisions", details=report)
+    return report
+
+
+def _parse_pipeline_definition(value):
+    try:
+        definition = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise MachineError("invalid_input", "pipeline definition must be JSON", details={"error": str(error)}) from error
+    try:
+        return definition, sequential_pipeline.validate_definition(definition)
+    except sequential_pipeline.PipelineError as error:
+        raise MachineError("invalid_input", str(error)) from error
+
+
+def _pipeline_root(source, core_args, explicit=None):
+    from tools.automatic_extraction import output_directory
+    source = Path(source).expanduser().resolve()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    def option(name, default=None):
+        try:
+            return core_args[core_args.index(name) + 1]
+        except (ValueError, IndexError):
+            return default
+    return output_directory(source, automatic=option("--ocr", "auto") == "auto" and "--native-text-only" not in core_args, explicit=option("--output-dir"))
+
+
+def _pipeline_create(source, definition_json, explicit_root=None):
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.is_file():
+        raise MachineError("invalid_input", "source does not exist", details={"source": str(source_path)})
+    definition, validation = _parse_pipeline_definition(definition_json)
+    process = next(item for item in definition["stages"] if item["type"] == "PROCESS")
+    core_args = process["config"].get("core_args", [])
+    if not isinstance(core_args, list) or any(not isinstance(item, str) for item in core_args):
+        raise MachineError("invalid_input", "PROCESS core_args must be an array of strings")
+    root = _pipeline_root(source_path, core_args, explicit_root)
+    try:
+        state, created = sequential_pipeline.create(root, source=source_path, definition=definition)
+    except sequential_pipeline.PipelineError as error:
+        raise MachineError("validation_failure", str(error)) from error
+    job = ensure_job(root, status="planned", source=[str(source_path)])
+    state["project_id"] = job["job_id"]
+    sequential_pipeline.save(root, state)
+    project_history.record(root, job)
+    return root, state, {"created": created, **validation}
+
+
+def _validate_completed_pipeline_stage(root, item):
+    refs = item.get("artifact_refs") or {}
+    if not refs:
+        return False
+    for reference in refs.values():
+        relative = reference.get("path") if isinstance(reference, dict) else None
+        if not isinstance(relative, str) or not (Path(root) / relative).exists():
+            return False
+    return True
+
+
+def _run_pipeline(root, *, resume=False):
+    root = Path(root).expanduser().resolve()
+    try:
+        state = sequential_pipeline._load(root)
+    except sequential_pipeline.PipelineError as error:
+        raise MachineError("validation_failure", str(error)) from error
+    if not state:
+        raise MachineError("invalid_input", "pipeline does not exist for this project")
+    try:
+        sequential_pipeline.validate_definition(state.get("definition"))
+    except sequential_pipeline.PipelineError as error:
+        raise MachineError("validation_failure", str(error)) from error
+    job = ensure_job(root, status="running", source=[state["source"]])
+    state["project_id"] = job["job_id"]
+    sequential_pipeline.save(root, state)
+    emitter = Emitter(job["job_id"])
+    emitter.emit("pipeline_resumed" if resume else "pipeline_started", phase="prepare", message="Pipeline resumed" if resume else "Pipeline started", details={"pipeline_id": state["pipeline_id"], "output_dir": str(root), "stages": [item["type"] for item in state["stages"]], "source": state["source"]})
+    project_history.record(root, job)
+    for item in state["stages"]:
+        if item.get("status") == "COMPLETE":
+            if _validate_completed_pipeline_stage(root, item):
+                continue
+            item.update({"status": "PENDING", "validation": {"valid": False, "reason": "required artifact missing"}})
+            state["completed_stage_ids"] = [identifier for identifier in state.get("completed_stage_ids", []) if identifier != item["stage_id"]]
+            sequential_pipeline.save(root, state)
+        if item.get("status") == "PAUSED" or item.get("status") == "FAILED":
+            item["status"] = "PENDING"
+            sequential_pipeline.save(root, state)
+        phase = _pipeline_phase(item)
+        sequential_pipeline.mark_running(root, state, item)
+        update_job(root, status="running", last_phase=phase, pipeline_id=state["pipeline_id"])
+        emitter.emit("stage_started", phase=phase, message=f"{item['type'].replace('_', ' ').title()} started", details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"], "stage_type": item["type"]})
+        try:
+            config = item["config"]
+            if item["type"] == "PROCESS":
+                result = _run_existing(emitter, [state["source"]], config.get("core_args", []), complete_job=False)
+                if result == EXIT_CODES["cancelled"]:
+                    sequential_pipeline.mark_paused(root, state, item, code="cancelled", message="Processing cancelled at a safe checkpoint", cancellation=True)
+                    update_job(root, status="cancelled", last_phase=phase, partial=True, pipeline_id=state["pipeline_id"])
+                    emitter.emit("pipeline_paused", phase=phase, code="cancelled", message="Pipeline paused; completed work is retained", details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"]})
+                    return EXIT_CODES["cancelled"]
+                validation, refs = {"valid": True, "book_manifest": "PASS"}, _pipeline_refs(root, ("book_manifest", "run_summary", "raw_review", "review", "clusters"))
+            elif item["type"] == "REVIEW_POLICY":
+                priority = _load(root / "review_priority.json", {}) or {}
+                counts = priority.get("counts", {}) if isinstance(priority, dict) else {}
+                unresolved = int(counts.get("HIGH", 0) or 0) + int(counts.get("MEDIUM", 0) or 0)
+                if config["policy"] == "review_when_required" and unresolved:
+                    sequential_pipeline.mark_paused(root, state, item, code="REVIEW_REQUIRED", message=f"{unresolved} HIGH/MEDIUM review items require a human decision")
+                    update_job(root, status="paused", last_phase=phase, pipeline_id=state["pipeline_id"])
+                    emitter.emit("pipeline_paused", phase=phase, code="REVIEW_REQUIRED", message="Pipeline paused for required review", details={"pipeline_id": state["pipeline_id"], "unresolved": unresolved, "policy": config["policy"]})
+                    return EXIT_CODES["success"]
+                validation, refs = {"valid": True, "policy": config["policy"], "unresolved_high_medium": unresolved, "raw_evidence_mutated": False}, _pipeline_refs(root, ("review", "raw_review", "decisions"))
+            elif item["type"] == "FINAL_BUILD":
+                result = _final_build(root)
+                validation, refs = {"valid": True, **result}, _pipeline_refs(root, ("final_build", "final_text", "final_markdown", "decisions"))
+            elif item["type"] == "CDM":
+                document_path = canonical_document.write_document(canonical_document.build_document(root), root)
+                validation, refs = {"valid": True, "path": str(document_path.relative_to(root))}, _pipeline_refs(root, ("cdm",))
+            elif item["type"] == "TRANSLATE":
+                def translation_progress(event_type, details):
+                    emitter.emit("stage_progress", phase="translation", current=details.get("current"), total=details.get("total"), code=event_type, message=event_type.replace("_", " "), details={"pipeline_id": state["pipeline_id"], **details})
+                result = translation.translate_document(root, source_language=config["source_language"], target_language=config["target_language"], provider=config.get("provider", "ollama"), model=config["model"], glossary_path=config.get("glossary"), endpoint=config.get("endpoint", "http://127.0.0.1:11434"), timeout=config.get("timeout", 120), keep_alive=config.get("keep_alive", translation.DEFAULT_MODEL_KEEP_ALIVE), chunk_size=config.get("chunk_size", translation.DEFAULT_LOGICAL_UNIT_CHUNK_SIZE), progress=translation_progress)
+                validation = result.get("validation") or {}
+                if not validation.get("valid", False) or validation.get("stale", False):
+                    raise MachineError("validation_failure", "translation validation did not pass", details=validation)
+                refs = _pipeline_refs(root, ("translations",))
+            elif item["type"] == "EXPORT":
+                formats = config["formats"]
+                if config.get("document") == "TRANSLATION":
+                    translation_stage = next(value for value in state["stages"] if value["type"] == "TRANSLATE")
+                    translation_config = translation_stage["config"]
+                    result = export_document.export_translation(root, formats, source_language=translation_config["source_language"], target_language=translation_config["target_language"])
+                else:
+                    result = export_document.export_document(root, formats)
+                validation, refs = {"valid": True, "formats": formats, "result": result}, _pipeline_refs(root, ("exports", "deliverables"))
+            else:
+                raise MachineError("validation_failure", "unsupported pipeline stage")
+        except KeyboardInterrupt:
+            sequential_pipeline.mark_paused(root, state, item, code="cancelled", message="Pipeline cancelled at a safe boundary", cancellation=True)
+            update_job(root, status="cancelled", last_phase=phase, partial=True, pipeline_id=state["pipeline_id"])
+            emitter.emit("pipeline_paused", phase=phase, code="cancelled", message="Pipeline paused; completed work is retained", details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"]})
+            return EXIT_CODES["cancelled"]
+        except (MachineError, ValueError, OSError, subprocess.SubprocessError) as error:
+            code = error.code if isinstance(error, MachineError) else "stage_failure"
+            details = error.details if isinstance(error, MachineError) else {"type": type(error).__name__}
+            sequential_pipeline.mark_failed(root, state, item, code=code, message=str(error), details=details)
+            update_job(root, status="failed", last_phase=phase, partial=True, pipeline_id=state["pipeline_id"])
+            emitter.emit("stage_failed", phase=phase, code=code, message=str(error), details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"], **details})
+            emitter.emit("job_failed", phase=phase, code=code, message=str(error), details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"]})
+            return EXIT_CODES.get(code, EXIT_CODES["validation_failure"])
+        required_refs = {
+            "PROCESS": ("book_manifest",), "FINAL_BUILD": ("final_build", "final_text"),
+            "CDM": ("cdm",), "TRANSLATE": ("translations",), "EXPORT": ("exports",),
+        }.get(item["type"], ())
+        missing_refs = [name for name in required_refs if name not in refs]
+        if missing_refs:
+            validation = {**validation, "valid": False, "missing_artifacts": missing_refs}
+        # Persist the final two boundaries separately.  If the host quits here,
+        # resume verifies the recorded artifacts instead of assuming success.
+        sequential_pipeline.mark_validating(root, state, item)
+        if not validation.get("valid", False):
+            # Validation happens after the stage's producer has returned.  It
+            # must still follow the same fail-closed pipeline transition as an
+            # execution error; otherwise a relaunch could misrepresent an
+            # invalid stage as merely in-progress.
+            message = "pipeline stage validation did not pass"
+            sequential_pipeline.mark_failed(root, state, item, code="validation_failure", message=message, details=validation)
+            update_job(root, status="failed", last_phase=phase, partial=True, pipeline_id=state["pipeline_id"])
+            emitter.emit("stage_failed", phase=phase, code="validation_failure", message=message, details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"], **validation})
+            emitter.emit("job_failed", phase=phase, code="validation_failure", message=message, details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"]})
+            return EXIT_CODES["validation_failure"]
+        sequential_pipeline.mark_committing(root, state, item, validation=validation, artifact_refs=refs)
+        sequential_pipeline.mark_complete(root, state, item, validation=validation, artifact_refs=refs)
+        emitter.emit("stage_completed", phase=phase, message=f"{item['type'].replace('_', ' ').title()} completed", details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"], "validation": validation, "artifacts": refs})
+    sequential_pipeline.complete_pipeline(root, state)
+    completed = update_job(root, status="completed", last_phase="export" if any(item["type"] == "EXPORT" for item in state["stages"]) else "cdm", partial=False, artifacts=artifact_map(root), pipeline_id=state["pipeline_id"])
+    project_history.record(root, completed)
+    emitter.emit("pipeline_completed", phase=completed["last_phase"], message="Pipeline completed", details={"pipeline_id": state["pipeline_id"], "output_dir": str(root), "artifacts": artifact_map(root)})
+    emitter.emit("job_completed", phase=completed["last_phase"], message="Pipeline completed", details={"pipeline": state, "output_dir": str(root), "artifacts": artifact_map(root)})
     return EXIT_CODES["success"]
 
 
@@ -464,6 +712,49 @@ def _handle(args):
         # signal paths use the same durable job identity.
         args.output_dir = source.parent / f"{source.stem}_book" if source else None
         return _run_existing(Emitter("pending"), args.sources, args.core_args)
+    if args.command == "pipeline-create":
+        root, state, validation = _pipeline_create(args.source, args.definition_json, args.output_dir)
+        emitter = Emitter(state["project_id"] or _job_id(root))
+        emitter.emit("job_completed", phase="prepare", message="Pipeline configured", details={"output_dir": str(root), "pipeline": state, "validation": validation})
+        return EXIT_CODES["success"]
+    if args.command == "pipeline-validate":
+        try:
+            state = sequential_pipeline._load(root)
+            if not state:
+                raise sequential_pipeline.PipelineError("pipeline does not exist for this project")
+            result = sequential_pipeline.validate_definition(state["definition"])
+        except sequential_pipeline.PipelineError as error:
+            raise MachineError("validation_failure", str(error)) from error
+        emitter = Emitter(read_job(root)["job_id"])
+        emitter.emit("job_completed", phase="prepare", message="Pipeline validated", details={"pipeline": state, "validation": result})
+        return EXIT_CODES["success"]
+    if args.command in {"pipeline-start", "pipeline-resume"}:
+        return _run_pipeline(root, resume=args.command == "pipeline-resume")
+    if args.command == "pipeline-status":
+        try:
+            state = sequential_pipeline._load(root)
+        except sequential_pipeline.PipelineError as error:
+            raise MachineError("validation_failure", str(error)) from error
+        if not state:
+            raise MachineError("invalid_input", "pipeline does not exist for this project")
+        emitter = Emitter(read_job(root)["job_id"])
+        emitter.emit("job_completed", phase=COMMAND_PHASE[args.command], message="Pipeline status", details={"pipeline": state, "artifacts": artifact_map(root)})
+        return EXIT_CODES["success"]
+    if args.command == "pipeline-cancel":
+        try:
+            state = sequential_pipeline._load(root)
+            if not state:
+                raise sequential_pipeline.PipelineError("pipeline does not exist for this project")
+            item = sequential_pipeline.stage(state, state.get("current_stage_id")) if state.get("current_stage_id") else sequential_pipeline.next_pending(state)
+            if item is None:
+                raise sequential_pipeline.PipelineError("completed pipeline cannot be cancelled")
+            sequential_pipeline.mark_paused(root, state, item, code="cancelled", message="Pipeline paused before starting a new stage", cancellation=True)
+        except sequential_pipeline.PipelineError as error:
+            raise MachineError("validation_failure", str(error)) from error
+        update_job(root, status="cancelled", last_phase=_pipeline_phase(item), partial=True, pipeline_id=state["pipeline_id"])
+        emitter = Emitter(read_job(root)["job_id"])
+        emitter.emit("pipeline_paused", phase=_pipeline_phase(item), code="cancelled", message="Pipeline paused", details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"]})
+        return EXIT_CODES["cancelled"]
     state = ensure_job(root); emitter = Emitter(state["job_id"])
     # A user-triggered Core operation is real activity; background history
     # discovery deliberately bypasses this path and leaves ordering unchanged.
@@ -500,22 +791,7 @@ def _handle(args):
         return _invoke(emitter, root, "export", "translation export", lambda: export_document.export_translation(root, args.format,
             source_language=args.source_language, target_language=args.target_language))
     if args.command == "final-build":
-        def build():
-            book, priority = review_decisions.load_json(Path(root)/"book.json"), review_decisions.load_json(Path(root)/"review_priority.json")
-            decisions_path = Path(root)/"review_decisions.json"
-            # A final book without review decisions is valid. Persist the empty
-            # authoritative decision artifact before building so its source
-            # fingerprint is real and the final-build report is reproducible.
-            if decisions_path.exists():
-                decisions = review_decisions.load_json(decisions_path)
-            else:
-                decisions = review_decisions.empty_decisions(Path(root)/"review_priority.json", Path(root)/"book.json")
-                review_decisions.atomic_write_json(decisions_path, decisions)
-            text, markdown, report = review_decisions.build_final(book, priority, decisions, book_path=Path(root)/"book.json", priority_path=Path(root)/"review_priority.json", decisions_path=decisions_path, booktext_version="0.1.0")
-            review_decisions.write_final(root, text, markdown, report)
-            if report["stale_or_conflict_count"]: raise MachineError("stale_conflict", "final build has stale or conflicting decisions", details=report)
-            return report
-        return _invoke(emitter, root, "final_build", "final build", build)
+        return _invoke(emitter, root, "final_build", "final build", lambda: _final_build(root))
     if args.command == "decision":
         return _invoke(emitter, root, "review", "review decision", lambda: review_decisions.record_decision(decisions_path=Path(root)/"review_decisions.json", priority_path=Path(root)/"review_priority.json", book_path=Path(root)/"book.json", item_id=args.item, action=args.action, replacement_text=args.replacement, note=args.note, replace=args.replace))
     if args.command == "baseline-preview":
@@ -580,6 +856,9 @@ def main(argv=None):
     p = sub.add_parser("project-remove"); p.add_argument("project_id"); p.add_argument("--history-path")
     p = sub.add_parser("cleanup"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
+    p = sub.add_parser("pipeline-create"); p.add_argument("--definition-json", required=True); p.add_argument("--output-dir", type=Path); p.add_argument("source")
+    for command in ("pipeline-validate", "pipeline-start", "pipeline-status", "pipeline-resume", "pipeline-cancel"):
+        p = sub.add_parser(command); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("document-preview"); p.add_argument("output_dir", type=Path); p.add_argument("--index", type=int, default=0); p.add_argument("--limit", type=int, default=25)
     p = sub.add_parser("recover"); p.add_argument("output_dir", type=Path); p.add_argument("--surya-results")
@@ -617,6 +896,13 @@ def main(argv=None):
         # A signal during an operation is reported as cancellation, not prose.
         root = getattr(args, "output_dir", None)
         if root:
+            try:
+                pipeline = sequential_pipeline._load(root)
+                if pipeline and pipeline.get("current_stage_id"):
+                    item = sequential_pipeline.stage(pipeline, pipeline["current_stage_id"])
+                    sequential_pipeline.mark_paused(root, pipeline, item, code="cancelled", message="Pipeline cancelled at a safe boundary", cancellation=True)
+            except sequential_pipeline.PipelineError:
+                pass
             state = update_job(root, status="cancelled", partial=True)
             Emitter(state["job_id"]).emit("job_cancelled", phase=state.get("last_phase"), code="cancelled", message="Job cancelled")
         return EXIT_CODES["cancelled"]
