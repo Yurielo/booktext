@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -64,6 +65,16 @@ class AdaptiveSuryaBatchTests(unittest.TestCase):
                 second = booktext.recognize_pages_surya(pages, root / "surya", root / "work")
             self.assertEqual(first, second)
             self.assertEqual(calls, [list(range(1, 9)), [9]])
+
+    def test_changed_recognition_budget_cannot_reuse_old_page_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {}, clear=True):
+            root = Path(temp); calls = []; pages = [fake_page(1)]
+            with patch.object(booktext, "require_surya"), patch.object(booktext, "_recognize_pages_surya_batch", self._runner(calls)):
+                booktext.recognize_pages_surya(pages, root / "surya", root / "work")
+                with patch.dict(os.environ, {"SURYA_MAX_TOKENS_FULL_PAGE": "16000"}):
+                    with self.assertRaisesRegex(chunk_lifecycle.ChunkPlanError, "stale"):
+                        booktext.recognize_pages_surya(pages, root / "surya", root / "work")
+            self.assertEqual(calls, [[1]])
 
     def test_resume_reuses_source_bound_prepared_pages_without_rendering(self):
         with tempfile.TemporaryDirectory() as temp:

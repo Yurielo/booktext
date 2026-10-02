@@ -147,5 +147,19 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertIn("Scanned text survives.", [block.get("text") for block in doc["blocks"]])
         self.assertIn({"page":1,"kind":"source_render_diagnostic"}, doc["warnings"])
 
+    def test_scan_without_native_blocks_preserves_primary_column_order(self):
+        (self.root / "review_decisions.json").unlink()
+        self.book["pages"] = [{"page": 1, "text": "Left top. Left bottom. Right top.",
+                               "layout_blocks": [], "visuals": []}]
+        write(self.root / "book.json", self.book)
+        write(self.root / "surya/surya-input/results.json", {"pages": [{"page": 1, "blocks": [
+            {"label": "Text", "reading_order": 1, "bbox": [0, 0, 40, 20], "html": "<p>Left top.</p>"},
+            {"label": "Text", "reading_order": 2, "bbox": [0, 80, 40, 100], "html": "<p>Left bottom.</p>"},
+            {"label": "Text", "reading_order": 3, "bbox": [60, 0, 100, 20], "html": "<p>Right top.</p>"},
+        ]}]})
+        document = build_document(self.root)
+        self.assertEqual([b["text"] for b in document["blocks"] if b["type"] == "paragraph"],
+                         ["Left top.", "Left bottom.", "Right top."])
+
 
 if __name__ == "__main__": unittest.main()

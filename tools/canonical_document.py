@@ -282,8 +282,13 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
             # Preserve per-column native flow; insert OCR regions by vertical location.
             if native_blocks and len(page_blocks) == len(native_blocks):
                 page_blocks = native_blocks
-            else:
+            elif native_blocks:
                 page_blocks = sorted(page_blocks, key=lambda raw: ((raw.get("bbox") or [0,0])[1], (raw.get("bbox") or [0,0])[0]))
+            else:
+                # A scan with an evidence-only OCR layer has no visible native
+                # blocks. Preserve Surya's reading order: sorting by y then x
+                # interleaves columns in journals and destroys paragraph flow.
+                page_blocks = sorted(page_blocks, key=lambda raw: raw.get("reading_order", 0))
             page_blocks = [{**raw, "reading_order": i} for i,raw in enumerate(page_blocks, 1)]
             if not page_blocks and record.get("text", "").strip():
                 # An OCR engine/version without blocks still owns real text.

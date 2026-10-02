@@ -43,7 +43,7 @@ MAX_AUTOMATIC_HANDWRITING_AREA_PERCENT = 20.0
 OWNED_CHILDREN = LifecycleRegistry()
 
 
-def run(command, check=True, capture=False, quiet=False, timeout=None):
+def run(command, check=True, capture=False, quiet=False, timeout=None, env=None):
     command = [str(x) for x in command]
     if not quiet:
         print("→", " ".join(command))
@@ -52,6 +52,7 @@ def run(command, check=True, capture=False, quiet=False, timeout=None):
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
+        env=env,
     )
     try:
         stdout, stderr = child.process.communicate(timeout=timeout)
@@ -769,6 +770,31 @@ def _surya_page_text(page_result):
     return ""
 
 
+def surya_runtime_environment():
+    """Leave room for the image/prompt in each owned llama.cpp context slot.
+
+    Surya's output budget is not a total context budget. In the installed
+    Surya2 release both defaults are 12288, which silently cuts dense pages.
+    Keep the generation policy unchanged and reserve 4096 input tokens.
+    """
+    env = os.environ.copy()
+    generation = int(env.get("SURYA_MAX_TOKENS_FULL_PAGE", "12288"))
+    requested = int(env.get("SURYA_INFERENCE_CTX_PER_SLOT", "12288"))
+    slot = max(requested, generation + 4096)
+    env.setdefault("SURYA_MAX_TOKENS_FULL_PAGE", str(generation))
+    env["SURYA_INFERENCE_CTX_PER_SLOT"] = str(slot)
+    # Surya2 otherwise chooses eight slots on this Mac even for one page.
+    # Bound reserved KV memory; explicit operator concurrency is preserved.
+    env.setdefault("SURYA_INFERENCE_PARALLEL", "2")
+    total = env.get("SURYA_INFERENCE_CTX_SIZE")
+    parallel = int(env.get("SURYA_INFERENCE_PARALLEL", "2"))
+    if generation <= 0 or requested <= 0 or parallel <= 0:
+        raise ValueError("Surya token/context/parallel budgets must be positive")
+    if total and int(total) < slot * parallel:
+        raise ValueError("SURYA_INFERENCE_CTX_SIZE cannot fit generation plus image/prompt per slot")
+    return env
+
+
 def _recognize_pages_surya_batch(pages, output_dir, temp_dir):
     """
     Run Surya once for all selected page images.
@@ -806,7 +832,7 @@ def _recognize_pages_surya_batch(pages, output_dir, temp_dir):
             str(SURYA_CLI),
             str(input_dir),
             "--output_dir", str(staging_dir),
-        ])
+        ], env=surya_runtime_environment())
     except Exception:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
@@ -948,9 +974,15 @@ def recognize_pages_surya(pages, output_dir, temp_dir, *, chunk_size=None,
         ",".join(str(number) for number in selected).encode("ascii")
     ).hexdigest()
     job_id = "ocr-" + fingerprint[:20]
+    runtime = surya_runtime_environment()
+    budgets = {key: runtime[key] for key in (
+        "SURYA_MAX_TOKENS_FULL_PAGE", "SURYA_INFERENCE_CTX_PER_SLOT", "SURYA_INFERENCE_PARALLEL"
+    )}
+    if "SURYA_INFERENCE_CTX_SIZE" in runtime:
+        budgets["SURYA_INFERENCE_CTX_SIZE"] = runtime["SURYA_INFERENCE_CTX_SIZE"]
     plan = chunk_lifecycle.create_or_load_plan(
         root, job_id=job_id, source_fp=fingerprint, operation="surya_ocr",
-        page_numbers=selected, options={"engine": "surya", "raw_schema": "page-keyed-v1"},
+        page_numbers=selected, options={"engine": "surya", "raw_schema": "page-keyed-v1", "runtime_budgets": budgets},
         chunk_size=chunk_size,
     )
     # A staged OCR input plus its result can be substantially larger than the
