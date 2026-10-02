@@ -24,15 +24,23 @@ from pathlib import Path
 from tools import canonical_document, review_decisions
 
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 ARTIFACT_TYPE = "booktext.translation"
 CHUNK_PLAN_TYPE = "booktext.translation_chunk_plan"
 CHUNK_CHECKPOINT_TYPE = "booktext.translation_chunk_checkpoint"
+PARTIAL_CHECKPOINT_TYPE = "booktext.translation_partial_chunk_checkpoint"
 CHUNK_WORKSPACE_TYPE = "booktext.translation_chunk_workspace"
-CHUNK_SCHEMA_VERSION = "1.0"
+CHUNK_SCHEMA_VERSION = "1.1"
 SUPPORTED_LANGUAGES = ("en", "ru")
 TEXT_TYPES = {"heading", "paragraph", "list", "caption", "unknown"}
 DEFAULT_LOGICAL_UNIT_CHUNK_SIZE = 12
+PROMPT_VERSION = "qwen-document-translation-v2"
+QUALITY_POLICY_VERSION = "translation-quality-v2"
+MAX_UNIT_ATTEMPTS = 3
+CONTEXT_CHAR_BUDGET = 900
+MAX_RETRY_SOURCE_CHARS = 1000
+MAX_OUTPUT_TOKENS = 2048
+SUPPORTED_SCHEMA_VERSIONS = {"1.0", SCHEMA_VERSION}
 # Ollama owns the shared daemon and model processes, not BookText. A request
 # lease is the only safe way to bound BookText's model residency: it lets a
 # sequential document reuse one loaded model, then lets Ollama unload it
@@ -89,6 +97,10 @@ def _checkpoint_path(root, chunk_id):
     return _translation_workspace(root) / chunk_id / "checkpoint.json"
 
 
+def _partial_checkpoint_path(root, chunk_id):
+    return _translation_workspace(root) / chunk_id / "partial-checkpoint.json"
+
+
 def _workspace_marker(root):
     return _translation_workspace(root) / ".booktext-translation-workspace.json"
 
@@ -122,8 +134,16 @@ def _glossary(path):
         return {}, None
     path = Path(path).expanduser().resolve()
     value = _load(path)
-    if not isinstance(value, dict) or not all(isinstance(key, str) and isinstance(item, str) for key, item in value.items()):
+    if not isinstance(value, dict):
         raise ValueError("glossary must be a JSON object of source terms to target terms")
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("glossary source terms must be non-empty strings")
+        if isinstance(item, str) and item.strip():
+            continue
+        if isinstance(item, dict) and isinstance(item.get("target"), str) and item["target"].strip() and all(isinstance(v, str) and v.strip() for v in item.get("variants", [])):
+            continue
+        raise ValueError("glossary values must be target strings or {target, variants} objects")
     return value, {"path": str(path), "sha256": sha_file(path), "entries": len(value)}
 
 
@@ -167,25 +187,131 @@ def _extract_translation(content):
     return translation.strip()
 
 
+def _sentences(text, *, tail=False, limit=CONTEXT_CHAR_BUDGET):
+    """Return compact whole-sentence context; never silently split a sentence."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    parts = re.findall(r"[^.!?\n]+[.!?]+(?:\s+|$)|[^.!?\n]+$", text, flags=re.DOTALL)
+    if not parts:
+        return ""
+    selected, used = [], 0
+    iterable = reversed(parts) if tail else iter(parts)
+    for part in iterable:
+        part = part.strip()
+        if not part:
+            continue
+        # A context window must be a whole sentence *and* bounded.  If the
+        # nearest sentence is itself too large, omit it explicitly instead of
+        # cutting it mid-sentence or silently exceeding the prompt budget.
+        if used + len(part) + 1 > limit:
+            if selected:
+                break
+            continue
+        selected.append(part); used += len(part) + 1
+    if tail: selected.reverse()
+    return " ".join(selected)
+
+
+def _heading_lineage(blocks, index):
+    """Use only actual preceding heading text; never infer an unknown hierarchy."""
+    lineage = []
+    for candidate in reversed(blocks[:index]):
+        if candidate.get("type") == "heading" and candidate.get("text"):
+            lineage.append({"block_id": candidate["block_id"], "text": candidate["text"], "level": candidate.get("level")})
+            if len(lineage) == 3: break
+    return list(reversed(lineage))
+
+
+def _glossary_rules(glossary, source):
+    """Return only applicable glossary rules, preserving legacy string values."""
+    result = []
+    for term, value in glossary.items():
+        if term.casefold() not in source.casefold():
+            continue
+        if isinstance(value, str):
+            target, variants = value, []
+        else:
+            target, variants = value["target"], value.get("variants", [])
+        result.append({"source": term, "target": target, "variants": variants})
+    return result
+
+
+def _target_term_present(text, term):
+    """Allow Russian inflection through word stems; do not rewrite output."""
+    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", term.casefold())
+    actual = text.casefold()
+    if not words:
+        return True
+    for word in words:
+        stem = word[:-2] if len(word) >= 6 and CYRILLIC_RE.search(word) else word
+        if stem not in actual:
+            return False
+    return True
+
+
+def _response_quality(source, translated, *, source_language, target_language, kind, glossary, before, after, response):
+    signals = quality_signals(source, translated, source_language=source_language, target_language=target_language, kind=kind)
+    completion = response.get("done_reason") if isinstance(response, dict) else None
+    if completion and completion not in {"stop"}:
+        signals.append("provider_completion_requires_review")
+    if kind == "heading" and _script_language(source) == source_language and _script_language(translated) == source_language:
+        signals.append("untranslated_heading")
+    for rule in _glossary_rules(glossary, source):
+        permitted = [rule["target"], *rule["variants"]]
+        if not any(_target_term_present(translated, candidate) for candidate in permitted):
+            signals.append("required_glossary_term_missing:" + rule["source"])
+    compact = re.sub(r"\s+", " ", translated.casefold()).strip()
+    for context in (before, after):
+        sample = _sentences(context, tail=bool(before), limit=280)
+        normalized = re.sub(r"\s+", " ", sample.casefold()).strip()
+        if len(normalized) >= 80 and normalized in compact:
+            signals.append("possible_context_leakage")
+    sentences = re.findall(r"[^.!?]+[.!?]", translated)
+    if len(sentences) > 1 and len({re.sub(r"\s+", " ", sentence).strip().casefold() for sentence in sentences}) < len(sentences):
+        signals.append("repeated_output_sentence")
+    return sorted(set(signals))
+
+
+def _retryable_quality_signals(signals):
+    """Only ask the model again for defects a fresh rendering can improve.
+
+    Source-side evidence (for example a line-end hyphen inherited from the
+    CDM) remains visible for review but must not waste two extra model calls.
+    """
+    retryable = {
+        "numeric_tokens_changed",
+        "mixed_scripts_inside_word",
+        "possible_untranslated_prose",
+        "provider_completion_requires_review",
+        "untranslated_heading",
+        "possible_context_leakage",
+        "repeated_output_sentence",
+    }
+    return [signal for signal in signals if signal in retryable or signal.startswith("required_glossary_term_missing:")]
+
+
 def _translate_ollama(*, endpoint, model, source, source_language, target_language, before, after, glossary, timeout, keep_alive=DEFAULT_MODEL_KEEP_ALIVE, document_context=None):
     glossary_text = json.dumps(glossary, ensure_ascii=False, sort_keys=True) if glossary else "{}"
     prompt = {
-        "task": "Translate only the source block. Do not correct, summarize, omit, add commentary, or translate numbers/identifiers.",
+        "prompt_version": PROMPT_VERSION,
+        "task": "Translate only owned_source. Do not correct, summarize, omit, add commentary, or translate numbers/identifiers.",
         "source_language": source_language,
         "target_language": target_language,
-        "source_block": source,
-        "previous_context": before,
-        "next_context": after,
+        "owned_source": source,
+        "context_before_read_only": before,
+        "context_after_read_only": after,
         "document_context": document_context or {},
-        "required_glossary": glossary,
+        "applicable_glossary": _glossary_rules(glossary, source),
         "response": "Return exactly JSON: {\"translation\": \"...\"}",
-        "safety": "Preserve all numeric tokens, fractions, units, citations and proper identifiers exactly when possible.",
+        "safety": "Read-only context is for meaning only and must not appear in translation. Preserve all numeric tokens, fractions, units, citations and proper identifiers exactly when possible.",
     }
     # Translation needs a faithful rendered block, not a reasoning trace.
     # Qwen3 and other thinking-capable local models can otherwise spend the
     # whole bounded request window on hidden analysis before producing JSON.
     # This remains an explicit provider setting in the resulting provenance.
-    payload = {"model": model, "stream": False, "format": "json", "think": False, "keep_alive": keep_alive, "options": {"temperature": 0},
+    payload = {"model": model, "stream": False, "format": "json", "think": False, "keep_alive": keep_alive,
+               "options": {"temperature": 0, "num_predict": MAX_OUTPUT_TOKENS},
                "messages": [{"role": "system", "content": "You are a faithful document translator."},
                             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}]}
     request = urllib.request.Request(endpoint.rstrip("/") + "/api/chat", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"})
@@ -197,8 +323,9 @@ def _translate_ollama(*, endpoint, model, source, source_language, target_langua
     content = (((result.get("message") or {}).get("content")) if isinstance(result, dict) else None)
     if not isinstance(content, str):
         raise ValueError("local Ollama response is missing message content")
-    return _extract_translation(content), {"temperature": 0, "thinking": False, "response_format": "json", "glossary_json": glossary_text,
-                                           "keep_alive": keep_alive}
+    return _extract_translation(content), {"temperature": 0, "max_output_tokens": MAX_OUTPUT_TOKENS, "thinking": False, "response_format": "json", "prompt_version": PROMPT_VERSION,
+                                           "glossary_json": glossary_text, "keep_alive": keep_alive,
+                                           "done_reason": result.get("done_reason"), "eval_count": result.get("eval_count")}
 
 
 def _eligible(document):
@@ -210,7 +337,7 @@ def _document_context(document, *, source_language, target_language, glossary):
     metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
     return {"document_id": document.get("document_id"), "title": metadata.get("title"),
             "source_language": source_language, "target_language": target_language,
-            "required_glossary": glossary,
+            "glossary_sha256": _digest(glossary),
             "output_contract": "Translate only the owned source block; supplied context is read-only and must never be emitted."}
 
 
@@ -289,9 +416,51 @@ def _valid_translation_checkpoint(root, chunk):
     return entries
 
 
+def _valid_partial_translation_checkpoint(root, chunk):
+    """Return a verified, ordered prefix from a failed chunk, if present."""
+    path = _partial_checkpoint_path(root, chunk["chunk_id"])
+    if not path.is_file() or path.is_symlink():
+        return None
+    payload = _load(path)
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return None
+    expected = chunk.get("owned_unit_ids", [])[:len(entries)]
+    if [entry.get("block_id") for entry in entries if isinstance(entry, dict)] != expected:
+        return None
+    if (payload.get("artifact_type") != PARTIAL_CHECKPOINT_TYPE
+            or payload.get("chunk_id") != chunk.get("chunk_id")
+            or payload.get("entries_sha256") != _digest(entries)):
+        return None
+    return entries
+
+
+def _commit_partial_translation_checkpoint(root, chunk, entries):
+    """Atomically retain completed owned units before a neighbouring failure."""
+    if not entries or [entry.get("block_id") for entry in entries] != chunk["owned_unit_ids"][:len(entries)]:
+        raise ValueError("translation partial checkpoint contains units outside chunk ownership")
+    payload = {
+        "schema_version": CHUNK_SCHEMA_VERSION,
+        "artifact_type": PARTIAL_CHECKPOINT_TYPE,
+        "chunk_id": chunk["chunk_id"],
+        "owned_unit_ids": chunk["owned_unit_ids"][:len(entries)],
+        "entries": entries,
+        "entries_sha256": _digest(entries),
+        "committed_at": _now(),
+        "lifecycle": "partial_checkpoint",
+    }
+    path = _partial_checkpoint_path(root, chunk["chunk_id"])
+    _atomic_json(path, payload)
+    if _valid_partial_translation_checkpoint(root, chunk) is None:
+        raise ValueError("translation partial checkpoint verification failed")
+
+
 def _commit_translation_checkpoint(root, plan, chunk, entries, *, duration_seconds):
     if [entry.get("block_id") for entry in entries] != chunk["owned_unit_ids"]:
         raise ValueError("translation checkpoint contains units outside chunk ownership")
+    for entry in entries:
+        if isinstance(entry.get("validation"), dict):
+            entry["validation"]["checkpoint"] = "PASS"
     payload = {"schema_version": CHUNK_SCHEMA_VERSION, "artifact_type": CHUNK_CHECKPOINT_TYPE,
                "chunk_id": chunk["chunk_id"], "owned_unit_ids": chunk["owned_unit_ids"], "entries": entries,
                "entries_sha256": _digest(entries), "committed_at": _now(), "duration_seconds": duration_seconds, "lifecycle": "checkpoint"}
@@ -300,6 +469,9 @@ def _commit_translation_checkpoint(root, plan, chunk, entries, *, duration_secon
         raise ValueError("translation checkpoint verification failed")
     chunk.update({"status": "complete", "completed_at": _now(), "duration_seconds": duration_seconds,
                   "validation": {"status": "PASS", "entries_sha256": payload["entries_sha256"]}})
+    partial = _partial_checkpoint_path(root, chunk["chunk_id"])
+    if partial.is_file() and not partial.is_symlink():
+        partial.unlink()
     _save_plan(root, plan)
 
 
@@ -337,23 +509,45 @@ def quality_signals(source, translated, *, source_language, target_language, kin
     return signals
 
 
-def _entry(block, *, source_language, target_language, text, before, after, glossary, provider, timeout, keep_alive, document_context=None):
+def _entry(block, *, source_language, target_language, text, before, after, glossary, provider, timeout, keep_alive, document_context=None, lineage=None):
     detected = _script_language(text)
     base = {"block_id": block["block_id"], "block_type": block["type"], "source_page": block.get("provenance", {}).get("source_page"),
             "source_text": text, "source_text_sha256": _sha_bytes(text.encode("utf-8")), "detected_language": detected,
-            "context": {"previous_block_id": before[0] if before else None, "next_block_id": after[0] if after else None}}
+            "context": {"previous_block_id": before[0] if before else None, "next_block_id": after[0] if after else None,
+                        "before_read_only": before[1] if before else "", "after_read_only": after[1] if after else "",
+                        "heading_lineage": lineage or []}}
     # A block already wholly in the target language needs no model call. Mixed
     # blocks are sent with an explicit source language and remain auditable.
     if detected == target_language:
         return {**base, "status": "skipped_already_target_language", "translation": None, "validation": {"numeric_tokens": "not_applicable"}}
-    translated, settings = _translate_ollama(endpoint=provider["endpoint"], model=provider["model"], source=text,
-        source_language=source_language, target_language=target_language, before=before[1] if before else "", after=after[1] if after else "", glossary=glossary, timeout=timeout, keep_alive=keep_alive, document_context=document_context)
+    attempts = []
+    translated = settings = None
+    retry_reason = None
+    attempt_limit = MAX_UNIT_ATTEMPTS if len(text) <= MAX_RETRY_SOURCE_CHARS else 1
+    for attempt_number in range(1, attempt_limit + 1):
+        scoped_context = {**(document_context or {}), "block_type": block["type"], "heading_lineage": lineage or [],
+                          "attempt": attempt_number, "retry_reason": retry_reason}
+        candidate, candidate_settings = _translate_ollama(endpoint=provider["endpoint"], model=provider["model"], source=text,
+            source_language=source_language, target_language=target_language, before=before[1] if before else "", after=after[1] if after else "", glossary=glossary, timeout=timeout, keep_alive=keep_alive, document_context=scoped_context)
+        signals = _response_quality(text, candidate, source_language=source_language, target_language=target_language,
+                                    kind=block["type"], glossary=glossary, before=before[1] if before else "", after=after[1] if after else "", response=candidate_settings)
+        attempts.append({"number": attempt_number, "translation": candidate, "translation_sha256": _sha_bytes(candidate.encode("utf-8")),
+            "provider_settings": candidate_settings, "quality_signals": signals, "retry_reason": retry_reason,
+            "attempt_limit": attempt_limit})
+        translated, settings = candidate, candidate_settings
+        retry_reason = _retryable_quality_signals(signals)
+        if not retry_reason:
+            break
     original_numbers, translated_numbers = _numbers(text), _numbers(translated)
-    status = "machine_translated" if original_numbers == translated_numbers else "needs_numeric_review"
+    signals = attempts[-1]["quality_signals"]
+    status = "machine_translated" if not signals and original_numbers == translated_numbers else "needs_quality_review"
+    if original_numbers != translated_numbers:
+        status = "needs_numeric_review"
     return {**base, "status": status, "translation": translated, "translation_sha256": _sha_bytes(translated.encode("utf-8")),
-            "validation": {"numeric_tokens": "PASS" if status == "machine_translated" else "FAIL", "source": original_numbers, "translation": translated_numbers,
-                           "quality_signals": quality_signals(text, translated, source_language=source_language, target_language=target_language, kind=block["type"])},
-            "provider_settings": settings}
+            "validation": {"request": "PASS", "structure": "PASS", "checkpoint": "pending", "human_acceptance": "NOT_REVIEWED",
+                           "numeric_tokens": "PASS" if original_numbers == translated_numbers else "FAIL", "source": original_numbers, "translation": translated_numbers,
+                           "quality_signals": signals, "quality_status": "PASS" if not signals else "REVIEW_REQUIRED"},
+            "provider_settings": settings, "attempts": attempts}
 
 
 def _render(entries, *, bilingual=False):
@@ -373,15 +567,27 @@ def _render(entries, *, bilingual=False):
 
 
 def _validate_manifest(manifest, document, *, cdm_sha=None):
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("artifact_type") != ARTIFACT_TYPE:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS or manifest.get("artifact_type") != ARTIFACT_TYPE:
         raise ValueError("invalid translation schema")
     source = manifest.get("source") or {}
     # The file fingerprint anchors this derivative to the exact CDM artifact
     # used for translation, including any future schema-preserving change.
     stale = cdm_sha is not None and source.get("cdm_sha256") != cdm_sha
-    expected = {block["block_id"]: block for block in _eligible(document)}
+    eligible_blocks = _eligible(document)
+    selected_ids = source.get("selected_block_ids")
+    if selected_ids is None:
+        selected_blocks = eligible_blocks
+    elif (not isinstance(selected_ids, list) or not selected_ids
+          or len(selected_ids) != len(set(selected_ids))):
+        raise ValueError("translation has invalid selected logical units")
+    else:
+        selected_set = set(selected_ids)
+        selected_blocks = [block for block in eligible_blocks if block["block_id"] in selected_set]
+        if [block["block_id"] for block in selected_blocks] != selected_ids:
+            raise ValueError("translation selection is not ordered source logical units")
+    expected = {block["block_id"]: block for block in selected_blocks}
     observed = manifest.get("blocks")
-    if not isinstance(observed, list) or len(observed) != len(expected) or [item.get("block_id") for item in observed if isinstance(item, dict)] != [block["block_id"] for block in _eligible(document)]:
+    if not isinstance(observed, list) or len(observed) != len(expected) or [item.get("block_id") for item in observed if isinstance(item, dict)] != [block["block_id"] for block in selected_blocks]:
         raise ValueError("translation does not cover the current eligible CDM blocks")
     invalid = []
     quality = []
@@ -389,18 +595,24 @@ def _validate_manifest(manifest, document, *, cdm_sha=None):
         block = expected[item["block_id"]]
         if item.get("source_text_sha256") != _sha_bytes(block["text"].encode("utf-8")):
             stale = True
-        if item.get("status") in {"machine_translated", "needs_numeric_review"} and not isinstance(item.get("translation"), str):
+        if item.get("status") in {"machine_translated", "needs_numeric_review", "needs_quality_review"} and not isinstance(item.get("translation"), str):
             invalid.append(item["block_id"])
         if isinstance(item.get("translation"), str):
             direction = manifest.get("direction") or {}
-            signals = quality_signals(block["text"], item["translation"], source_language=direction.get("source_language", "en"),
-                                      target_language=direction.get("target_language", "ru"), kind=block["type"])
+            context = item.get("context") or {}
+            signals = _response_quality(block["text"], item["translation"], source_language=direction.get("source_language", "en"),
+                                        target_language=direction.get("target_language", "ru"), kind=block["type"],
+                                        glossary=(manifest.get("validation_policy") or {}).get("glossary", {}),
+                                        before=context.get("before_read_only", ""), after=context.get("after_read_only", ""),
+                                        response=item.get("provider_settings") or {})
             if signals: quality.append({"block_id": block["block_id"], "source_page": block.get("provenance", {}).get("source_page"), "signals": signals})
     return {"valid": not invalid, "stale": stale, "invalid_block_ids": invalid,
             "machine_translated": sum(item.get("status") == "machine_translated" for item in observed),
             "needs_numeric_review": sum(item.get("status") == "needs_numeric_review" for item in observed),
+            "needs_quality_review": sum(item.get("status") == "needs_quality_review" for item in observed),
             "skipped": sum(str(item.get("status", "")).startswith("skipped_") for item in observed),
-            "quality_policy": "signals are human-review evidence, not automatic corrections", "quality_review": quality, "quality_review_count": len(quality)}
+            "quality_policy": "signals are human-review evidence, not automatic corrections", "quality_review": quality, "quality_review_count": len(quality),
+            "semantic_acceptance": "HUMAN_REVIEW_REQUIRED"}
 
 
 def _reset_translation_workspace(root):
@@ -413,7 +625,7 @@ def _reset_translation_workspace(root):
         shutil.rmtree(workspace)
 
 
-def translate_document(output_dir, *, source_language, target_language, provider, model, glossary_path=None, endpoint="http://127.0.0.1:11434", timeout=120, keep_alive=DEFAULT_MODEL_KEEP_ALIVE, chunk_size=DEFAULT_LOGICAL_UNIT_CHUNK_SIZE, restart=False, progress=None):
+def translate_document(output_dir, *, source_language, target_language, provider, model, glossary_path=None, endpoint="http://127.0.0.1:11434", timeout=120, keep_alive=DEFAULT_MODEL_KEEP_ALIVE, chunk_size=DEFAULT_LOGICAL_UNIT_CHUNK_SIZE, restart=False, progress=None, block_ids=None):
     root = Path(output_dir).expanduser().resolve()
     pair = pair_name(source_language, target_language)
     if provider != "ollama":
@@ -424,36 +636,64 @@ def translate_document(output_dir, *, source_language, target_language, provider
     glossary, glossary_provenance = _glossary(glossary_path)
     cdm_sha = sha_file(root / "book_document.json")
     keep_alive = _validate_keep_alive(keep_alive)
-    destination = translation_path(root, source_language, target_language)
-    existing = _load(destination)
-    if not restart and existing and (existing.get("source") or {}).get("cdm_sha256") == cdm_sha and (existing.get("provider") or {}).get("model") == model and existing.get("glossary") == glossary_provenance:
-        validation = _validate_manifest(existing, document, cdm_sha=cdm_sha)
-        if validation["valid"] and not validation["stale"]:
-            return {"path": str(destination), "reused": True, "validation": validation}
-    if existing:
-        history = destination.parent / "history" / f"{pair}-{(existing.get('source') or {}).get('cdm_sha256', 'unknown')[:12]}.json"
-        history.parent.mkdir(parents=True, exist_ok=True)
-        if not history.exists(): _atomic_json(history, existing)
-    # A changed/stale derived manifest is archived above. Its checkpoint plan
-    # belongs to the old source fingerprint and cannot be resumed safely.
-    if restart or existing:
-        _reset_translation_workspace(root)
     metadata = {**_model_info(endpoint, model, timeout), "resource_lifecycle": {
         "keep_alive": keep_alive,
         "policy": "BookText requests a bounded Ollama model lease; it never stops the shared daemon or unloads a model by process name.",
     }}
-    blocks = _eligible(document)
+    all_blocks = _eligible(document)
+    if block_ids is None:
+        blocks = all_blocks
+        selected_block_ids = None
+    else:
+        if not isinstance(block_ids, (list, tuple)) or not block_ids or any(not isinstance(value, str) for value in block_ids):
+            raise ValueError("block_ids must be a non-empty list of logical-unit IDs")
+        if len(block_ids) != len(set(block_ids)):
+            raise ValueError("block_ids must not contain duplicates")
+        requested = set(block_ids)
+        blocks = [block for block in all_blocks if block["block_id"] in requested]
+        selected_block_ids = [block["block_id"] for block in blocks]
+        if len(selected_block_ids) != len(block_ids):
+            raise ValueError("block_ids contain an ineligible or unknown CDM block")
     translation_id = "translation-" + _sha_bytes((document.get("document_id", "") + pair + cdm_sha).encode("utf-8"))[:20]
     options = {"direction": {"source_language": source_language, "target_language": target_language}, "provider": "ollama", "model": model,
-               "model_digest": metadata.get("model_digest"), "glossary": glossary_provenance, "keep_alive": keep_alive}
+               "model_digest": metadata.get("model_digest"), "glossary": glossary_provenance, "keep_alive": keep_alive,
+               "prompt_version": PROMPT_VERSION, "quality_policy_version": QUALITY_POLICY_VERSION, "context_char_budget": CONTEXT_CHAR_BUDGET,
+               "max_output_tokens": MAX_OUTPUT_TOKENS, "max_retry_source_chars": MAX_RETRY_SOURCE_CHARS,
+               "selected_block_ids": selected_block_ids}
     units = [_unit_spec(block) for block in blocks]
     source_fingerprint = _digest({"cdm_sha256": cdm_sha, "units": units, "options": options})
+    destination = translation_path(root, source_language, target_language)
+    existing = _load(destination)
+    expected_reuse = {"model": model, "model_digest": metadata.get("model_digest"), "glossary": glossary_provenance,
+                      "prompt_version": PROMPT_VERSION, "quality_policy_version": QUALITY_POLICY_VERSION, "keep_alive": keep_alive,
+                      "max_output_tokens": MAX_OUTPUT_TOKENS, "max_retry_source_chars": MAX_RETRY_SOURCE_CHARS}
+    if not restart and existing and (existing.get("source") or {}).get("cdm_sha256") == cdm_sha and all((existing.get("generation") or {}).get(key) == value for key, value in expected_reuse.items()):
+        validation = _validate_manifest(existing, document, cdm_sha=cdm_sha)
+        if validation["valid"] and not validation["stale"]:
+            return {"path": str(destination), "reused": True, "validation": validation}
+    active_plan = _load(_plan_path(root))
+    compatible_active_plan = bool(active_plan) and all(active_plan.get(key) == value for key, value in {
+        "translation_id": translation_id, "source_fingerprint": source_fingerprint,
+        "options_fingerprint": _digest(options),
+    }.items())
+    if existing:
+        history = destination.parent / "history" / f"{pair}-{(existing.get('source') or {}).get('cdm_sha256', 'unknown')[:12]}.json"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        if not history.exists(): _atomic_json(history, existing)
+    # A previous completed derivative may be stale while a newer matching plan
+    # is in progress. Preserve that plan and its partial unit checkpoints; only
+    # reset an authenticated workspace when the plan itself is incompatible or
+    # the user explicitly requests a restart.
+    if restart or (existing and not compatible_active_plan):
+        _reset_translation_workspace(root)
     plan, plan_created = _create_or_load_translation_plan(root, translation_id=translation_id, source_fingerprint=source_fingerprint,
         units=units, options=options, chunk_size=chunk_size)
     if progress:
         progress("chunk_plan_created" if plan_created else "job_resumed", {"chunks": len(plan["chunks"]), "logical_units": len(units), "translation_id": translation_id})
     by_id = {block["block_id"]: block for block in blocks}
-    index_by_id = {block["block_id"]: index for index, block in enumerate(blocks)}
+    # A bounded pilot may own a subset, while its read-only meaning context
+    # remains anchored in the complete ordered CDM.
+    index_by_id = {block["block_id"]: index for index, block in enumerate(all_blocks)}
     context = _document_context(document, source_language=source_language, target_language=target_language, glossary=glossary)
     resumed_chunks = []
     for chunk in plan["chunks"]:
@@ -464,14 +704,21 @@ def translate_document(output_dir, *, source_language, target_language, provider
             continue
         chunk.update({"status": "running", "attempts": int(chunk.get("attempts", 0)) + 1, "started_at": _now()}); _save_plan(root, plan)
         if progress: progress("chunk_started", {"chunk_id": chunk["chunk_id"], "current": plan["chunks"].index(chunk) + 1, "total": len(plan["chunks"]), "logical_units": len(chunk["owned_unit_ids"]), "owned_unit_ids": chunk["owned_unit_ids"]})
-        started = time.monotonic(); entries = []
+        started = time.monotonic()
+        partial = _valid_partial_translation_checkpoint(root, chunk)
+        entries = list(partial or [])
+        if partial and progress:
+            progress("chunk_progress", {"chunk_id": chunk["chunk_id"], "status": "partial_resume",
+                                        "current": len(entries), "total": len(chunk["owned_unit_ids"]),
+                                        "logical_units": len(entries)})
         try:
-            for block_id in chunk["owned_unit_ids"]:
+            for block_id in chunk["owned_unit_ids"][len(entries):]:
                 block = by_id[block_id]; index = index_by_id[block_id]
-                before = (blocks[index - 1]["block_id"], blocks[index - 1]["text"][-700:]) if index else None
-                after = (blocks[index + 1]["block_id"], blocks[index + 1]["text"][:700]) if index + 1 < len(blocks) else None
+                before = (all_blocks[index - 1]["block_id"], _sentences(all_blocks[index - 1]["text"], tail=True)) if index else None
+                after = (all_blocks[index + 1]["block_id"], _sentences(all_blocks[index + 1]["text"])) if index + 1 < len(all_blocks) else None
                 entries.append(_entry(block, source_language=source_language, target_language=target_language, text=block["text"], before=before, after=after,
-                    glossary=glossary, provider=metadata, timeout=timeout, keep_alive=keep_alive, document_context=context))
+                    glossary=glossary, provider=metadata, timeout=timeout, keep_alive=keep_alive, document_context=context, lineage=_heading_lineage(all_blocks, index)))
+                _commit_partial_translation_checkpoint(root, chunk, entries)
             _commit_translation_checkpoint(root, plan, chunk, entries, duration_seconds=round(time.monotonic() - started, 3))
             if progress: progress("chunk_completed", {"chunk_id": chunk["chunk_id"], "current": plan["chunks"].index(chunk) + 1, "total": len(plan["chunks"]), "logical_units": len(entries), "checkpoint": chunk["artifacts"]["checkpoint"]})
         except BaseException as error:
@@ -496,11 +743,14 @@ def translate_document(output_dir, *, source_language, target_language, provider
     bilingual_markdown.write_text(_render(entries, bilingual=True), encoding="utf-8")
     manifest = {"schema_version": SCHEMA_VERSION, "artifact_type": ARTIFACT_TYPE, "translation_id": translation_id,
         "created_at": _now(), "direction": {"source_language": source_language, "target_language": target_language},
-        "source": {"document_id": document.get("document_id"), "cdm_path": "book_document.json", "cdm_sha256": cdm_sha, "raw_ocr_mutated": False, "decision_provenance": document.get("review", {})},
-        "provider": metadata, "glossary": glossary_provenance, "blocks": entries,
+        "source": {"document_id": document.get("document_id"), "cdm_path": "book_document.json", "cdm_sha256": cdm_sha, "raw_ocr_mutated": False,
+                   "decision_provenance": document.get("review", {}), "selected_block_ids": selected_block_ids},
+        "provider": metadata, "glossary": glossary_provenance,
+        "generation": expected_reuse, "validation_policy": {"version": QUALITY_POLICY_VERSION, "glossary": glossary,
+                                                                "semantic_acceptance": "HUMAN_REVIEW_REQUIRED"}, "blocks": entries,
         "execution": {"logical_unit_ownership": True, "document_context": context, "checkpoint_plan": str(_plan_path(root).relative_to(root)),
                       "source_fingerprint": source_fingerprint, "chunk_count": len(plan["chunks"]), "resumed_chunks": resumed_chunks,
-                      "assembly": {"coverage": "PASS", "ordering": "PASS", "duplicates": "PASS", "context_only_output": "PASS"}},
+                      "assembly": {"coverage": "PASS", "ordering": "PASS", "duplicates": "PASS", "context_only_output": "NOT_SEMANTICALLY_VERIFIED"}},
         "outputs": {"translation_markdown": str(target_markdown.relative_to(root)), "bilingual_markdown": str(bilingual_markdown.relative_to(root))},
         "policy": "Derived translation only. Raw OCR, review decisions, final-book artifacts, and CDM remain unchanged. Machine translation is not human-reviewed automatically."}
     manifest["validation"] = _validate_manifest(manifest, document, cdm_sha=cdm_sha)
