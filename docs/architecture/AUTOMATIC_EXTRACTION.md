@@ -144,6 +144,12 @@ rechecks existing translations offline without rewriting their source evidence.
 
 ## Verification
 
+For scans with no visible native-text blocks, CDM keeps the primary Surya
+reading order rather than interleaving columns by vertical position. Retained
+figure crops with matching raw-layout provenance and bounds occupy that same
+primary position exactly once; unanchored assets are not assigned a guessed
+semantic position.
+
 Run `python3 -m unittest discover -s tests -v` and
 `swift run --package-path BookTextApp BookTextProtocolTests`.
 `tests/test_automatic_extraction.py` includes the real CLI/machine path, geometry,

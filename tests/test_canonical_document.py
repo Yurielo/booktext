@@ -161,5 +161,19 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertEqual([b["text"] for b in document["blocks"] if b["type"] == "paragraph"],
                          ["Left top.", "Left bottom.", "Right top."])
 
+    def test_scan_figure_stays_at_anchored_primary_position_once(self):
+        (self.root / "review_decisions.json").unlink()
+        self.book["pages"] = [{"page": 1, "text": "Left caption. Right column.", "layout_blocks": [],
+            "visuals": [{"index": 2, "image": "images/figure.png", "bbox": [0, 30, 40, 100],
+                         "source_provenance": {"kind": "surya_layout_source_crop", "raw_layout": "surya/surya-input/results.json"}}]}]
+        write(self.root / "book.json", self.book)
+        write(self.root / "surya/surya-input/results.json", {"pages": [{"page": 1, "blocks": [
+            {"label": "Text", "reading_order": 0, "bbox": [0, 0, 40, 20], "html": "<p>Left caption.</p>"},
+            {"label": "Figure", "reading_order": 1, "bbox": [0, 30, 40, 100], "html": "", "skipped": True},
+            {"label": "Text", "reading_order": 2, "bbox": [60, 0, 100, 20], "html": "<p>Right column.</p>"},
+        ]}]})
+        document = build_document(self.root)
+        self.assertEqual([b["type"] for b in document["blocks"]], ["paragraph", "figure", "paragraph", "page_break"])
+
 
 if __name__ == "__main__": unittest.main()

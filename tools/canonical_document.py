@@ -298,6 +298,21 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
         table_entries = (record.get("tables") or {}).get("tables") or []
         tables_by_index = {value.get("index"): value for value in table_entries if isinstance(value, dict)}
         emitted_tables = set()
+        visuals = [*(record.get("visuals") or []), *recovered_visuals.get(page, [])]
+        emitted_visuals = set()
+
+        def add_visual(visual):
+            identity = visual.get("image") or visual.get("index")
+            if identity in emitted_visuals:
+                return
+            emitted_visuals.add(identity)
+            image = _relative_if_file(root, visual.get("image"))
+            if image is None:
+                warnings.append({"page": page, "kind": "missing_visual_asset", "path": visual.get("image")})
+                return
+            add({"block_id": _stable_id("figure", f"{document_id}:{page}:{identity}"), "type": "figure", "image": image,
+                 "description": visual.get("description"), "description_ref": _relative_if_file(root, visual.get("description_file")), "caption_id": None,
+                 "provenance": {**page_ref, "visual_index": visual.get("index"), "visual_type": visual.get("type"), "bbox": visual.get("bbox"), "recovered_visual_evidence": recovered_visual_ref if visual.get("source_provenance") else None, "source": visual.get("source_provenance")}})
 
         def add_table(table):
             status, index = table.get("status"), table.get("index")
@@ -332,6 +347,20 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                         add_table(tables_by_index[raw_table_index])
                     continue
                 if label.lower() == "figure":
+                    # A retained primary-layout crop belongs at this exact
+                    # primary reading position, not at a y-sorted page tail.
+                    # Match anchored crop geometry only, never guess an image.
+                    bounds = raw.get("bbox")
+                    for visual in visuals:
+                        source = visual.get("source_provenance") or {}
+                        other = visual.get("bbox")
+                        if (source.get("kind") == "surya_layout_source_crop" and
+                                source.get("raw_layout") == raw_surya_ref and
+                                isinstance(bounds, list) and isinstance(other, list) and
+                                len(bounds) == len(other) == 4 and
+                                all(isinstance(a, (int, float)) and isinstance(b, (int, float)) and
+                                    abs(a-b) < .01 for a,b in zip(bounds,other))):
+                            add_visual(visual)
                     continue
                 text = _block_text(raw)
                 if not text:
@@ -353,16 +382,9 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                                         "line_geometry": text_normalization.line_geometry(fragment.get("lines"), dimensions, fragment.get("bbox")) if raw.get("extraction") == "native_pdf_words" else None}})
         for table in sorted(tables_by_index.values(), key=lambda value: value.get("index", 0)):
             add_table(table)
-        for visual in [*(record.get("visuals") or []), *recovered_visuals.get(page, [])]:
-            image = _relative_if_file(root, visual.get("image"))
-            if image is None:
-                warnings.append({"page": page, "kind": "missing_visual_asset", "path": visual.get("image")})
-                continue
-            visual_identity = visual.get("image") or visual.get("index")
-            add({"block_id": _stable_id("figure", f"{document_id}:{page}:{visual_identity}"), "type": "figure", "image": image,
-                 "description": visual.get("description"), "description_ref": _relative_if_file(root, visual.get("description_file")), "caption_id": None,
-                 "provenance": {**page_ref, "visual_index": visual.get("index"), "visual_type": visual.get("type"), "bbox": visual.get("bbox"), "recovered_visual_evidence": recovered_visual_ref if visual.get("source_provenance") else None, "source": visual.get("source_provenance")}})
-        if isinstance(native_blocks, list) and not has_changed_text:
+        for visual in visuals:
+            add_visual(visual)
+        if native_blocks and not has_changed_text:
             page_content = blocks[page_start:]
             figures = [block for block in page_content if block["type"] == "figure"]
             content = [block for block in page_content if block["type"] != "figure"]
