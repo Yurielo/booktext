@@ -6,7 +6,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from tools.export_document import export_document, export_translation, _enable_docx_text_wrapping, WP, W, A
+from tools.export_document import export_document, export_translation, _enable_docx_text_wrapping, _format_wide_docx_tables, WP, W, A
 
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACAQAAAABazTCJAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAACYktHRAAB3YoTpAAAAAd0SU1FB+oJHAcpDsplvHsAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDktMjhUMDc6NDE6MTQrMDA6MDAdjJROAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTA5LTI4VDA3OjQxOjE0KzAwOjAwbNEs8gAAACh0RVh0ZGF0ZTp0aW1lc3RhbXAAMjAyNi0wOS0yOFQwNzo0MToxNCswMDowMDvEDS0AAAAMSURBVAjXYzjAcAAAAwQBgcU7oqkAAAAASUVORK5CYII=")
@@ -136,6 +136,46 @@ class ExportDocumentTests(unittest.TestCase):
         markdown = (self.root / "translations/exports/en-ru/book-en-ru.md").read_text(encoding="utf-8")
         self.assertIn("Перевод: Corrected prose", markdown)
         self.assertNotIn("Unknown layout block", markdown)
+
+    def test_wide_docx_table_widths_preserve_every_cell_and_are_idempotent(self):
+        path = self.root / "wide.docx"
+        root = ET.Element(f"{W}document"); body = ET.SubElement(root, f"{W}body")
+        table = ET.SubElement(body, f"{W}tbl"); grid = ET.SubElement(table, f"{W}tblGrid")
+        for _ in range(11): ET.SubElement(grid, f"{W}gridCol", {f"{W}w": "850"})
+        content = [["Disease description", *["Year"]*10], ["Meningococcal infection and complications", *["12,671"]*10]]
+        for values in content:
+            row = ET.SubElement(table, f"{W}tr")
+            for value in values:
+                cell = ET.SubElement(row, f"{W}tc")
+                ET.SubElement(ET.SubElement(ET.SubElement(cell, f"{W}p"), f"{W}r"), f"{W}t").text = value
+        with zipfile.ZipFile(path, "w") as archive: archive.writestr("word/document.xml", ET.tostring(root))
+        self.assertEqual(_format_wide_docx_tables(path), 1)
+        with zipfile.ZipFile(path) as archive: first = archive.read("word/document.xml")
+        result = ET.fromstring(first)
+        widths = [int(node.get(f"{W}w")) for node in result.findall(f".//{W}gridCol")]
+        self.assertEqual(sum(widths), 9360)
+        self.assertGreater(widths[0], widths[1]*3)
+        self.assertEqual([node.text for node in result.iter(f"{W}t")], [value for row in content for value in row])
+        self.assertEqual([int(node.get(f"{W}w")) for node in result.findall(f".//{W}tcW")], widths*2)
+        self.assertEqual(result.find(f".//{W}tbl")[0].tag, f"{W}tblPr")
+        self.assertTrue(all(node[0].tag == f"{W}tcPr" for node in result.iter(f"{W}tc")))
+        self.assertEqual(_format_wide_docx_tables(path), 1)
+        with zipfile.ZipFile(path) as archive: self.assertEqual(first, archive.read("word/document.xml"))
+
+    def test_small_or_merged_docx_tables_are_not_reinterpreted(self):
+        path = self.root / "complex.docx"
+        root = ET.Element(f"{W}document"); body = ET.SubElement(root, f"{W}body")
+        for count, merged in [(2, False), (8, True)]:
+            table = ET.SubElement(body, f"{W}tbl"); grid = ET.SubElement(table, f"{W}tblGrid")
+            for _ in range(count): ET.SubElement(grid, f"{W}gridCol")
+            row = ET.SubElement(table, f"{W}tr")
+            for _ in range(count):
+                cell = ET.SubElement(row, f"{W}tc")
+                if merged: ET.SubElement(ET.SubElement(cell, f"{W}tcPr"), f"{W}gridSpan", {f"{W}val":"2"})
+        with zipfile.ZipFile(path, "w") as archive: archive.writestr("word/document.xml", ET.tostring(root))
+        before = path.read_bytes()
+        self.assertEqual(_format_wide_docx_tables(path), 0)
+        self.assertEqual(before, path.read_bytes())
 
     def test_invalid_cdm_or_broken_table_fails_without_export_success(self):
         self.document["blocks"][4]["artifacts"]["json"] = "tables/missing.json"; write(self.root / "book_document.json", self.document)

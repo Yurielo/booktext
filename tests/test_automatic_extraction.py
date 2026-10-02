@@ -156,6 +156,43 @@ class AutomaticExtractionTests(unittest.TestCase):
         self.assertTrue(auto.scan_line_evidence(image)["scan_like"])
         self.assertFalse(auto.scan_line_evidence(Image.new("L", (600,800), 0))["scan_like"])
 
+    def test_figure_framing_restores_touching_pixels_without_caption_or_raw_changes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); (root/"images").mkdir()
+            image = Image.new("RGB", (600,800), "white"); draw = ImageDraw.Draw(image)
+            draw.rectangle((95,195,305,405), fill="black")
+            draw.rectangle((100,180,300,184), fill="black")  # Separate caption outside six-point range.
+            image.save(root/"page.png"); image.crop((100,200,300,400)).save(root/"images/raw.png")
+            before = (root/"images/raw.png").read_bytes()
+            visual = {"index":1,"bbox":[50,100,150,200],"image":"images/raw.png",
+                      "source_provenance":{"kind":"surya_layout_source_crop","raw_layout":"surya/results.json"}}
+            framed, warnings = auto.refine_scanned_figure(root, visual, "page.png", [300,400])
+            self.assertEqual(warnings, [])
+            self.assertEqual(framed["bbox"], visual["bbox"])
+            self.assertEqual((root/"images/raw.png").read_bytes(), before)
+            self.assertEqual(visual["image"], "images/raw.png")
+            box = [round(v*2) for v in framed["source_provenance"]["crop_bbox_points"]]
+            self.assertEqual(box, [94,194,307,407])
+            with Image.open(root/framed["image"]) as crop:
+                self.assertEqual(crop.tobytes(), image.crop(box).tobytes())
+            again, _ = auto.refine_scanned_figure(root, visual, "page.png", [300,400])
+            self.assertEqual(again, framed)
+            Image.new("RGB", (1,1), "black").save(root/framed["image"])
+            with self.assertRaisesRegex(ValueError, "stale refined figure"):
+                auto.refine_scanned_figure(root, visual, "page.png", [300,400])
+
+    def test_figure_framing_keeps_uncertain_or_nonprimary_edges(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); (root/"images").mkdir()
+            Image.new("RGB", (600,800), "black").save(root/"page.png")
+            Image.new("RGB", (200,200), "black").save(root/"images/raw.png")
+            visual = {"index":1,"bbox":[50,100,150,200],"image":"images/raw.png",
+                      "source_provenance":{"kind":"surya_layout_source_crop"}}
+            framed, warnings = auto.refine_scanned_figure(root, visual, "page.png", [300,400])
+            self.assertEqual(framed, visual); self.assertEqual(len(warnings[0]["edges"]), 4)
+            visual["source_provenance"]["kind"] = "native_figure"
+            self.assertEqual(auto.refine_scanned_figure(root,visual,"page.png",[300,400]), (visual, []))
+
     def test_mixed_partial_text_layer_routes_residual_scan_only(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); source = root/"mixed.pdf"; source.write_bytes(b"pdf")

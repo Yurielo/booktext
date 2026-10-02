@@ -199,6 +199,97 @@ def _enable_docx_text_wrapping(destination):
     return converted
 
 
+def _format_wide_docx_tables(destination):
+    """Presentation only: give prose more space than short numeric fields.
+
+    Never change cell text/order or infer missing/merged cells. Complex tables
+    remain untouched. This pass is deterministic and operates on final OOXML.
+    """
+    with zipfile.ZipFile(destination) as archive:
+        files = {entry.filename: archive.read(entry.filename) for entry in archive.infolist()}
+    root = ET.fromstring(files["word/document.xml"])
+    section = root.find(f".//{W}sectPr")
+    size = section.find(f"{W}pgSz") if section is not None else None
+    margins = section.find(f"{W}pgMar") if section is not None else None
+    def number(node, key, default):
+        return int(node.get(f"{W}{key}", default)) if node is not None else default
+    available = number(size, "w", 12240) - number(margins, "left", 1440) - number(margins, "right", 1440)
+    if available <= 0:
+        raise ValueError("DOCX has invalid printable width")
+    def property(parent, tag, **attributes):
+        node = parent.find(f"{W}{tag}")
+        if node is None:
+            node = ET.Element(f"{W}{tag}")
+            before = {
+                "keepNext": {"keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr", "pBdr", "shd", "tabs", "spacing", "ind", "jc"},
+                "tblW": {"jc", "tblCellSpacing", "tblInd", "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook"},
+                "tblBorders": {"shd", "tblLayout", "tblCellMar", "tblLook"},
+                "tblLayout": {"tblCellMar", "tblLook"}, "tblCellMar": {"tblLook"},
+                "spacing": {"ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment", "outlineLvl", "rPr", "sectPr"},
+                "sz": {"szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang"},
+                "szCs": {"highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang"},
+                "tcW": {"gridSpan", "hMerge", "vMerge", "tcBorders", "shd", "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark"},
+            }.get(tag, set())
+            position = 0 if tag.endswith("Pr") else next(
+                (index for index, child in enumerate(parent) if child.tag.removeprefix(W) in before), len(parent))
+            parent.insert(position, node)
+        node.attrib.update({f"{W}{key}": str(value) for key, value in attributes.items()})
+        return node
+    changed = 0
+    for table in root.findall(f".//{W}tbl"):
+        grid = table.find(f"{W}tblGrid")
+        columns = list(grid) if grid is not None else []
+        rows = [row.findall(f"{W}tc") for row in table.findall(f"{W}tr")]
+        if (len(columns) < 8 or not rows or any(len(row) != len(columns) for row in rows)
+                or table.find(f".//{W}gridSpan") is not None
+                or table.find(f".//{W}vMerge") is not None
+                or table.find(f".//{W}tbl") is not None):
+            continue
+        weights = []
+        for index in range(len(columns)):
+            # OOXML t nodes only: formatting whitespace is not cell content.
+            texts = [" ".join(node.text or "" for node in row[index].iter(f"{W}t")) for row in rows]
+            weights.append(max(6, min(36, max((len(text) for text in texts), default=0) + 2)))
+        widths = [available * weight // sum(weights) for weight in weights]
+        widths[-1] += available - sum(widths)
+        props = property(table, "tblPr")
+        property(props, "tblW", w=available, type="dxa")
+        property(props, "tblLayout", type="fixed")
+        padding = property(props, "tblCellMar")
+        for side in ("left", "right", "top", "bottom"):
+            property(padding, side, w=40 if side in {"left", "right"} else 50, type="dxa")
+        borders = property(props, "tblBorders")
+        for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            property(borders, side, val="single", sz=4, color="D9D9D9")
+        for column, width in zip(columns, widths):
+            column.set(f"{W}w", str(width))
+        for row_index, row in enumerate(rows):
+            for cell, width in zip(row, widths):
+                cell_props = property(cell, "tcPr")
+                property(cell_props, "tcW", w=width, type="dxa")
+                property(cell_props, "vAlign", val="center")
+                for paragraph in cell.findall(f"{W}p"):
+                    paragraph_props = property(paragraph, "pPr")
+                    property(paragraph_props, "spacing", before=0, after=0, line=240, lineRule="auto")
+                    # Avoid an isolated one/two-row table start at a page foot.
+                    # This is pagination, not an inferred semantic header.
+                    if row_index < min(2, len(rows)-1):
+                        property(paragraph_props, "keepNext", val=1)
+                for run in cell.iter(f"{W}r"):
+                    run_props = property(run, "rPr")
+                    property(run_props, "sz", val=18)
+                    property(run_props, "szCs", val=18)
+        changed += 1
+    if changed:
+        files["word/document.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        temporary = destination.with_suffix(".tables.tmp.docx")
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, value in files.items():
+                archive.writestr(name, value)
+        temporary.replace(destination)
+    return changed
+
+
 def _renderer_python():
     candidates = [os.environ.get("BOOKTEXT_EXPORT_PYTHON"), sys.executable, str(Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3")]
     for candidate in candidates:
@@ -300,6 +391,7 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
         try:
             _pandoc(docx_markdown, paths["docx"], root)
             _enable_docx_text_wrapping(paths["docx"])
+            _format_wide_docx_tables(paths["docx"])
         finally:
             docx_markdown.unlink(missing_ok=True)
     if "epub" in requested:

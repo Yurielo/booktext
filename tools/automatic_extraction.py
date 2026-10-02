@@ -291,6 +291,83 @@ def native_layout(page, exclusions):
     return blocks
 
 
+def refine_scanned_figure(output, visual, page_image, dimensions):
+    """Restore boundary-touching pixels to a nearby white gap, never redraw.
+
+    The raw crop/bbox stays intact. Only primary-layout source crops qualify;
+    no safe gap within six points means keep that edge and report uncertainty.
+    """
+    from PIL import Image
+    root = Path(output).resolve()
+    source = visual.get("source_provenance") or {}
+    bounds = visual.get("bbox")
+    if (source.get("kind") != "surya_layout_source_crop" or
+            not isinstance(bounds, list) or len(bounds) != 4 or
+            not dimensions or len(dimensions) != 2):
+        return visual, []
+    page_path = (root / page_image).resolve()
+    raw_path = (root / visual["image"]).resolve()
+    if not page_path.is_relative_to(root) or not raw_path.is_relative_to(root):
+        raise ValueError("figure framing paths must stay within output")
+    if not page_path.is_file() or not raw_path.is_file():
+        return visual, []
+    with Image.open(page_path) as full:
+        full.load()
+        sx, sy = full.width / dimensions[0], full.height / dimensions[1]
+        pixels = [round(value * (sx if i % 2 == 0 else sy)) for i,value in enumerate(bounds)]
+        x0,y0,x1,y1 = pixels
+        if not (0 <= x0 < x1 <= full.width and 0 <= y0 < y1 <= full.height):
+            raise ValueError("figure framing has invalid source coordinates")
+        ink = full.convert("L").point(lambda value: 255 if value < 192 else 0)
+        framed, uncertain = list(pixels), []
+        # Vertical edges first so separate caption lines outside the primary
+        # rectangle are not brought in by a blind uniform padding rectangle.
+        for index in (1, 3, 0, 2):
+            low = index in (0,1)
+            step = -1 if low else 1
+            axis_scale = sx if index % 2 == 0 else sy
+            limit = full.width if index % 2 == 0 else full.height
+            x0,y0,x1,y1 = framed
+            def strip(position):
+                return (x0,position,x1,position+1) if index % 2 else (position,y0,position+1,y1)
+            inner = pixels[index] if low else pixels[index]-1
+            if ink.crop(strip(inner)).getbbox() is None:
+                continue
+            found = False
+            for distance in range(1, max(1, round(6*axis_scale))+1):
+                position = inner + step*distance
+                if not 0 <= position < limit:
+                    break
+                if ink.crop(strip(position)).getbbox() is None:
+                    framed[index] = position if low else position+1
+                    found = True
+                    break
+            if not found:
+                uncertain.append(("left", "top", "right", "bottom")[index])
+        warnings = [{"kind": "figure_boundary_uncertain", "visual_index": visual.get("index"),
+                     "edges": uncertain, "message": "No separating white gap within six points; original crop edge retained."}] if uncertain else []
+        if framed == pixels:
+            return visual, warnings
+        fingerprint = hashlib.sha256((sha(page_path) + repr(framed)).encode()).hexdigest()[:16]
+        destination = root / "images" / "refined_figures" / f"{raw_path.stem}-{fingerprint}.png"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        crop = full.crop(framed)
+        if destination.exists():
+            with Image.open(destination) as cached:
+                if cached.size != crop.size or cached.mode != crop.mode or cached.tobytes() != crop.tobytes():
+                    raise ValueError("stale refined figure pixels; refusing reuse")
+        else:
+            temporary = destination.with_suffix(".tmp.png")
+            crop.save(temporary, format="PNG", dpi=(sx*72,sy*72))
+            temporary.replace(destination)
+        refined = {**visual, "image": str(destination.relative_to(root)), "source_provenance": {**source,
+            "raw_crop": str(raw_path.relative_to(root)), "crop_bbox_points": [v/(sx if i%2==0 else sy) for i,v in enumerate(framed)],
+            "raw_crop_sha256": sha(raw_path),
+            "framing_policy": "boundary-touching source pixels to separating white gap, max six points; no redrawing",
+            "prepared_page_sha256": sha(page_path), "sha256": sha(destination)}}
+        return refined, warnings
+
+
 def retain_scanned_figures(output, record, page_result):
     """Retain Surya-labelled figures inside a raster scan, without another OCR.
 
