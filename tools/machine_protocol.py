@@ -90,6 +90,25 @@ def ensure_job(root, *, status="created", source=None):
     _atomic(path, state); return state
 
 
+def read_job(root):
+    """Read a durable job if present, without creating or changing anything.
+
+    Inspection/history is intentionally different from a run: a stale output
+    path must never gain a `.booktext_job.json` merely because it appeared in a
+    recent-project list.
+    """
+    root = Path(root).expanduser().resolve()
+    state = _load(_job_path(root))
+    if not isinstance(state, dict):
+        return {"schema_version": JOB_SCHEMA_VERSION, "artifact_type": "booktext.machine_job",
+                "protocol_version": PROTOCOL_VERSION, "job_id": _job_id(root), "output_dir": str(root),
+                "source": [], "status": "discovered", "last_phase": None, "artifacts": {}}
+    state = dict(state)
+    state.setdefault("job_id", _job_id(root)); state.setdefault("output_dir", str(root)); state.setdefault("source", [])
+    state.setdefault("artifacts", {}); state.setdefault("status", "discovered"); state.setdefault("last_phase", None)
+    return state
+
+
 def update_job(root, **changes):
     state = ensure_job(root)
     # A retry that reaches a verified terminal success must not inherit an
@@ -114,6 +133,35 @@ def artifact_map(root):
         "extraction_report": "extraction/report.json", "source_inventory": "extraction/inventory.json",
     }
     return {name: {"path": value, "exists": (root / value).exists()} for name, value in candidates.items()}
+
+
+def _has_booktext_evidence(artifacts, state):
+    """Whether this directory can be safely treated as a BookText output."""
+    if state.get("status") not in {None, "discovered", "created"}:
+        return True
+    return any(artifacts[name]["exists"] for name in (
+        "book_manifest", "run_summary", "raw_review", "review", "final_build", "cdm", "exports", "document_identity", "translations",
+    ))
+
+
+def _icloud_managed_path(root):
+    """Avoid blocking the native launch on a dataless iCloud placeholder."""
+    normalized = str(Path(root).expanduser())
+    return "/Library/Mobile Documents/" in normalized or "/Library/CloudStorage/iCloud Drive/" in normalized
+
+
+def _unavailable_inspection(root, *, detail):
+    root = Path(root).expanduser().resolve()
+    state = {"schema_version": JOB_SCHEMA_VERSION, "artifact_type": "booktext.machine_job",
+             "protocol_version": PROTOCOL_VERSION, "job_id": _job_id(root), "output_dir": str(root),
+             "source": [], "status": "discovered", "last_phase": None, "artifacts": {}}
+    unavailable = {"state": "FAILED", "action": "Locate project files", "availability": "PROJECT_FILES_UNAVAILABLE",
+                   "page_count": None, "translation_state": "NOT_STARTED", "last_phase": None,
+                   "source_unavailable": False, "reopen_available": False, "detail": detail}
+    return {"protocol_version": PROTOCOL_VERSION, "job": {**state, "complete": False, "incomplete": True},
+            "artifacts": {}, "review": {"unresolved_priority_counts": {"HIGH": 0, "MEDIUM": 0}, "stale_or_conflict_count": 0},
+            "cdm": {"present": False, "schema_version": None}, "exports": {"present": False, "validation": None},
+            "run_summary": None, "project": unavailable}
 
 
 def _translation_state(root, artifacts):
@@ -172,8 +220,12 @@ def _project_projection(root, state, artifacts, counts, summary, final, document
 def inspect_output(root):
     root = Path(root).expanduser().resolve()
     if not root.is_dir(): raise MachineError("invalid_input", "output directory does not exist", details={"output_dir": str(root)})
-    state = ensure_job(root, status="discovered")
+    if _icloud_managed_path(root):
+        return _unavailable_inspection(root, detail="iCloud-managed project files must be available locally before reopening")
+    state = read_job(root)
     artifacts = artifact_map(root)
+    if not _has_booktext_evidence(artifacts, state):
+        return _unavailable_inspection(root, detail="BookText project evidence is unavailable")
     summary, final, document, export = (_load(root / name, {}) or {} for name in ("run_summary.json", "final_build.json", "book_document.json", "exports/export_manifest.json"))
     priority = _load(root / "review_priority.json", {}) or {}
     counts = (final.get("unresolved_priority_counts") or document.get("review", {}).get("unresolved_priority_counts")
@@ -392,10 +444,10 @@ def _handle(args):
     if args.command == "inspect":
         if not Path(root).expanduser().resolve().is_dir():
             raise MachineError("invalid_input", "output directory does not exist", details={"output_dir": str(root)})
-        state = ensure_job(root, status="discovered"); emitter = Emitter(state["job_id"])
-        if args.record_activity:
+        detail = inspect_output(root); state = detail["job"]; emitter = Emitter(state["job_id"])
+        if args.record_activity and detail["project"].get("availability") != "PROJECT_FILES_UNAVAILABLE":
             project_history.record(root, state, activity=True)
-        emitter.emit("job_completed", phase=state.get("last_phase"), message="Existing job inspected", details=inspect_output(root)); return 0
+        emitter.emit("job_completed", phase=state.get("last_phase"), message="Existing job inspected", details=detail); return 0
     if args.command == "project-history":
         # Explicit persisted output references are the only migration source.
         # Discovery performs inspect-only reconciliation and never starts OCR.

@@ -142,7 +142,10 @@ def reconcile(*, known_outputs, inspect, history_path=None):
             continue
         try:
             detail = inspect(root)
-            record(root, detail.get("job", {}), history_path=path, activity=False)
+            if detail.get("project", {}).get("availability") == "PROJECT_FILES_UNAVAILABLE":
+                warnings.append(f"known project unavailable: {root}")
+            else:
+                record(root, detail.get("job", {}), history_path=path, activity=False)
         except Exception:
             warnings.append(f"known project could not be inspected: {root}")
     payload = _load(path)

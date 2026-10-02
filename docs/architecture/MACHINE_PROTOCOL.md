@@ -53,6 +53,12 @@ export; only a resume that needs the source is blocked. Missing project files
 are reported as `PROJECT_FILES_UNAVAILABLE`. `project-remove` removes only an
 index row and never deletes source or BookText artifacts.
 
+For a dataless iCloud-managed output, history intentionally returns the same
+controlled unavailable state without probing artifacts, writing a job file, or
+requesting download/materialization. A user can make a local copy available
+and then reopen it; the background recent-project refresh never waits on cloud
+I/O.
+
 `export` requires at least one format: `markdown`, `html`, `docx`, `epub`,
 `pdf`, or `pdf_image`. `all` is supported only as an explicit format choice;
 Core does not default an omitted selection to every format.
