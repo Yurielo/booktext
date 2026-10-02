@@ -26,7 +26,7 @@ class MachineProtocolTests(unittest.TestCase):
     def assert_protocol(self, payload):
         self.assertTrue(payload)
         for event in payload:
-            self.assertEqual("1.0", event["protocol_version"])
+            self.assertEqual(protocol.PROTOCOL_VERSION.split(".")[0], event["protocol_version"].split(".")[0])
             self.assertIn(event["event_type"], protocol.EVENT_TYPES)
             self.assertIn("job_id", event)
             self.assertIn("details", event)
@@ -64,6 +64,25 @@ class MachineProtocolTests(unittest.TestCase):
             self.assertTrue(result["artifacts"]["cdm"]["exists"])
             self.assertTrue(result["artifacts"]["exports"]["exists"])
             self.assertEqual(1, result["review"]["unresolved_priority_counts"]["HIGH"])
+
+    def test_inspect_discovers_namespaced_translation_export_and_its_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            export_dir = root / "translations" / "exports" / "en-ru"
+            export_dir.mkdir(parents=True)
+            (export_dir / "export_manifest.json").write_text(
+                json.dumps({"validation": {"cdm": "PASS", "formats": {"docx": "PASS"}}}),
+                encoding="utf-8",
+            )
+            # Simulate a job persisted by an older Core with only the former
+            # root-level export path.  Inspection must use live discovery.
+            protocol.ensure_job(root, status="completed")
+            protocol.update_job(root, artifacts={"exports": {"exists": False, "path": "exports/export_manifest.json"}})
+            detail = protocol.inspect_output(root)
+            self.assertTrue(detail["artifacts"]["exports"]["exists"])
+            self.assertEqual("translations/exports/en-ru/export_manifest.json", detail["artifacts"]["exports"]["path"])
+            self.assertEqual("PASS", detail["exports"]["validation"]["formats"]["docx"])
+            self.assertTrue(detail["job"]["artifacts"]["exports"]["exists"])
 
     @mock.patch("tools.machine_protocol.export_document.export_document", return_value={"generated": {"docx": {}}})
     def test_machine_export_passes_only_explicit_selected_formats(self, exported):

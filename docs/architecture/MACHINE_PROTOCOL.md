@@ -6,7 +6,7 @@ shell fragments: input paths are ordinary argv values.
 
 ## Compatibility
 
-Protocol version is currently **1.0**, independently of the BookText release.
+Protocol version is currently **1.1**, independently of the BookText release.
 Consumers must reject an unknown major version and may ignore unknown event
 fields and event types in a compatible minor version. In machine mode stdout
 contains JSONL protocol records only; delegated human-Core diagnostics go to
@@ -28,11 +28,33 @@ booktext machine cdm OUTPUT_DIR
 booktext machine translation OUTPUT_DIR --source-language en --target-language ru --model MODEL [--keep-alive 30s]
 booktext machine translation-validate OUTPUT_DIR --source-language en --target-language ru
 booktext machine export OUTPUT_DIR --format FORMAT [--format FORMAT ...]
+booktext machine pipeline-create --definition-json JSON SOURCE
+booktext machine pipeline-validate OUTPUT_DIR
+booktext machine pipeline-start OUTPUT_DIR
+booktext machine pipeline-status OUTPUT_DIR
+booktext machine pipeline-resume OUTPUT_DIR
+booktext machine pipeline-cancel OUTPUT_DIR
 ```
 
 The command layer calls existing production Core functions for processing,
 review decisions, final build, CDM build, and publication export. It does not
 duplicate their business logic.
+
+## Sequential pipelines
+
+A pipeline is an optional, persisted, strictly ordered plan stored as
+`.booktext_pipeline.json` inside its existing BookText output. It supports only
+the product stages `PROCESS`, `REVIEW_POLICY`, `FINAL_BUILD`, `CDM`,
+`TRANSLATE`, and `EXPORT`; it is not a scripting or DAG interface. Core validates
+the full definition before work begins. Each stage is committed atomically and
+records only existing artifact references.
+
+`skip_human_review` continues from raw/canonical OCR without accepting Vision
+or writing corrective decisions. `review_when_required` pauses with
+`REVIEW_REQUIRED` when unresolved HIGH/MEDIUM items exist. Resume verifies each
+completed artifact first and starts the first incomplete stage; valid OCR and
+translation checkpoints are never repeated. A translated export explicitly uses
+the selected translation derivative rather than the source-language CDM.
 
 ## Durable project history
 
@@ -52,6 +74,11 @@ existing output remains reopenable for review, final-build, translation, or
 export; only a resume that needs the source is blocked. Missing project files
 are reported as `PROJECT_FILES_UNAVAILABLE`. `project-remove` removes only an
 index row and never deletes source or BookText artifacts.
+
+Pipeline projects additionally project `PIPELINE_PLANNED`, `PIPELINE_RUNNING`,
+or `PIPELINE_PAUSED`, with the current and completed stage IDs. The history
+index remains only a discovery aid: the project-owned Core pipeline file is the
+source of truth on every reopen.
 
 For a dataless iCloud-managed output, history intentionally returns the same
 controlled unavailable state without probing artifacts, writing a job file, or
@@ -76,6 +103,10 @@ types are: `job_started`, `phase_started`, `progress`, `warning`,
 `artifact_created`, `review_summary`, `phase_completed`, `job_completed`,
 `job_failed`, and `job_cancelled`. Stable UI phases are `preflight`, `prepare`,
 `ocr`, `qa`, `visuals/tables`, `review`, `final_build`, `cdm`, `translation`, and `export`.
+
+Pipeline events are `pipeline_started`, `stage_started`, `stage_progress`,
+`stage_completed`, `stage_failed`, `pipeline_paused`, `pipeline_resumed`, and
+`pipeline_completed`. Existing 1.x clients may safely ignore them.
 
 Exit codes: 0 success; 2 invalid input; 3 preflight/dependency failure; 4
 processing failure; 5 validation failure; 6 stale/conflict; 130 cancellation.

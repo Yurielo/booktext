@@ -229,6 +229,13 @@ export the ready book. Core configuration, processing options, diagnostics,
 and manual storage cleanup remain under **Settings** instead of the routine
 document screen.
 
+Before pressing **Start**, the app can save a simple sequential workflow:
+process, choose a review policy, optionally translate EN↔RU, then export only
+the selected formats. After one Start, Core advances validated stages in order;
+an interruption resumes at the first incomplete stage without repeating valid
+OCR or translation checkpoints. This is a fixed product workflow, not a general
+automation or scripting feature.
+
 The app uses the versioned JSONL contract, never terminal prose:
 
 ```bash

@@ -1,6 +1,6 @@
 import Foundation
 
-public let machineProtocolVersion = "1.0"
+public let machineProtocolVersion = "1.1"
 
 public enum MachineEventType: String, Codable, CaseIterable, Sendable {
     case jobStarted = "job_started", phaseStarted = "phase_started", progress, warning
@@ -13,6 +13,10 @@ public enum MachineEventType: String, Codable, CaseIterable, Sendable {
     case assemblyStarted = "assembly_started", assemblyCompleted = "assembly_completed"
     case cleanupStarted = "cleanup_started", cleanupProgress = "cleanup_progress"
     case cleanupCompleted = "cleanup_completed", cleanupWarning = "cleanup_warning"
+    case pipelineStarted = "pipeline_started", stageStarted = "stage_started"
+    case stageProgress = "stage_progress", stageCompleted = "stage_completed"
+    case stageFailed = "stage_failed", pipelinePaused = "pipeline_paused"
+    case pipelineResumed = "pipeline_resumed", pipelineCompleted = "pipeline_completed"
 
     public init(from decoder: Decoder) throws {
         let value = try decoder.singleValueContainer().decode(String.self)
@@ -76,11 +80,12 @@ public struct JobPresentation: Sendable, Equatable {
         guard event.supported else { state = .failed; errorCode = "unsupported_protocol"; return }
         jobID = event.jobID; phase = event.phase ?? phase; current = event.current ?? current; total = event.total ?? total; page = event.page ?? page
         switch event.eventType {
-        case .jobStarted: state = .running
+        case .jobStarted, .pipelineStarted, .pipelineResumed, .stageStarted, .stageProgress: state = .running
         case .warning: warnings.append(event.message)
         case .jobCompleted: state = .completed
-        case .jobFailed: state = .failed; errorCode = event.code
-        case .jobCancelled: state = .cancelled
+        case .jobFailed, .stageFailed: state = .failed; errorCode = event.code
+        case .jobCancelled, .pipelinePaused: state = .cancelled
+        case .pipelineCompleted: state = .completed
         default: break
         }
     }

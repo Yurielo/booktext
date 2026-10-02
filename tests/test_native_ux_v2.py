@@ -15,7 +15,7 @@ class NativeUXV2ContractTests(unittest.TestCase):
         for label in (
             'Text("Choose a document")',
             'Button("Choose File"',
-            'Button("Start Processing"',
+            'Button("Start", action: model.start)',
             'Button("Open Book")',
             'Button("Translate")',
             'Button("Export…")',
@@ -67,6 +67,19 @@ class NativeUXV2ContractTests(unittest.TestCase):
         self.assertIn("Resuming previous processing. Completed work will not be repeated.", APP)
         self.assertIn('DisclosureGroup("Details"', APP)
         self.assertIn("DocumentPresentationMapper.phaseLabel", APP)
+
+    def test_pipeline_configuration_is_compact_and_core_owned(self):
+        for label in (
+            'Text("Workflow")',
+            'Text("Skip review")',
+            'Toggle("3  Translate English → Russian"',
+            'Label("4  Export"',
+            '"pipeline-create"',
+            '"pipeline-start"',
+            '"pipeline-resume"',
+        ):
+            self.assertIn(label, APP)
+        self.assertNotIn("review_decisions", APP)
 
 
 if __name__ == "__main__":

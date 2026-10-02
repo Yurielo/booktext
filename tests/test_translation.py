@@ -119,17 +119,20 @@ class TranslationTests(unittest.TestCase):
         self.assertFalse(payload["think"])
         self.assertFalse(settings["thinking"])
         self.assertEqual("30s", payload["keep_alive"])
+        self.assertEqual(translation.RESPONSE_JSON_SCHEMA, payload["format"])
         self.assertEqual("30s", settings["keep_alive"])
-        self.assertEqual(translation.MAX_OUTPUT_TOKENS, payload["options"]["num_predict"])
+        self.assertEqual("json_schema", settings["response_format"])
+        self.assertEqual(translation._max_output_tokens_for_source("Hello"), payload["options"]["num_predict"])
 
     def test_model_lease_is_bounded_and_recorded_without_global_unload(self):
         with mock.patch("tools.translation._model_info", side_effect=self.fake_metadata), \
              mock.patch("tools.translation._translate_ollama", side_effect=self.fake_translate) as translated:
             translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", keep_alive="30s")
-        self.assertTrue(all(call.kwargs["keep_alive"] == "30s" for call in translated.call_args_list))
+        self.assertTrue(all(call.kwargs["keep_alive"] == "300s" for call in translated.call_args_list))
         artifact = json.loads((self.root / "translations/en-ru.json").read_text(encoding="utf-8"))
         lifecycle = artifact["provider"]["resource_lifecycle"]
-        self.assertEqual("30s", lifecycle["keep_alive"])
+        self.assertEqual("30s", lifecycle["requested_idle_keep_alive"])
+        self.assertEqual("300s", lifecycle["execution_keep_alive"])
         self.assertIn("never stops the shared daemon", lifecycle["policy"])
         with self.assertRaisesRegex(ValueError, "bounded duration"):
             translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", keep_alive="forever")
@@ -153,6 +156,79 @@ class TranslationTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
         self.assertEqual("30s", cancelled[0]["keep_alive"])
+
+    @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
+    def test_transient_provider_request_retries_only_the_same_logical_unit(self, _metadata):
+        calls = []
+        def transient(**kwargs):
+            calls.append(kwargs["source"])
+            if len(calls) == 1:
+                raise translation.TranslationProviderRequestError("simulated temporary local failure")
+            return self.fake_translate(**kwargs)
+        with mock.patch("tools.translation._translate_ollama", side_effect=transient):
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=1)
+        self.assertEqual(["HELLO", "HELLO", "Value 12.5 mg on 1/2 page."], calls)
+        artifact = json.loads((self.root / "translations/en-ru.json").read_text())
+        first = artifact["blocks"][0]["attempts"][0]
+        self.assertEqual(2, first["provider_request_attempts"])
+        self.assertEqual(1, len(first["provider_request_failures"]))
+
+    @mock.patch("tools.translation.urllib.request.urlopen")
+    def test_malformed_provider_json_is_retryable_request_failure(self, urlopen):
+        response = mock.MagicMock()
+        response.read.return_value = b'{"message":{"content":"not json"}}'
+        urlopen.return_value.__enter__.return_value = response
+        with self.assertRaisesRegex(translation.TranslationProviderRequestError, "translation JSON object"):
+            translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+
+    @mock.patch("tools.translation.urllib.request.urlopen")
+    def test_short_target_script_non_json_response_is_preserved_as_review_evidence(self, urlopen):
+        response = mock.MagicMock()
+        response.read.return_value = '{"message":{"content":"КОРЬ"}}'.encode("utf-8")
+        urlopen.return_value.__enter__.return_value = response
+        translated, settings = translation._translate_ollama(endpoint="http://local", model="test", source="MEASLES", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+        self.assertEqual("КОРЬ", translated)
+        self.assertTrue(settings["response_format_fallback"])
+
+    def test_plain_provider_fallback_is_never_accepted_as_clean_translation(self):
+        signals = translation._response_quality("MEASLES", "КОРЬ", source_language="en", target_language="ru", kind="heading", glossary={}, before="", after="", response={"response_format_fallback": True})
+        self.assertIn("provider_response_format_requires_review", signals)
+
+    @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
+    def test_provider_retry_uses_bounded_escalating_timeout_for_same_unit(self, _metadata):
+        observed = []
+        def transient(**kwargs):
+            observed.append((kwargs["source"], kwargs["timeout"]))
+            if len(observed) == 1:
+                raise translation.TranslationProviderRequestError("simulated timeout")
+            return self.fake_translate(**kwargs)
+        with mock.patch("tools.translation._translate_ollama", side_effect=transient):
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", timeout=120, chunk_size=1)
+        self.assertEqual([("HELLO", 120), ("HELLO", 240)], observed[:2])
+
+    def test_execution_lease_covers_the_bounded_request_without_becoming_unbounded(self):
+        self.assertEqual("300s", translation._effective_request_keep_alive("30s", 120))
+        self.assertEqual("300s", translation._effective_request_keep_alive("30s", 300))
+        self.assertEqual("30s", translation._effective_request_keep_alive("30s", 1))
+
+    def test_output_budget_is_logical_unit_sized_and_bounded(self):
+        self.assertEqual(128, translation._max_output_tokens_for_source("MEASLES"))
+        self.assertEqual(2048, translation._max_output_tokens_for_source("x" * 2000))
+
+    def test_explicit_qwen_thinking_envelope_is_not_emitted_as_translation(self):
+        self.assertEqual('{"translation":"КОРЬ"}', translation._strip_model_thinking('<think>reasoning</think>\n{"translation":"КОРЬ"}'))
+
+    @mock.patch("tools.translation.urllib.request.urlopen")
+    def test_short_heading_uses_bounded_plain_target_contract(self, urlopen):
+        response = mock.MagicMock()
+        response.read.return_value = '{"message":{"content":"КОРЬ"}}'.encode("utf-8")
+        urlopen.return_value.__enter__.return_value = response
+        translated, settings = translation._translate_ollama(endpoint="http://local", model="test", source="MEASLES", source_language="en", target_language="ru", before="before", after="after", glossary={}, timeout=1, document_context={"block_type": "heading"})
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertNotIn("format", payload)
+        self.assertEqual(64, payload["options"]["num_predict"])
+        self.assertEqual("КОРЬ", translated)
+        self.assertEqual("plain_short_heading", settings["response_format"])
 
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     def test_logical_unit_checkpoints_resume_without_retranslating_completed_units(self, _metadata):

@@ -112,6 +112,20 @@ class ProjectHistoryTests(unittest.TestCase):
         (translations / "en-ru.json").write_text(json.dumps({"artifact_type": "booktext.translation", "validation": {"valid": True, "stale": False}}), encoding="utf-8")
         code, events = self._history_command(); self.assertEqual("TRANSLATION_READY", events[-1]["details"]["projects"][0]["state"])
 
+    def test_pipeline_projection_is_read_from_project_owned_state(self):
+        from tools import sequential_pipeline
+        definition = sequential_pipeline.default_definition(review_policy="skip_human_review", export_formats=["docx"])
+        pipeline, _ = sequential_pipeline.create(self.root, source=self.source, definition=definition)
+        sequential_pipeline.mark_running(self.root, pipeline, pipeline["stages"][0])
+        protocol.update_job(self.root, status="running", last_phase="ocr")
+        project_history.record(self.root, protocol.read_job(self.root), history_path=self.history)
+        code, events = self._history_command()
+        self.assertEqual(0, code)
+        row = events[-1]["details"]["projects"][0]
+        self.assertEqual("PIPELINE_RUNNING", row["state"])
+        self.assertEqual("process", row["pipeline_current_stage"])
+        self.assertEqual([], row["pipeline_completed_stages"])
+
     def test_missing_source_workspace_and_malformed_entry_are_controlled(self):
         project_history.record(self.root, self.state, history_path=self.history)
         self.source.unlink()
