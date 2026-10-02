@@ -27,6 +27,8 @@ import BookTextCore
     @Published var includePDF = false
     @Published var cleanupBusy = false
     @Published private(set) var recentOutputPaths: [String] = []
+    @Published private(set) var projects: [ProjectHistoryEntry] = []
+    @Published private(set) var historyWarning = ""
     @Published private(set) var resumedRun = false
     @Published private(set) var buildingFinalBook = false
     private var bridge: CoreProcessBridge?
@@ -51,6 +53,7 @@ import BookTextCore
             return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && directory.boolValue
         }
         UserDefaults.standard.set(recentOutputPaths, forKey: "booktext.recent.outputs")
+        loadProjectHistory(knownOutputs: recentOutputPaths)
     }
     func clearRecents() {
         recentOutputPaths = []
@@ -61,6 +64,27 @@ import BookTextCore
         recentOutputPaths = RecentOutputList.normalized(recentOutputPaths, adding: url.path)
         UserDefaults.standard.set(recentOutputPaths, forKey: "booktext.recent.outputs")
         UserDefaults.standard.set(url.path, forKey: "booktext.last.output")
+    }
+    private func loadProjectHistory(knownOutputs: [String] = []) {
+        let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath))
+        let arguments = ["project-history"] + knownOutputs.flatMap { ["--known-output", $0] }
+        do { try client.start(arguments: arguments, event: { [weak self] event in Task { @MainActor in
+            guard let self, event.eventType == .jobCompleted else { return }
+            let details = event.details.object ?? [:]
+            self.projects = details["projects"]?.values?.compactMap(ProjectHistoryEntry.init) ?? []
+            self.historyWarning = details["warnings"]?.values?.compactMap(\.string).joined(separator: "\n") ?? ""
+        } }, stderr: { _ in }, finished: { _ in }) } catch { historyWarning = "Project history is unavailable: \(error.localizedDescription)" }
+    }
+    func removeProject(_ project: ProjectHistoryEntry) {
+        let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath))
+        do { try client.start(arguments: ["project-remove", project.id], event: { [weak self] event in Task { @MainActor in
+            guard event.eventType == .jobCompleted else { return }
+            self?.projects.removeAll { $0.id == project.id }
+        } }, stderr: { _ in }, finished: { _ in }) } catch { historyWarning = "Could not remove project from history: \(error.localizedDescription)" }
+    }
+    func openProject(_ project: ProjectHistoryEntry) {
+        guard project.reopenAvailable else { errorText = project.detailForUnavailable; presentation.state = .failed; return }
+        inspect(URL(fileURLWithPath: project.outputPath))
     }
     func addFiles(_ urls: [URL]) {
         sourceURLs = urls; outputURL = nil; result = [:]; ready = false; resumedRun = false
@@ -117,9 +141,9 @@ import BookTextCore
         outputURL = url.standardizedFileURL; sourceURLs = []; result = [:]; errorText = ""
         presentation = JobPresentation(state: .running, phase: "prepare"); rememberOutput(url)
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
-        do { try client.start(arguments: ["inspect", url.path], event: { [weak self] event in Task { @MainActor in
+        do { try client.start(arguments: ["inspect", url.path, "--record-activity"], event: { [weak self] event in Task { @MainActor in
             guard let self else { return }; self.presentation.consume(event)
-            if event.eventType == .jobCompleted { self.result = event.details.object ?? [:]; self.presentation.state = .completed }
+            if event.eventType == .jobCompleted { self.result = event.details.object ?? [:]; self.presentation.state = .completed; self.loadProjectHistory() }
             if event.eventType == .jobFailed { self.errorText = "\(event.code): \(event.message)" }
         } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in
             guard let self else { return }
@@ -215,14 +239,22 @@ struct ContentView: View {
         }
     }
     @ViewBuilder private var recentDocuments: some View {
-        if !model.recentOutputPaths.isEmpty {
+        if !model.projects.isEmpty || !model.historyWarning.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Recent documents").font(.headline)
-                ForEach(model.recentOutputPaths.prefix(5), id: \.self) { path in
-                    Button { model.inspect(URL(fileURLWithPath: path)) } label: {
-                        HStack { Image(systemName: "book.closed"); Text(displayName(for: path)).lineLimit(1); Spacer(); Text("Open existing output").font(.caption).foregroundStyle(.secondary); Image(systemName: "chevron.right").foregroundStyle(.tertiary) }.contentShape(Rectangle())
-                    }.buttonStyle(.plain).padding(.vertical, 7)
+                Text("Recent Projects").font(.headline)
+                ForEach(model.projects.prefix(8)) { project in
+                    HStack(spacing: 10) {
+                        Image(systemName: project.availability == "AVAILABLE" ? "book.closed" : "exclamationmark.triangle").foregroundStyle(project.availability == "AVAILABLE" ? Color.accentColor : Color.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(project.name).lineLimit(1)
+                            Text(projectMetadata(project)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        Button(project.action) { model.openProject(project) }.disabled(!project.reopenAvailable)
+                        Menu { Button("Remove from History", role: .destructive) { model.removeProject(project) } } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton)
+                    }.padding(.vertical, 6)
                 }
+                if !model.historyWarning.isEmpty { Text(model.historyWarning).font(.caption).foregroundStyle(.orange) }
             }.padding(.horizontal, 4)
         }
     }
@@ -283,7 +315,11 @@ struct ContentView: View {
     private var lifecycleSymbol: String { model.snapshot.state == .reviewRequired ? "exclamationmark.circle.fill" : "checkmark.circle.fill" }
     private var progressDescription: String { if let current = model.presentation.current, let total = model.presentation.total { return "\(current) of \(total)" + (model.presentation.page.map { " · page \($0)" } ?? "") }; return model.presentation.page.map { "Page \($0)" } ?? "Working…" }
     private func refreshCurrentOutput() { if let output = model.outputURL { model.inspect(output) } }
-    private func displayName(for path: String) -> String { let name = URL(fileURLWithPath: path).lastPathComponent; return name.hasSuffix("_book") ? String(name.dropLast(5)) : name }
+    private func projectMetadata(_ project: ProjectHistoryEntry) -> String {
+        let pages = project.pageCount.map { "\($0) pages" } ?? "pages unknown"
+        let translation = project.translationState == "NOT_STARTED" ? "" : " · translation \(project.translationState.lowercased())"
+        return "\(project.state.replacingOccurrences(of: "_", with: " ")) · \(pages)\(translation)"
+    }
     private func chooseFiles() {
         let panel = NSOpenPanel(); panel.allowsMultipleSelection = true; panel.canChooseDirectories = false
         panel.allowedContentTypes = [.pdf, .image, .plainText, .rtf, UTType(filenameExtension: "djvu") ?? .data, UTType(filenameExtension: "djv") ?? .data, UTType(filenameExtension: "docx") ?? .data]

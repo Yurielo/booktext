@@ -21,7 +21,7 @@ class NativeUXV2ContractTests(unittest.TestCase):
             'Button("Export…")',
         ):
             self.assertIn(label, main)
-        self.assertIn('Text("Recent documents")', main)
+        self.assertIn('Text("Recent Projects")', main)
         self.assertIn('Button("Open Existing BookText Output…"', main)
 
     def test_developer_controls_are_progressively_disclosed(self):
@@ -42,7 +42,7 @@ class NativeUXV2ContractTests(unittest.TestCase):
             "translationReady", "failed",
         ):
             self.assertRegex(PRESENTATION, rf"case {state}\b")
-        self.assertIn('arguments: ["inspect", url.path]', APP)
+        self.assertIn('arguments: ["inspect", url.path, "--record-activity"]', APP)
         self.assertIn('arguments: ["cleanup", outputURL.path]', APP)
         self.assertNotIn("review_decisions", APP)
         self.assertNotIn("book_document.json", APP)

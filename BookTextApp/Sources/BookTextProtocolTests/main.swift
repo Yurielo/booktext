@@ -111,6 +111,26 @@ func recentsAndExportSelectionArePresentationOnly() throws {
     try check(formats == ["docx", "pdf"], "export sheet must pass only supported selected formats in stable order")
 }
 
+func projectHistoryUsesCoreProjectionAndStableIdentity() throws {
+    let item = JSONValue.object([
+        "project_id": .string("job-stable"), "name": .string("A book"), "output_dir": .string("/tmp/book"),
+        "state": .string("REVIEW_REQUIRED"), "action": .string("Review items"), "availability": .string("AVAILABLE"),
+        "page_count": .number(7), "translation_state": .string("NOT_STARTED"), "last_activity_at": .string("2026-01-01T00:00:00Z")
+    ])
+    let entry = try unwrap(ProjectHistoryEntry(item), "Core history entry must decode")
+    try check(entry.id == "job-stable" && entry.pageCount == 7, "stable Core identity and page count")
+    let data: [String: JSONValue] = [
+        "project": .object(["state": .string("REVIEW_REQUIRED")]),
+        "run_summary": .object(["processed": .number(7)]),
+        "review": .object(["unresolved_priority_counts": .object(["HIGH": .number(2), "MEDIUM": .number(0)])]),
+        "artifacts": .object(["final_build": .object(["exists": .bool(false)]), "cdm": .object(["exists": .bool(false)]), "translations": .object(["exists": .bool(false)])])
+    ]
+    let snapshot = DocumentPresentationMapper.snapshot(sourceSelected: false, outputSelected: true, jobState: .completed, inspection: data)
+    try check(snapshot.state == .reviewRequired && snapshot.primaryAction == .reviewItems, "existing state must come from Core projection")
+    let unavailable = ProjectHistoryEntry(.object(["project_id": .string("missing"), "output_dir": .string("/missing"), "availability": .string("SOURCE_UNAVAILABLE"), "reopen_available": .bool(true)]))!
+    try check(unavailable.detailForUnavailable.contains("Source unavailable") && unavailable.reopenAvailable, "moved source remains reopenable and controlled")
+}
+
 func unwrap<T>(_ value: T?, _ message: String) throws -> T {
     guard let value else { throw NSError(domain: "BookTextProtocolTests", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
     return value
@@ -128,6 +148,6 @@ func readerBoundariesAndWarningsUseOnlyCoreEvidence() throws {
 
 do {
     try readerBoundariesAndWarningsUseOnlyCoreEvidence()
-    try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping(); try reviewPayloadFixtureDecodesWithoutTerminalParsing(); try shortLivedCoreDeliversItsFinalJSONLEvent(); try documentCentricStateMapping(); try recentsAndExportSelectionArePresentationOnly()
+    try protocolFixtureAndUnknownEvent(); try progressCompletionFailureAndCancellationTransitions(); try safeArgumentArrayAndArtifactMapping(); try reviewPayloadFixtureDecodesWithoutTerminalParsing(); try shortLivedCoreDeliversItsFinalJSONLEvent(); try documentCentricStateMapping(); try recentsAndExportSelectionArePresentationOnly(); try projectHistoryUsesCoreProjectionAndStableIdentity()
     print("BookTextProtocolTests: PASS")
 } catch { fputs("BookTextProtocolTests: FAIL \(error.localizedDescription)\n", stderr); exit(1) }

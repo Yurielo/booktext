@@ -18,6 +18,9 @@ stderr.
 booktext machine preflight [--operation run|export|cdm|final-build|review|translation]
 booktext machine run SOURCE... -- [existing BookText run options]
 booktext machine inspect OUTPUT_DIR
+booktext machine inspect OUTPUT_DIR --record-activity
+booktext machine project-history [--known-output OUTPUT_DIR ...]
+booktext machine project-remove PROJECT_ID
 booktext machine review OUTPUT_DIR [--page N]
 booktext machine decision OUTPUT_DIR --item ID --action ACTION [...]
 booktext machine final-build OUTPUT_DIR
@@ -30,6 +33,25 @@ booktext machine export OUTPUT_DIR --format FORMAT [--format FORMAT ...]
 The command layer calls existing production Core functions for processing,
 review decisions, final build, CDM build, and publication export. It does not
 duplicate their business logic.
+
+## Durable project history
+
+`project-history` is a Core-owned, versioned local index at
+`~/Library/Application Support/BookText/project-history.json` (or the explicit
+`BOOKTEXT_HISTORY_PATH` used by an integrator). It contains only stable job
+identity, output location, source reference, display name, and activity times.
+It is **not** a second workflow state store: every list/relaunch reconciles a
+row through `inspect`, without OCR, model use, or artifact regeneration.
+
+The resulting `project` projection has one of `READY_TO_PROCESS`,
+`PROCESSING`, `INTERRUPTED_RESUMABLE`, `REVIEW_REQUIRED`,
+`READY_FOR_FINAL_BUILD`, `BOOK_READY`, `TRANSLATING`, `TRANSLATION_READY`, or
+`FAILED`, together with a source/translation availability state and a stable
+action label. A moved source is reported as `SOURCE_UNAVAILABLE`, but a valid
+existing output remains reopenable for review, final-build, translation, or
+export; only a resume that needs the source is blocked. Missing project files
+are reported as `PROJECT_FILES_UNAVAILABLE`. `project-remove` removes only an
+index row and never deletes source or BookText artifacts.
 
 `export` requires at least one format: `markdown`, `html`, `docx`, `epub`,
 `pdf`, or `pdf_image`. `all` is supported only as an explicit format choice;
