@@ -30,7 +30,7 @@ class SequentialPipelineTests(unittest.TestCase):
     def definition(self, *, translation=False, review="skip_human_review", formats=("docx",)):
         return sequential_pipeline.default_definition(
             review_policy=review,
-            translation={"source_language": "en", "target_language": "ru", "provider": "ollama", "model": "qwen3:8b"} if translation else None,
+            translation={"source_language": "en", "target_language": "ru", "provider": "ollama", "model": "translategemma:4b"} if translation else None,
             export_formats=list(formats),
         )
 
@@ -50,6 +50,25 @@ class SequentialPipelineTests(unittest.TestCase):
         translation["stages"][4]["config"]["target_language"] = "en"
         with self.assertRaisesRegex(sequential_pipeline.PipelineError, "distinct"):
             sequential_pipeline.validate_definition(translation)
+
+    def test_legacy_translation_pipeline_migrates_only_after_explicit_command(self):
+        definition = self.definition(translation=True)
+        definition["stages"][4]["config"]["model"] = "qwen3:8b"
+        self.root.mkdir()
+        state = {"schema_version": sequential_pipeline.SCHEMA_VERSION, "artifact_type": sequential_pipeline.ARTIFACT_TYPE,
+                 "pipeline_id": "old", "source": str(self.source), "definition": definition, "status": "PAUSED",
+                 "current_stage_id": "translate", "stages": [{**stage, "status": "COMPLETE" if stage["type"] in {"PROCESS", "REVIEW_POLICY", "FINAL_BUILD", "CDM"} else "PENDING", "artifact_refs": {}} for stage in definition["stages"]],
+                 "completed_stage_ids": ["process", "review", "final-build", "cdm"]}
+        sequential_pipeline.save(self.root, state)
+        with self.assertRaisesRegex(sequential_pipeline.PipelineError, "MODEL_RETIRED"):
+            sequential_pipeline.validate_definition(sequential_pipeline._load(self.root)["definition"])
+        migrated, changed = sequential_pipeline.migrate_legacy_translation(self.root)
+        self.assertTrue(changed)
+        self.assertEqual("qwen3:8b", migrated["migration_history"][0]["previous_stage"]["config"]["model"])
+        self.assertEqual("translategemma:4b", migrated["stages"][4]["config"]["model"])
+        self.assertTrue(sequential_pipeline.validate_definition(migrated["definition"])["valid"])
+        _, changed_again = sequential_pipeline.migrate_legacy_translation(self.root)
+        self.assertFalse(changed_again)
 
     def test_create_is_durable_idempotent_and_machine_accessible(self):
         definition = self.definition()

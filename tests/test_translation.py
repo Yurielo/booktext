@@ -34,7 +34,7 @@ class TranslationTests(unittest.TestCase):
 
     @staticmethod
     def fake_metadata(*_args, **_kwargs):
-        return {"kind": "ollama", "endpoint": "http://local", "model": "test-model", "model_digest": "sha256:test", "model_size_bytes": 1, "api": "/api/chat"}
+        return {"kind": "ollama", "endpoint": "http://local", "model": translation.PRODUCTION_MODEL, "model_digest": "sha256:test", "model_size_bytes": 1, "api": "/api/chat"}
 
     @staticmethod
     def fake_translate(**kwargs):
@@ -42,11 +42,57 @@ class TranslationTests(unittest.TestCase):
         translated = {"HELLO": "ПРИВЕТ", "Value 12.5 mg on 1/2 page.": "Значение 12.5 mg на 1/2 странице."}.get(source, source)
         return translated, {"temperature": 0, "response_format": "json", "glossary_json": "{}"}
 
+    def test_retired_model_is_rejected_before_provider_access(self):
+        with mock.patch("tools.translation._model_info") as provider:
+            with self.assertRaisesRegex(ValueError, "MODEL_RETIRED"):
+                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="qwen3:8b")
+        provider.assert_not_called()
+        result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "booktext.py"), "translate", str(self.root),
+            "--source-language", "en", "--target-language", "ru", "--model", "qwen3:8b"], capture_output=True, text=True)
+        self.assertEqual(5, result.returncode)
+        self.assertEqual("MODEL_RETIRED", json.loads(result.stderr)["code"])
+
+    def test_busy_translation_worker_does_not_start_provider(self):
+        with mock.patch("tools.translation.fcntl.flock", side_effect=BlockingIOError), mock.patch("tools.translation._model_info") as provider:
+            with self.assertRaisesRegex(ValueError, "TRANSLATION_BUSY"):
+                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama")
+        provider.assert_not_called()
+
+    @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
+    @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
+    def test_completed_en_ru_plan_does_not_block_new_ru_en_run(self, _metadata, _translate):
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama")
+        result = translation.translate_document(self.root, source_language="ru", target_language="en", provider="ollama")
+        self.assertTrue(result["validation"]["valid"])
+        self.assertTrue((self.root / "translations/en-ru.json").exists())
+        self.assertTrue((self.root / "translations/ru-en.json").exists())
+
+    @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
+    @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
+    def test_legacy_partial_checkpoint_requires_explicit_migration_and_archives(self, _metadata, translated):
+        with mock.patch("tools.translation._translate_ollama", side_effect=ValueError("interrupted")):
+            with self.assertRaisesRegex(ValueError, "interrupted"):
+                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama")
+        plan_path = self.root / "translations/chunks/translation_plan.json"
+        legacy = json.loads(plan_path.read_text())
+        legacy["options"]["model"] = "qwen3:8b"
+        legacy["options_fingerprint"] = translation._digest(legacy["options"])
+        plan_path.write_text(json.dumps(legacy))
+        with self.assertRaisesRegex(ValueError, "MIGRATION_REQUIRED"):
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama")
+        translated.assert_not_called()
+        result = translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", migrate=True)
+        self.assertTrue(result["validation"]["valid"])
+        archives = list((self.root / "translations/history/checkpoints").glob("*/translation_plan.json"))
+        self.assertEqual(1, len(archives))
+        self.assertEqual("qwen3:8b", json.loads(archives[0].read_text())["options"]["model"])
+        self.assertEqual(translation.PRODUCTION_MODEL, json.loads((self.root / "translations/en-ru.json").read_text())["generation"]["model"])
+
     @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     def test_translation_is_source_anchored_deterministic_and_does_not_edit_cdm(self, _metadata, _translate):
         before = (self.root / "book_document.json").read_bytes()
-        result = translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+        result = translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL)
         self.assertFalse(result["reused"])
         self.assertEqual(before, (self.root / "book_document.json").read_bytes())
         artifact = json.loads((self.root / "translations/en-ru.json").read_text())
@@ -56,14 +102,14 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual("skipped_already_target_language", artifact["blocks"][2]["status"])
         self.assertTrue((self.root / "translations/book-en-ru.md").is_file())
         self.assertTrue((self.root / "translations/book-en-ru-bilingual.md").is_file())
-        reused = translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+        reused = translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL)
         self.assertTrue(reused["reused"])
         self.assertEqual(2, _translate.call_count)
 
     @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     def test_cli_validate_needs_no_model_or_provider(self, _metadata, _translate):
-        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL)
         result = subprocess.run(
             [sys.executable, str(Path(__file__).parents[1] / "booktext.py"), "translate", str(self.root),
              "--source-language", "en", "--target-language", "ru", "--validate"],
@@ -75,12 +121,12 @@ class TranslationTests(unittest.TestCase):
     @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     def test_changed_source_marks_existing_translation_stale_and_archives_prior_revision(self, _metadata, _translate):
-        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL)
         self.document["blocks"][1]["text"] = "Value 14 mg."
         (self.root / "book_document.json").write_text(json.dumps(self.document), encoding="utf-8")
         stale = translation.validate_translation(self.root, source_language="en", target_language="ru")
         self.assertTrue(stale["stale"])
-        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, migrate=True)
         self.assertTrue(list((self.root / "translations/history").glob("en-ru-*.json")))
 
     @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
@@ -90,7 +136,7 @@ class TranslationTests(unittest.TestCase):
         self.document["blocks"][1]["text"] = "An example, i. e. the explanation in ordinary prose."
         self.document["blocks"][1]["provenance"]["layout_label"] = "Text"
         (self.root / "book_document.json").write_text(json.dumps(self.document))
-        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL)
         calls = _translate.call_count
         raw_translation = (self.root / "translations/en-ru.json").read_bytes()
         text_normalization.project(self.document["blocks"], [b.get("text", "") for b in self.document["blocks"]])
@@ -102,32 +148,34 @@ class TranslationTests(unittest.TestCase):
     @mock.patch("tools.translation._translate_ollama", return_value=("Значение 12.6 mg на 1/2 странице.", {}))
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     def test_numeric_changes_are_never_silently_verified(self, _metadata, _translate):
-        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL)
         artifact = json.loads((self.root / "translations/en-ru.json").read_text())
         number_entry = next(item for item in artifact["blocks"] if item["block_id"] == "b2")
         self.assertEqual("needs_numeric_review", number_entry["status"])
         self.assertEqual("FAIL", number_entry["validation"]["numeric_tokens"])
 
     @mock.patch("tools.translation.urllib.request.urlopen")
-    def test_ollama_translation_disables_reasoning_and_records_setting(self, urlopen):
+    def test_ollama_uses_translate_gemma_plain_text_contract(self, urlopen):
         response = mock.MagicMock()
-        response.read.return_value = b'{"message":{"content":"{\\\"translation\\\": \\\"\\u041f\\u0440\\u0438\\u0432\\u0435\\u0442\\\"}"}}'
+        response.read.return_value = json.dumps({"message": {"content": "Привет"}, "done_reason": "stop"}, ensure_ascii=False).encode()
         urlopen.return_value.__enter__.return_value = response
-        translated, settings = translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+        translated, settings = translation._translate_ollama(endpoint="http://local", model=translation.PRODUCTION_MODEL, source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
         self.assertEqual("Привет", translated)
         payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertFalse(payload["think"])
-        self.assertFalse(settings["thinking"])
-        self.assertEqual("30s", payload["keep_alive"])
-        self.assertEqual(translation.RESPONSE_JSON_SCHEMA, payload["format"])
-        self.assertEqual("30s", settings["keep_alive"])
-        self.assertEqual("json_schema", settings["response_format"])
-        self.assertEqual(translation._max_output_tokens_for_source("Hello"), payload["options"]["num_predict"])
+        self.assertNotIn("think", payload)
+        self.assertNotIn("format", payload)
+        self.assertEqual(1, len(payload["messages"]))
+        self.assertEqual("user", payload["messages"][0]["role"])
+        self.assertIn("English (en) to Russian (ru)", payload["messages"][0]["content"])
+        self.assertTrue(payload["messages"][0]["content"].endswith("\n\n\nHello"))
+        self.assertEqual("plain_text", settings["response_format"])
+        self.assertEqual(translation.PROMPT_VERSION, settings["prompt_version"])
+
 
     def test_model_lease_is_bounded_and_recorded_without_global_unload(self):
         with mock.patch("tools.translation._model_info", side_effect=self.fake_metadata), \
              mock.patch("tools.translation._translate_ollama", side_effect=self.fake_translate) as translated:
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", keep_alive="30s")
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, keep_alive="30s")
         self.assertTrue(all(call.kwargs["keep_alive"] == "300s" for call in translated.call_args_list))
         artifact = json.loads((self.root / "translations/en-ru.json").read_text(encoding="utf-8"))
         lifecycle = artifact["provider"]["resource_lifecycle"]
@@ -135,9 +183,9 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual("300s", lifecycle["execution_keep_alive"])
         self.assertIn("never stops the shared daemon", lifecycle["policy"])
         with self.assertRaisesRegex(ValueError, "bounded duration"):
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", keep_alive="forever")
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, keep_alive="forever")
         with self.assertRaisesRegex(ValueError, "between 1ms and 300s"):
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", keep_alive="6m")
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, keep_alive="6m")
 
     def test_failure_timeout_and_cancellation_keep_the_bounded_lease(self):
         observed = []
@@ -146,7 +194,7 @@ class TranslationTests(unittest.TestCase):
             raise urllib.error.URLError("simulated transport failure")
         with mock.patch("tools.translation.urllib.request.urlopen", side_effect=failed_request):
             with self.assertRaisesRegex(ValueError, "translation request failed"):
-                translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+                translation._translate_ollama(endpoint="http://local", model=translation.PRODUCTION_MODEL, source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
         self.assertEqual("30s", observed[0]["keep_alive"])
         cancelled = []
         def cancelled_request(request, timeout):
@@ -154,7 +202,7 @@ class TranslationTests(unittest.TestCase):
             raise KeyboardInterrupt
         with mock.patch("tools.translation.urllib.request.urlopen", side_effect=cancelled_request):
             with self.assertRaises(KeyboardInterrupt):
-                translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+                translation._translate_ollama(endpoint="http://local", model=translation.PRODUCTION_MODEL, source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
         self.assertEqual("30s", cancelled[0]["keep_alive"])
 
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
@@ -166,7 +214,7 @@ class TranslationTests(unittest.TestCase):
                 raise translation.TranslationProviderRequestError("simulated temporary local failure")
             return self.fake_translate(**kwargs)
         with mock.patch("tools.translation._translate_ollama", side_effect=transient):
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=1)
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, chunk_size=1)
         self.assertEqual(["HELLO", "HELLO", "Value 12.5 mg on 1/2 page."], calls)
         artifact = json.loads((self.root / "translations/en-ru.json").read_text())
         first = artifact["blocks"][0]["attempts"][0]
@@ -174,21 +222,14 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(1, len(first["provider_request_failures"]))
 
     @mock.patch("tools.translation.urllib.request.urlopen")
-    def test_malformed_provider_json_is_retryable_request_failure(self, urlopen):
+    def test_empty_or_truncated_plain_response_fails(self, urlopen):
         response = mock.MagicMock()
-        response.read.return_value = b'{"message":{"content":"not json"}}'
         urlopen.return_value.__enter__.return_value = response
-        with self.assertRaisesRegex(translation.TranslationProviderRequestError, "translation JSON object"):
-            translation._translate_ollama(endpoint="http://local", model="test", source="Hello", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
+        for content, done_reason in (("", "stop"), ("КОРЬ", "length")):
+            response.read.return_value = json.dumps({"message": {"content": content}, "done_reason": done_reason}, ensure_ascii=False).encode()
+            with self.assertRaises(translation.TranslationProviderRequestError):
+                translation._translate_ollama(endpoint="http://local", model=translation.PRODUCTION_MODEL, source="MEASLES", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
 
-    @mock.patch("tools.translation.urllib.request.urlopen")
-    def test_short_target_script_non_json_response_is_preserved_as_review_evidence(self, urlopen):
-        response = mock.MagicMock()
-        response.read.return_value = '{"message":{"content":"КОРЬ"}}'.encode("utf-8")
-        urlopen.return_value.__enter__.return_value = response
-        translated, settings = translation._translate_ollama(endpoint="http://local", model="test", source="MEASLES", source_language="en", target_language="ru", before="", after="", glossary={}, timeout=1)
-        self.assertEqual("КОРЬ", translated)
-        self.assertTrue(settings["response_format_fallback"])
 
     def test_plain_provider_fallback_is_never_accepted_as_clean_translation(self):
         signals = translation._response_quality("MEASLES", "КОРЬ", source_language="en", target_language="ru", kind="heading", glossary={}, before="", after="", response={"response_format_fallback": True})
@@ -203,7 +244,7 @@ class TranslationTests(unittest.TestCase):
                 raise translation.TranslationProviderRequestError("simulated timeout")
             return self.fake_translate(**kwargs)
         with mock.patch("tools.translation._translate_ollama", side_effect=transient):
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", timeout=120, chunk_size=1)
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, timeout=120, chunk_size=1)
         self.assertEqual([("HELLO", 120), ("HELLO", 240)], observed[:2])
 
     def test_execution_lease_covers_the_bounded_request_without_becoming_unbounded(self):
@@ -215,20 +256,17 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(128, translation._max_output_tokens_for_source("MEASLES"))
         self.assertEqual(2048, translation._max_output_tokens_for_source("x" * 2000))
 
-    def test_explicit_qwen_thinking_envelope_is_not_emitted_as_translation(self):
-        self.assertEqual('{"translation":"КОРЬ"}', translation._strip_model_thinking('<think>reasoning</think>\n{"translation":"КОРЬ"}'))
-
     @mock.patch("tools.translation.urllib.request.urlopen")
-    def test_short_heading_uses_bounded_plain_target_contract(self, urlopen):
+    def test_heading_uses_same_plain_text_contract(self, urlopen):
         response = mock.MagicMock()
-        response.read.return_value = '{"message":{"content":"КОРЬ"}}'.encode("utf-8")
+        response.read.return_value = json.dumps({"message": {"content": "КОРЬ"}, "done_reason": "stop"}, ensure_ascii=False).encode()
         urlopen.return_value.__enter__.return_value = response
-        translated, settings = translation._translate_ollama(endpoint="http://local", model="test", source="MEASLES", source_language="en", target_language="ru", before="before", after="after", glossary={}, timeout=1, document_context={"block_type": "heading"})
+        translated, settings = translation._translate_ollama(endpoint="http://local", model=translation.PRODUCTION_MODEL, source="MEASLES", source_language="en", target_language="ru", before="before", after="after", glossary={}, timeout=1, document_context={"block_type": "heading"})
         payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
         self.assertNotIn("format", payload)
-        self.assertEqual(64, payload["options"]["num_predict"])
         self.assertEqual("КОРЬ", translated)
-        self.assertEqual("plain_short_heading", settings["response_format"])
+        self.assertEqual("plain_text", settings["response_format"])
+
 
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     def test_logical_unit_checkpoints_resume_without_retranslating_completed_units(self, _metadata):
@@ -242,13 +280,13 @@ class TranslationTests(unittest.TestCase):
             return self.fake_translate(**kwargs)
         with mock.patch("tools.translation._translate_ollama", side_effect=interrupted):
             with self.assertRaisesRegex(ValueError, "interruption"):
-                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=1)
+                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, chunk_size=1)
             plan_path = self.root / "translations/chunks/translation_plan.json"
             plan = json.loads(plan_path.read_text())
             self.assertEqual("complete", plan["chunks"][0]["status"])
             self.assertEqual("failed", plan["chunks"][1]["status"])
             self.assertTrue((self.root / plan["chunks"][0]["artifacts"]["checkpoint"]).is_file())
-            result = translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=1)
+            result = translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, chunk_size=1)
         self.assertEqual(["HELLO", "Value 12.5 mg on 1/2 page.", "Value 12.5 mg on 1/2 page."], calls)
         self.assertEqual(["chunk-0001"], result["execution"]["resumed_chunks"])
         artifact = json.loads((self.root / "translations/en-ru.json").read_text())
@@ -262,7 +300,7 @@ class TranslationTests(unittest.TestCase):
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
     def test_chunk_plan_context_is_read_only_and_source_anchored(self, _translate, _metadata):
-        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=1)
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, chunk_size=1)
         plan = json.loads((self.root / "translations/chunks/translation_plan.json").read_text())
         self.assertEqual(["b1"], plan["chunks"][0]["owned_unit_ids"])
         self.assertEqual(["b2"], plan["chunks"][0]["context_after_unit_ids"])
@@ -284,11 +322,11 @@ class TranslationTests(unittest.TestCase):
 
         with mock.patch("tools.translation._translate_ollama", side_effect=interrupted):
             with self.assertRaisesRegex(ValueError, "neighbour failure"):
-                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=2)
+                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, chunk_size=2)
             partial = self.root / "translations/chunks/chunk-0001/partial-checkpoint.json"
             self.assertTrue(partial.is_file())
             self.assertEqual(["b1"], [entry["block_id"] for entry in json.loads(partial.read_text())["entries"]])
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", chunk_size=2)
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, chunk_size=2)
         self.assertEqual(["HELLO", "Value 12.5 mg on 1/2 page.", "Value 12.5 mg on 1/2 page."], calls)
         self.assertFalse(partial.exists())
 
@@ -297,7 +335,7 @@ class TranslationTests(unittest.TestCase):
         first_glossary = self.root / "first-glossary.json"; first_glossary.write_text(json.dumps({"HELLO": "ПРИВЕТ"}), encoding="utf-8")
         second_glossary = self.root / "second-glossary.json"; second_glossary.write_text(json.dumps({"HELLO": "ПРИВЕТ", "Value": "Значение"}), encoding="utf-8")
         with mock.patch("tools.translation._translate_ollama", side_effect=self.fake_translate):
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", glossary_path=first_glossary, block_ids=["b1", "b2"], chunk_size=2)
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, glossary_path=first_glossary, block_ids=["b1", "b2"], chunk_size=2)
         calls, failed_once = [], {"value": False}
         def interrupted(**kwargs):
             calls.append(kwargs["source"])
@@ -307,8 +345,8 @@ class TranslationTests(unittest.TestCase):
             return self.fake_translate(**kwargs)
         with mock.patch("tools.translation._translate_ollama", side_effect=interrupted):
             with self.assertRaisesRegex(ValueError, "new revision interruption"):
-                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", glossary_path=second_glossary, block_ids=["b1", "b2"], chunk_size=2)
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", glossary_path=second_glossary, block_ids=["b1", "b2"], chunk_size=2)
+                translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, glossary_path=second_glossary, block_ids=["b1", "b2"], chunk_size=2, migrate=True)
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, glossary_path=second_glossary, block_ids=["b1", "b2"], chunk_size=2)
         self.assertEqual(["HELLO", "Value 12.5 mg on 1/2 page.", "Value 12.5 mg on 1/2 page."], calls)
 
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
@@ -316,7 +354,7 @@ class TranslationTests(unittest.TestCase):
         self.document["blocks"][1]["text"] = "biomagnetical-"
         (self.root / "book_document.json").write_text(json.dumps(self.document), encoding="utf-8")
         with mock.patch("tools.translation._translate_ollama", return_value=("биомагнитный-", {"done_reason": "stop"})) as translated:
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model")
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL)
         entry = next(item for item in json.loads((self.root / "translations/en-ru.json").read_text())["blocks"] if item["block_id"] == "b2")
         self.assertEqual("needs_quality_review", entry["status"])
         self.assertIn("source_boundary_hyphen_requires_review", entry["validation"]["quality_signals"])
@@ -328,7 +366,7 @@ class TranslationTests(unittest.TestCase):
         (self.root / "book_document.json").write_text(json.dumps(self.document), encoding="utf-8")
         glossary = self.root / "glossary.json"; glossary.write_text(json.dumps({"Magic Wand": "Магический жезл"}), encoding="utf-8")
         with mock.patch("tools.translation._translate_ollama", return_value=("Магический палец", {"done_reason": "stop"})) as translated:
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", glossary_path=glossary)
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, glossary_path=glossary)
         entry = next(item for item in json.loads((self.root / "translations/en-ru.json").read_text())["blocks"] if item.get("block_id") == "b2")
         self.assertEqual("needs_quality_review", entry["status"])
         self.assertEqual(1, len(entry["attempts"]))
@@ -348,7 +386,7 @@ class TranslationTests(unittest.TestCase):
     @mock.patch("tools.translation._translate_ollama", side_effect=fake_translate.__func__)
     @mock.patch("tools.translation._model_info", side_effect=fake_metadata.__func__)
     def test_bounded_pilot_owns_selected_units_but_uses_full_cdm_context(self, _metadata, translated):
-        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", block_ids=["b2"])
+        translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, block_ids=["b2"])
         artifact = json.loads((self.root / "translations/en-ru.json").read_text())
         self.assertEqual(["b2"], artifact["source"]["selected_block_ids"])
         self.assertEqual(["b2"], [entry["block_id"] for entry in artifact["blocks"]])
@@ -358,10 +396,10 @@ class TranslationTests(unittest.TestCase):
 
     def test_direction_and_glossary_validation_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "direction"):
-            translation.translate_document(self.root, source_language="en", target_language="en", provider="ollama", model="test-model")
+            translation.translate_document(self.root, source_language="en", target_language="en", provider="ollama", model=translation.PRODUCTION_MODEL)
         glossary = self.root / "bad.json"; glossary.write_text("[]", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "glossary"):
-            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model="test-model", glossary_path=glossary)
+            translation.translate_document(self.root, source_language="en", target_language="ru", provider="ollama", model=translation.PRODUCTION_MODEL, glossary_path=glossary)
 
 
 if __name__ == "__main__":

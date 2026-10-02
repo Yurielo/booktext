@@ -199,12 +199,12 @@ unresolved review и fallback/unknown counts. Подробный contract и л�
 ### Производный перевод EN↔RU
 
 Перевод запускается только явно и только от уже проверенного CDM. В первой
-версии поддержан локальный Ollama без скрытой модели или облачного fallback:
+версии поддержан локальный Ollama с единственной моделью перевода `translategemma:4b` без облачного fallback:
 
 ```bash
 python3 booktext.py translate /path/to/book_output \
   --source-language en --target-language ru \
-  --provider ollama --model qwen3:8b
+  --provider ollama
 ```
 
 Результат находится в `translations/`: block-level provenance, модель и
@@ -245,7 +245,7 @@ python3 booktext.py machine project-history
 python3 booktext.py machine project-remove JOB_ID
 python3 booktext.py machine export /path/to/book_output --format html
 python3 booktext.py machine translation /path/to/book_output \
-  --source-language en --target-language ru --model qwen3:8b
+  --source-language en --target-language ru
 python3 booktext.py machine translation-export /path/to/book_output \
   --source-language en --target-language ru --format docx
 ```

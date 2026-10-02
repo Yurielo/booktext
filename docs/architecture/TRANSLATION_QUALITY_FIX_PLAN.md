@@ -1,3 +1,5 @@
+> Superseded by BookText Issue #131. This historical Qwen research plan is not an active production instruction.
+
 # План исправления качества перевода BookText
 
 Цель — уменьшить обнаруженные ошибки перевода и предотвратить их незаметное попадание в готовую книгу, сохранив локальную модель `qwen3:8b`. Исправления должны работать в существующем translation workflow, сохранять исходники, иллюстрации и возможность продолжения с checkpoint.

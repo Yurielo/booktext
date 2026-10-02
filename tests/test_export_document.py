@@ -5,8 +5,10 @@ import unittest
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 from tools.export_document import export_document, export_translation, _enable_docx_text_wrapping, _format_wide_docx_tables, WP, W, A
+from tools import translation
 
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACAQAAAABazTCJAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAACYktHRAAB3YoTpAAAAAd0SU1FB+oJHAcpDsplvHsAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDktMjhUMDc6NDE6MTQrMDA6MDAdjJROAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTA5LTI4VDA3OjQxOjE0KzAwOjAwbNEs8gAAACh0RVh0ZGF0ZTp0aW1lc3RhbXAAMjAyNi0wOS0yOFQwNzo0MToxNCswMDowMDvEDS0AAAAMSURBVAjXYzjAcAAAAwQBgcU7oqkAAAAASUVORK5CYII=")
@@ -136,6 +138,22 @@ class ExportDocumentTests(unittest.TestCase):
         markdown = (self.root / "translations/exports/en-ru/book-en-ru.md").read_text(encoding="utf-8")
         self.assertIn("Перевод: Corrected prose", markdown)
         self.assertNotIn("Unknown layout block", markdown)
+
+    def test_archived_qwen_translation_exports_without_model_inference(self):
+        source = (self.root / "book_document.json").read_bytes()
+        entries = [{"block_id": block["block_id"], "source_text_sha256": translation._sha_bytes(block["text"].encode()),
+                    "status": "machine_translated", "translation": "Legacy " + block["text"]}
+                   for block in self.document["blocks"] if block["type"] in translation.TEXT_TYPES and block.get("text")]
+        manifest = {"schema_version": "1.0", "artifact_type": "booktext.translation", "translation_id": "legacy-qwen",
+                    "direction": {"source_language": "en", "target_language": "ru"}, "source": {"cdm_sha256": translation._sha_bytes(source)},
+                    "provider": {"model": "qwen3:8b"}, "blocks": entries}
+        revision = translation._digest(manifest)
+        write(self.root / "translations/history" / f"en-ru-{revision}.json", manifest)
+        with mock.patch("tools.translation._model_info") as inference:
+            result = export_translation(self.root, ["markdown"], source_language="en", target_language="ru", history_sha=revision)
+        inference.assert_not_called()
+        self.assertEqual(f"translations/history/en-ru-{revision}.json", result["translation"]["path"])
+        self.assertIn("Legacy Corrected prose", (self.root / "translations/exports/en-ru/history" / revision / "book-en-ru.md").read_text())
 
     def test_wide_docx_table_widths_preserve_every_cell_and_are_idempotent(self):
         path = self.root / "wide.docx"

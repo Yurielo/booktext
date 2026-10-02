@@ -20,6 +20,7 @@ enum FinalBookSection: String, CaseIterable, Identifiable {
     @Published var operationCurrent: Int?
     @Published var operationTotal: Int?
     @Published var operationResumed = false
+    @Published var migrationRequired = false
     private let outputURL: URL
     private let configuration: CoreConfiguration
     private var bridge: CoreProcessBridge?
@@ -36,7 +37,7 @@ enum FinalBookSection: String, CaseIterable, Identifiable {
             self.operationTotal = event.total ?? self.operationTotal
             if event.eventType == .jobResumed { self.operationResumed = true }
             if event.eventType == .jobCompleted { completed(event.details.object ?? [:]) }
-            if event.eventType == .jobFailed { self.message = "\(event.code): \(event.message)" }
+            if event.eventType == .jobFailed { self.message = "\(event.code): \(event.message)"; self.migrationRequired = event.code == "MIGRATION_REQUIRED" }
             if event.eventType == .jobCancelled { self.message = "Operation stopped. Completed checkpoints remain available for resume." }
         } }, stderr: { _ in }, finished: { [weak self] _ in Task { @MainActor in self?.loading = false } }) }
         catch { loading = false; message = error.localizedDescription }
@@ -57,10 +58,10 @@ enum FinalBookSection: String, CaseIterable, Identifiable {
         guard !formats.isEmpty else { message = "Select at least one export format."; return }
         call(["export", outputURL.path] + formats.flatMap { ["--format", $0] }) { [weak self] detail in self?.exportCompleted(formats, detail) }
     }
-    func translate(sourceLanguage: String, targetLanguage: String, model: String) {
-        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { message = "Choose a local Ollama model before translating."; return }
-        call(["translation", outputURL.path, "--source-language", sourceLanguage, "--target-language", targetLanguage, "--provider", "ollama", "--model", model]) { [weak self] detail in
+    func translate(sourceLanguage: String, targetLanguage: String, migrate: Bool = false) {
+        call(["translation", outputURL.path, "--source-language", sourceLanguage, "--target-language", targetLanguage] + (migrate ? ["--migrate"] : [])) { [weak self] detail in
             let result = detail["result"]?.object ?? [:]
+            self?.migrationRequired = false
             let reused = result["reused"]?.bool == true
             self?.message = reused ? "Existing source-matched translation is available." : "Translation created from CDM; it is machine-translated, not human-reviewed."
             let qualityCount = result["validation"]?.object?["quality_review_count"]?.integer ?? 0
@@ -106,7 +107,6 @@ struct FinalBookView: View {
     @State private var showStructure = false
     @State private var section: FinalBookSection
     @State private var translationSource = "en"
-    @State private var translationModel = "qwen3:8b"
     @State private var selectedFormats: Set<String> = ["docx"]
     @Environment(\.dismiss) private var dismiss
     private let outputURL: URL
@@ -170,9 +170,9 @@ struct FinalBookView: View {
     @ViewBuilder private var translationControls: some View {
         VStack(alignment: .leading, spacing: 10) {
             Picker("Direction", selection: $translationSource) { Text("English → Russian").tag("en"); Text("Russian → English").tag("ru") }.pickerStyle(.segmented).frame(maxWidth: 360)
-            HStack { Text("Local model"); TextField("Ollama model", text: $translationModel).textFieldStyle(.roundedBorder).frame(width: 180) }
             HStack {
-                Button(model.loading ? "Translating…" : "Start Translation") { model.translate(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", model: translationModel) }.buttonStyle(.borderedProminent).disabled(model.loading)
+                Button(model.loading ? "Translating…" : "Start Translation") { model.translate(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en") }.buttonStyle(.borderedProminent).disabled(model.loading)
+                if model.migrationRequired { Button("Start TranslateGemma from saved document") { model.translate(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", migrate: true) }.disabled(model.loading) }
                 if model.loading { Button("Stop", action: model.cancel) }
                 Button("Open Translation") { model.openArtifact("translations") }.disabled(model.loading)
                 Button("Export translation") { model.exportTranslation(sourceLanguage: translationSource, targetLanguage: translationSource == "en" ? "ru" : "en", formats: ExportFormatSelection.ordered(selectedFormats)) }.disabled(model.loading || selectedFormats.isEmpty)
