@@ -775,12 +775,14 @@ def surya_runtime_environment():
 
     Surya's output budget is not a total context budget. In the installed
     Surya2 release both defaults are 12288, which silently cuts dense pages.
-    Keep the generation policy unchanged and reserve 4096 input tokens.
+    Keep the generation policy unchanged and reserve 8192 input tokens.
+    The real journal scan uses 4136 prompt/image tokens, so a 4096 reserve
+    alone still falls short. The margin also accommodates other page shapes.
     """
     env = os.environ.copy()
     generation = int(env.get("SURYA_MAX_TOKENS_FULL_PAGE", "12288"))
     requested = int(env.get("SURYA_INFERENCE_CTX_PER_SLOT", "12288"))
-    slot = max(requested, generation + 4096)
+    slot = max(requested, generation + 8192)
     env.setdefault("SURYA_MAX_TOKENS_FULL_PAGE", str(generation))
     env["SURYA_INFERENCE_CTX_PER_SLOT"] = str(slot)
     # Surya2 otherwise chooses eight slots on this Mac even for one page.

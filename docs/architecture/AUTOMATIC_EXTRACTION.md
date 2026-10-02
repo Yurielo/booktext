@@ -24,7 +24,7 @@ Surya layout, structured tables, fallback review and figure crops use the same
 production pipeline as scanned PDFs without a text layer. Old-policy workspaces
 fail closed on resume; select a new output directory to reprocess under v2.
 
-Dense scan OCR reserves 4096 input-image/prompt tokens in each llama.cpp context
+Dense scan OCR reserves 8192 input-image/prompt tokens in each llama.cpp context
 slot in addition to Surya's unchanged 12288 generation-token budget. An explicit
 total context override that cannot fit the per-slot budget fails closed rather
 than silently truncating a page. Larger explicit per-slot budgets are retained.

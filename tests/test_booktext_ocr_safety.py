@@ -139,7 +139,7 @@ class SuryaOutputSafetyTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             env = booktext.surya_runtime_environment()
         self.assertEqual(env["SURYA_MAX_TOKENS_FULL_PAGE"], "12288")
-        self.assertEqual(env["SURYA_INFERENCE_CTX_PER_SLOT"], "16384")
+        self.assertEqual(env["SURYA_INFERENCE_CTX_PER_SLOT"], "20480")
         self.assertEqual(env["SURYA_INFERENCE_PARALLEL"], "2")
         with patch.dict(os.environ, {"SURYA_MAX_TOKENS_FULL_PAGE": "20000",
                                      "SURYA_INFERENCE_CTX_PER_SLOT": "30000"}, clear=True):
