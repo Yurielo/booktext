@@ -76,6 +76,28 @@ class OwnedTmpLifecycleTests(unittest.TestCase):
             self.assertFalse(path.exists())
         self.assertEqual(self.objects(),[])
 
+    def test_managed_new_session_worker_inherits_lease_and_is_not_reaped(self):
+        code = ('import os; from tools.process_lifecycle import ManagedProcess; '
+                'p=ManagedProcess(["/bin/sleep","60"]); '
+                'print(os.environ["TMPDIR"],p.process.pid,flush=True); os._exit(0)')
+        parent=subprocess.Popen([sys.executable,self.helper,'--',sys.executable,'-c',code],env=self.env,stdout=subprocess.PIPE,text=True)
+        try:
+            path,pid=parent.stdout.readline().strip().rsplit(' ',1)
+            path=Path(path);pid=int(pid)
+            parent.wait(timeout=5)
+            try:
+                result=recover_stale(base_dir=self.base)
+                self.assertTrue(path.exists())
+                self.assertFalse(next(r for r in result if r['path']==str(path))['reaped'])
+            finally:
+                os.killpg(pid,signal.SIGTERM)
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline and lifecycle._other_users(path):time.sleep(.05)
+            with OwnedWorkspace(base_dir=self.base):self.assertFalse(path.exists())
+        finally:
+            parent.stdout.close()
+            if parent.poll() is None:parent.kill();parent.wait()
+
     def test_unknown_and_symlink_are_preserved(self):
         with OwnedWorkspace(base_dir=self.base) as path:
             unknown=path.parent/'foreign-booktext-looking-name';unknown.mkdir()
