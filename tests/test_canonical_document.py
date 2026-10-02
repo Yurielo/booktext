@@ -175,5 +175,17 @@ class CanonicalDocumentTests(unittest.TestCase):
         document = build_document(self.root)
         self.assertEqual([b["type"] for b in document["blocks"]], ["paragraph", "figure", "paragraph", "page_break"])
 
+    def test_v2_extraction_evidence_is_verified_before_offline_build(self):
+        import hashlib
+        self.book["extraction_policy"] = "automatic-extraction-2"
+        write(self.root / "book.json", self.book)
+        write(self.root / "extraction/source.json", {})
+        write(self.root / "extraction/native.xml", "preserved")
+        write(self.root / "extraction/artifacts.json", {"extraction/native.xml": hashlib.sha256(b"preserved").hexdigest()})
+        build_document(self.root)
+        write(self.root / "extraction/native.xml", "changed")
+        with self.assertRaisesRegex(ValueError, "stale extraction evidence"):
+            build_document(self.root)
+
 
 if __name__ == "__main__": unittest.main()

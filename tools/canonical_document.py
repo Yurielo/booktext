@@ -220,7 +220,7 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
         raise ValueError("CDM build requires book.json and review_priority.json")
     book, priority = _load(book_path), _load(priority_path)
     selection = document_continuity.selection(root, book)
-    if book.get("extraction_policy") == "automatic-extraction-1" and (root / "extraction/source.json").is_file():
+    if book.get("extraction_policy") in {"automatic-extraction-1", "automatic-extraction-2"} and (root / "extraction/source.json").is_file():
         expected_artifacts = _load(root / "extraction/artifacts.json")
         for relative,digest in expected_artifacts.items():
             path = (root / relative).resolve()
@@ -306,6 +306,11 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
             if identity in emitted_visuals:
                 return
             emitted_visuals.add(identity)
+            dimensions = (record.get("source_provenance") or {}).get("page_size_points")
+            if page_ref["prepared_page"] and dimensions:
+                from tools.automatic_extraction import refine_scanned_figure
+                visual, framing_warnings = refine_scanned_figure(root, visual, page_ref["prepared_page"], dimensions)
+                warnings.extend({"page": page, **warning} for warning in framing_warnings)
             image = _relative_if_file(root, visual.get("image"))
             if image is None:
                 warnings.append({"page": page, "kind": "missing_visual_asset", "path": visual.get("image")})

@@ -150,6 +150,18 @@ figure crops with matching raw-layout provenance and bounds occupy that same
 primary position exactly once; unanchored assets are not assigned a guessed
 semantic position.
 
+Offline CDM build can derive a better-framed image from a preserved scan when
+the primary rectangle cuts through source ink. Each touching edge is extended
+only to a separating white gap found within six points. No gap means retain the
+original edge and emit a boundary warning. Original crop, primary bbox and block
+identity remain unchanged; derived pixels, source-page hash, raw-crop hash and
+framing bounds are recorded. No recognition or graphic redraw is performed.
+
+DOCX tables with eight or more unmerged columns get deterministic presentation
+widths based on cell lengths and bounded 9-point typography. Cell text/order are
+unchanged; complex or merged tables are left untouched. Rebuild/export uses the
+same CDM and does not reinterpret raw HTML to guess new table semantics.
+
 Run `python3 -m unittest discover -s tests -v` and
 `swift run --package-path BookTextApp BookTextProtocolTests`.
 `tests/test_automatic_extraction.py` includes the real CLI/machine path, geometry,
