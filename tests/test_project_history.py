@@ -57,6 +57,30 @@ class ProjectHistoryTests(unittest.TestCase):
         self.assertEqual(before, (self.root / "book.json").read_bytes())
         self.assertFalse((self.root / "surya").exists())
 
+    def test_unverified_known_directory_is_controlled_without_creating_job_or_artifacts(self):
+        empty = Path(self.temporary.name) / "stale_cloud_placeholder"
+        empty.mkdir()
+        code, events = machine(lambda: protocol.main(["inspect", str(empty), "--record-activity"]))
+        self.assertEqual(0, code)
+        self.assertEqual("PROJECT_FILES_UNAVAILABLE", events[-1]["details"]["project"]["availability"])
+        self.assertFalse((empty / ".booktext_job.json").exists())
+        code, events = self._history_command("--known-output", str(empty))
+        self.assertEqual(0, code)
+        self.assertEqual([], events[-1]["details"]["projects"])
+        self.assertFalse((empty / ".booktext_job.json").exists())
+        self.assertTrue(events[-1]["details"]["warnings"])
+
+    def test_cloud_placeholder_is_controlled_without_artifact_probe_or_job_write(self):
+        placeholder = Path(self.temporary.name) / "icloud_book"
+        placeholder.mkdir()
+        with mock.patch.object(protocol, "_icloud_managed_path", return_value=True), \
+             mock.patch.object(protocol, "artifact_map") as artifacts:
+            detail = protocol.inspect_output(placeholder)
+        self.assertEqual("PROJECT_FILES_UNAVAILABLE", detail["project"]["availability"])
+        self.assertIn("iCloud-managed", detail["project"]["detail"])
+        artifacts.assert_not_called()
+        self.assertFalse((placeholder / ".booktext_job.json").exists())
+
     def test_interrupted_ocr_and_translation_are_reopenable_without_repeating_checkpoints(self):
         protocol.update_job(self.root, status="cancelled", last_phase="ocr", partial=True)
         chunks = self.root / "chunks"; chunks.mkdir()
