@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
+try:
+    from .diagnostic_artifacts import diagnostic_path
+except ImportError:
+    from diagnostic_artifacts import diagnostic_path
+
+# Evidence retention is explicitly opted into before tools/models run.
+diagnostic_path("")
+
 
 import json
 import subprocess
 from pathlib import Path
 
-SRC = Path("/tmp/booktext-hybrid-v11.json")
+SRC = Path(str(diagnostic_path("booktext-hybrid-v11.json")))
 SPELL = Path.home() / "AITools/booktext/bin/booktext-spellcheck"
 
-OUT_JSON = Path("/tmp/booktext-hybrid-v12.json")
-OUT_TEXT = Path("/tmp/booktext-hybrid-v12.txt")
-OUT_REVIEW = Path("/tmp/booktext-hybrid-v12-review.txt")
+OUT_JSON = Path(str(diagnostic_path("booktext-hybrid-v12.json")))
+OUT_TEXT = Path(str(diagnostic_path("booktext-hybrid-v12.txt")))
+OUT_REVIEW = Path(str(diagnostic_path("booktext-hybrid-v12-review.txt")))
 
 data = json.loads(SRC.read_text(encoding="utf-8"))
 records = data["resolved_units"]

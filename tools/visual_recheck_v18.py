@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
+try:
+    from .diagnostic_artifacts import diagnostic_path
+except ImportError:
+    from diagnostic_artifacts import diagnostic_path
+
+# Evidence retention is explicitly opted into before tools/models run.
+diagnostic_path("")
+
 
 import json
 import subprocess
 from pathlib import Path
 
 PAGE = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Downloads/neizlechimyh_bolezney_net_book/pages/page-0181.png"
-VISION = Path("/tmp/booktext-vision-words.json")
-OUT = Path("/tmp/booktext-v18-crops")
+VISION = Path(str(diagnostic_path("booktext-vision-words.json")))
+OUT = Path(str(diagnostic_path("booktext-v18-crops")))
 
 TARGETS = {
     "1-клеток,",

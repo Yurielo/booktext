@@ -12,16 +12,17 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 try:
+    from tools.owned_workspace import OwnedWorkspace, is_supervised, supervise
     from tools.canonical_document import validate_document
     from tools import document_identity, translation
 except ModuleNotFoundError:  # helper may be invoked directly by another Python
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tools.owned_workspace import OwnedWorkspace, is_supervised, supervise
     from tools.canonical_document import validate_document
     from tools import document_identity, translation
 
@@ -310,7 +311,7 @@ def _render_image_pdf(publication_pdf, destination):
     renderer = shutil.which("pdftoppm")
     if renderer is None:
         raise ValueError("image-only PDF requires pdftoppm (Poppler)")
-    with tempfile.TemporaryDirectory(prefix="booktext-pdf-image-") as temporary:
+    with OwnedWorkspace(prefix="booktext-pdf-image-") as temporary:
         prefix = Path(temporary) / "page"
         result = subprocess.run(
             [renderer, "-png", "-r", "150", str(publication_pdf), str(prefix)],
@@ -545,4 +546,7 @@ def main(argv=None):
     args = parser.parse_args(argv); print(json.dumps(export_document(args.output_dir, args.format), ensure_ascii=False))
 
 
-if __name__ == "__main__": main(sys.argv[1:])
+if __name__ == "__main__":
+    if not is_supervised():
+        sys.exit(supervise([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]))
+    main(sys.argv[1:])

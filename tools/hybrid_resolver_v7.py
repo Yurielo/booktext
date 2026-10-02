@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+try:
+    from .diagnostic_artifacts import diagnostic_path
+except ImportError:
+    from diagnostic_artifacts import diagnostic_path
+
+# Evidence retention is explicitly opted into before tools/models run.
+diagnostic_path("")
+
 
 import base64
 import csv
@@ -540,7 +548,7 @@ def main():
     )
 
     cropdir = Path(
-        "/tmp/booktext-v7-crops"
+        str(diagnostic_path("booktext-v7-crops"))
     )
 
     cropdir.mkdir(
@@ -718,8 +726,7 @@ def main():
             print()
 
     out = (
-        "/tmp/"
-        "booktext-hybrid-v7.json"
+        str(diagnostic_path("booktext-hybrid-v7.json"))
     )
 
     with open(

@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
+try:
+    from .diagnostic_artifacts import diagnostic_path
+except ImportError:
+    from diagnostic_artifacts import diagnostic_path
+
+# Evidence retention is explicitly opted into before tools/models run.
+diagnostic_path("")
+
 
 import json
 import re
 from pathlib import Path
 
-ALIGN = Path("/tmp/booktext-hybrid-v10-alignment.json")
-V7 = Path("/tmp/booktext-hybrid-v7.json")
+ALIGN = Path(str(diagnostic_path("booktext-hybrid-v10-alignment.json")))
+V7 = Path(str(diagnostic_path("booktext-hybrid-v7.json")))
 
-OUT_JSON = Path("/tmp/booktext-hybrid-v11.json")
-OUT_REVIEW = Path("/tmp/booktext-hybrid-v11-review.txt")
-OUT_TEXT = Path("/tmp/booktext-hybrid-v11.txt")
+OUT_JSON = Path(str(diagnostic_path("booktext-hybrid-v11.json")))
+OUT_REVIEW = Path(str(diagnostic_path("booktext-hybrid-v11-review.txt")))
+OUT_TEXT = Path(str(diagnostic_path("booktext-hybrid-v11.txt")))
 
 
 def norm(s):

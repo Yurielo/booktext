@@ -453,5 +453,7 @@ python3 tools/apply_human_review_to_document.py \
 
 ```bash
 python3 -m py_compile booktext.py tools/extract_surya_tables.py
-python3 -m unittest discover -s tests -v
+./scripts/test_suite.sh
 ```
+
+Temporary lifecycle and evidence retention: [owned TMP audit](docs/OWNED_TMP_LIFECYCLE.md). Use `scripts/test_suite.sh` for interruption-safe tests; historical diagnostics require `BOOKTEXT_DIAGNOSTIC_DIR` outside TMP.

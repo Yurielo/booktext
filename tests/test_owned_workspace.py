@@ -33,7 +33,9 @@ class OwnedWorkspaceTests(unittest.TestCase):
     def test_explicit_reaper_requires_exact_marker_and_dead_owner(self):
         workspace = OwnedWorkspace()
         path, workspace_id = workspace.path, workspace.workspace_id
-        workspace._closed = True  # simulate an interrupted creator; do not call close
+        import os
+        os.close(workspace._lease)
+        workspace._closed = True  # simulate a dead creator releasing its lease
         with mock.patch("tools.owned_workspace._pid_alive", return_value=False):
             self.assertEqual(reap_explicit(path, workspace_id=workspace_id), {"reaped": True, "reason": "explicit_stale_owned_workspace"})
         self.assertFalse(path.exists())

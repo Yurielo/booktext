@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+try:
+    from .diagnostic_artifacts import diagnostic_path
+except ImportError:
+    from diagnostic_artifacts import diagnostic_path
+
+# Evidence retention is explicitly opted into before tools/models run.
+diagnostic_path("")
+
 
 import base64
 import json
@@ -171,7 +179,7 @@ def main():
 
     W, H = dimensions(page)
 
-    outdir = Path("/tmp/booktext-v5-context")
+    outdir = Path(str(diagnostic_path("booktext-v5-context")))
     outdir.mkdir(parents=True, exist_ok=True)
 
     results = []
@@ -255,7 +263,7 @@ def main():
             print("ERROR: ", error)
         print()
 
-    path = "/tmp/booktext-hybrid-v5-review.json"
+    path = str(diagnostic_path("booktext-hybrid-v5-review.json"))
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(
