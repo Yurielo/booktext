@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tools import canonical_document, chunk_lifecycle, export_document, review_decisions, review_workspace, review_recovery, translation
+from tools import canonical_document, chunk_lifecycle, export_document, project_history, review_decisions, review_workspace, review_recovery, translation
 from tools.process_lifecycle import ManagedProcess
 
 
@@ -30,7 +30,7 @@ JOB_FILENAME = ".booktext_job.json"
 PHASES = ("preflight", "prepare", "ocr", "qa", "visuals/tables", "review", "final_build", "cdm", "translation", "export")
 EVENT_TYPES = ("job_started", "phase_started", "progress", "warning", "artifact_created", "review_summary", "phase_completed", "job_completed", "job_failed", "job_cancelled", "chunk_plan_created", "chunk_started", "chunk_progress", "chunk_completed", "chunk_failed", "chunk_retry", "job_resumed", "assembly_started", "assembly_completed", "cleanup_started", "cleanup_progress", "cleanup_completed", "cleanup_warning")
 EXIT_CODES = {"success": 0, "invalid_input": 2, "preflight_failure": 3, "processing_failure": 4, "validation_failure": 5, "cancelled": 130, "stale_conflict": 6}
-COMMAND_PHASE = {"run": "ocr", "cleanup": "prepare", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "translation-export": "export", "export": "export", "inspect": None}
+COMMAND_PHASE = {"run": "ocr", "cleanup": "prepare", "recover": "review", "decision": "review", "review": "review", "review-item": "review", "review-clusters": "review", "batch-preview": "review", "batch-confirm": "review", "batch-revert": "review", "baseline-preview": "review", "baseline-confirm": "review", "baseline-revert": "review", "final-build": "final_build", "cdm": "cdm", "document-preview": "cdm", "translation": "translation", "translation-validate": "translation", "translation-export": "export", "export": "export", "inspect": None, "project-history": None, "project-remove": None}
 
 
 class MachineError(RuntimeError):
@@ -116,6 +116,59 @@ def artifact_map(root):
     return {name: {"path": value, "exists": (root / value).exists()} for name, value in candidates.items()}
 
 
+def _translation_state(root, artifacts):
+    plan = _load(Path(root) / "translations" / "chunks" / "translation_plan.json", {}) or {}
+    manifest = _load(Path(root) / "translations" / "en-ru.json", {}) or {}
+    chunks = plan.get("chunks") if isinstance(plan, dict) else None
+    if isinstance(chunks, list) and chunks and any(chunk.get("status") != "complete" for chunk in chunks if isinstance(chunk, dict)):
+        return "RESUMABLE" if any(chunk.get("status") == "complete" for chunk in chunks if isinstance(chunk, dict)) else "IN_PROGRESS"
+    if isinstance(manifest, dict) and manifest.get("artifact_type") == translation.ARTIFACT_TYPE:
+        validation = manifest.get("validation") or {}
+        return "READY" if validation.get("valid", True) and not validation.get("stale", False) else "FAILED"
+    return "NOT_STARTED"
+
+
+def _project_projection(root, state, artifacts, counts, summary, final, document, export):
+    """Classify only already-recorded job/artifact truth; never start work."""
+    sources = state.get("source") if isinstance(state.get("source"), list) else []
+    source_unavailable = bool(sources) and any(not Path(value).exists() for value in sources if isinstance(value, str))
+    translation_state = _translation_state(root, artifacts)
+    job_status, phase = state.get("status"), state.get("last_phase")
+    # Existing results remain usable when their original source has moved.
+    # The source is required only for resume/processing, not for reopening a
+    # completed book, review queue, final build, or already-created translation.
+    availability = "SOURCE_UNAVAILABLE" if source_unavailable else "AVAILABLE"
+    if job_status == "running":
+        current, action, availability = ("TRANSLATING", "Resume Translation", "AVAILABLE") if phase == "translation" else ("PROCESSING", "Resume Processing", "AVAILABLE")
+    elif job_status == "cancelled":
+        if source_unavailable:
+            current, action = "FAILED", "Locate source"
+        else:
+            current, action = "INTERRUPTED_RESUMABLE", "Resume Translation" if phase == "translation" else "Resume Processing"
+    elif job_status == "failed":
+        current, action = "FAILED", "Locate source" if source_unavailable else ("Resume Translation" if phase == "translation" else "Resume Processing")
+    elif translation_state == "IN_PROGRESS":
+        current, action, availability = "TRANSLATING", "Resume Translation", "AVAILABLE"
+    elif translation_state == "RESUMABLE":
+        current, action = ("FAILED", "Locate source") if source_unavailable else ("INTERRUPTED_RESUMABLE", "Resume Translation")
+    elif counts.get("HIGH", 0) or counts.get("MEDIUM", 0):
+        current, action = "REVIEW_REQUIRED", "Review items"
+    elif translation_state == "READY":
+        current, action = "TRANSLATION_READY", "Open translation"
+    elif not artifacts["final_build"]["exists"]:
+        current, action = "READY_FOR_FINAL_BUILD", "Create final book"
+    elif artifacts["exports"]["exists"]:
+        current, action = "COMPLETED", "Open book"
+    else:
+        current, action = "BOOK_READY", "Open book"
+    pages = (summary.get("pages") or {}).get("processed") if isinstance(summary.get("pages"), dict) else None
+    if not isinstance(pages, int):
+        pages = len((_load(Path(root) / "book.json", {}) or {}).get("pages", []))
+    return {"state": current, "action": action, "availability": availability, "page_count": pages or None,
+            "translation_state": translation_state, "last_phase": phase, "source_unavailable": source_unavailable,
+            "reopen_available": True}
+
+
 def inspect_output(root):
     root = Path(root).expanduser().resolve()
     if not root.is_dir(): raise MachineError("invalid_input", "output directory does not exist", details={"output_dir": str(root)})
@@ -132,11 +185,12 @@ def inspect_output(root):
         (bool(summary) or artifacts["cdm"]["exists"] or artifacts["exports"]["exists"])
         and state.get("status") not in {"running", "cancelled", "failed"}
     )
+    project = _project_projection(root, state, artifacts, counts, summary, final, document, export)
     return {"protocol_version": PROTOCOL_VERSION, "job": {**state, "complete": complete, "incomplete": not complete},
             "artifacts": artifacts, "review": {"unresolved_priority_counts": {"HIGH": counts.get("HIGH", 0), "MEDIUM": counts.get("MEDIUM", 0)}, "stale_or_conflict_count": stale},
             "cdm": {"present": artifacts["cdm"]["exists"], "schema_version": document.get("schema_version")},
             "exports": {"present": artifacts["exports"]["exists"], "validation": export.get("validation")},
-            "run_summary": summary.get("pages")}
+            "run_summary": summary.get("pages"), "project": project}
 
 
 def _table_preview(root, block):
@@ -255,7 +309,8 @@ def _invoke(emitter, root, phase, operation, fn):
     update_job(root, status="running", last_phase=phase)
     emitter.emit("phase_started", phase=phase, message=f"{operation} started")
     result = fn()
-    artifacts = artifact_map(root); update_job(root, status="completed", last_phase=phase, artifacts=artifacts)
+    artifacts = artifact_map(root); completed_state = update_job(root, status="completed", last_phase=phase, artifacts=artifacts)
+    project_history.record(root, completed_state)
     for name, value in artifacts.items():
         if value["exists"] and name in {"final_build", "cdm", "exports", "decisions"}:
             emitter.emit("artifact_created", phase=phase, message=f"Artifact available: {name}", details={"name": name, **value})
@@ -274,6 +329,7 @@ def _run_existing(emitter, sources, core_args):
         except (ValueError, IndexError): return default
     root = output_directory(source, automatic=option("--ocr", "auto") == "auto" and "--native-text-only" not in core_args, explicit=option("--output-dir"))
     state = ensure_job(root, status="running", source=[str(Path(value).expanduser().resolve()) for value in sources]); emitter.job_id = state["job_id"]
+    project_history.record(root, state)
     emitter.emit("job_started", phase="preflight", message="Processing job started", details={"source": state["source"], "output_dir": str(root)})
     emitter.emit("phase_started", phase="preflight", message="Checking processing prerequisites")
     pf = processing_preflight(sources, core_args)
@@ -314,7 +370,8 @@ def _run_existing(emitter, sources, core_args):
     if code:
         update_job(root, status="failed", last_phase="ocr", partial=True, exit_code=code)
         raise MachineError("processing_failure", "processing core exited unsuccessfully", details={"exit_code": code})
-    update_job(root, status="completed", last_phase="review", partial=False, artifacts=artifact_map(root))
+    completed_state = update_job(root, status="completed", last_phase="review", partial=False, artifacts=artifact_map(root))
+    project_history.record(root, completed_state)
     emitter.emit("phase_completed", phase="review", message="Processing and review completed")
     summary = _load(root / "run_summary.json", {}) or {}
     for warning in summary.get("warnings", []):
@@ -336,7 +393,19 @@ def _handle(args):
         if not Path(root).expanduser().resolve().is_dir():
             raise MachineError("invalid_input", "output directory does not exist", details={"output_dir": str(root)})
         state = ensure_job(root, status="discovered"); emitter = Emitter(state["job_id"])
+        if args.record_activity:
+            project_history.record(root, state, activity=True)
         emitter.emit("job_completed", phase=state.get("last_phase"), message="Existing job inspected", details=inspect_output(root)); return 0
+    if args.command == "project-history":
+        # Explicit persisted output references are the only migration source.
+        # Discovery performs inspect-only reconciliation and never starts OCR.
+        result = project_history.reconcile(known_outputs=args.known_output, inspect=inspect_output, history_path=args.history_path)
+        emitter = Emitter("project-history")
+        emitter.emit("job_completed", message="Project history reconciled", details=result); return 0
+    if args.command == "project-remove":
+        result = project_history.remove(args.project_id, history_path=args.history_path)
+        emitter = Emitter("project-history")
+        emitter.emit("job_completed", message="Project removed from history", details=result); return 0
     if args.command == "run":
         source = Path(args.sources[0]).expanduser().resolve() if args.sources else None
         # Keep the derived output location on parsed arguments so all error and
@@ -344,6 +413,9 @@ def _handle(args):
         args.output_dir = source.parent / f"{source.stem}_book" if source else None
         return _run_existing(Emitter("pending"), args.sources, args.core_args)
     state = ensure_job(root); emitter = Emitter(state["job_id"])
+    # A user-triggered Core operation is real activity; background history
+    # discovery deliberately bypasses this path and leaves ordering unchanged.
+    project_history.record(root, state)
     if args.command == "cleanup":
         emitter.emit("cleanup_started", phase="prepare", message="Calculating safe temporary-file cleanup")
         try:
@@ -451,7 +523,9 @@ def main(argv=None):
     parser.add_argument("--protocol-version", action="version", version=PROTOCOL_VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("preflight"); p.add_argument("--operation", choices=("status", "run", "native-text", "export", "cdm", "final-build", "review", "translation"), default="status")
-    p = sub.add_parser("inspect"); p.add_argument("output_dir", type=Path)
+    p = sub.add_parser("inspect"); p.add_argument("output_dir", type=Path); p.add_argument("--record-activity", action="store_true")
+    p = sub.add_parser("project-history"); p.add_argument("--known-output", action="append", default=[]); p.add_argument("--history-path")
+    p = sub.add_parser("project-remove"); p.add_argument("project_id"); p.add_argument("--history-path")
     p = sub.add_parser("cleanup"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)

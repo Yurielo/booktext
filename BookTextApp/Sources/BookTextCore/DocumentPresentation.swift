@@ -79,6 +79,16 @@ public enum DocumentPresentationMapper {
         let cdm = inspection["cdm"]?.object?["present"]?.bool == true || artifactExists("cdm", in: artifacts)
         let translation = artifactExists("translations", in: artifacts)
 
+        // Core's history/reopen projection is authoritative for an existing
+        // job.  Swift maps it to presentation only; it does not infer resume
+        // from filenames, timestamps, or a second workflow state machine.
+        let coreProjectState = inspection["project"]?.object?["state"]?.string
+        if outputSelected, let coreProjectState, let mapped = projectState(coreProjectState) {
+            return DocumentPresentationSnapshot(state: mapped, primaryAction: primaryAction(for: mapped), pageCount: pages,
+                                                unresolvedHigh: high, unresolvedMedium: medium, finalBookAvailable: finalBook,
+                                                cdmAvailable: cdm, translationAvailable: translation)
+        }
+
         let state: DocumentLifecycleState
         if jobState == .failed {
             state = .failed
@@ -150,6 +160,21 @@ public enum DocumentPresentationMapper {
     private static func artifactExists(_ key: String, in artifacts: [String: JSONValue]) -> Bool {
         artifacts[key]?.object?["exists"]?.bool == true
     }
+
+    private static func projectState(_ value: String) -> DocumentLifecycleState? {
+        switch value {
+        case "READY_TO_PROCESS": .readyToProcess
+        case "PROCESSING": .processing
+        case "INTERRUPTED_RESUMABLE": .interruptedResumable
+        case "REVIEW_REQUIRED": .reviewRequired
+        case "READY_FOR_FINAL_BUILD": .readyForFinalBuild
+        case "BOOK_READY", "COMPLETED": .bookReady
+        case "TRANSLATING": .translating
+        case "TRANSLATION_READY": .translationReady
+        case "FAILED": .failed
+        default: nil
+        }
+    }
 }
 
 /// Normalizes the small persisted recent-output list.  It stores only paths;
@@ -166,6 +191,43 @@ public enum RecentOutputList {
             guard seen.insert(normalized).inserted else { return nil }
             return normalized
         }.prefix(max(0, limit)).map { $0 }
+    }
+}
+
+/// Decoded from the Core's versioned project-history operation.  This is an
+/// index row only; the `state` value is recomputed by Core on every refresh.
+public struct ProjectHistoryEntry: Equatable, Sendable, Identifiable {
+    public let id: String
+    public let name: String
+    public let outputPath: String
+    public let state: String
+    public let action: String
+    public let availability: String
+    public let reopenAvailable: Bool
+    public let pageCount: Int?
+    public let translationState: String
+    public let lastActivity: String
+
+    public init?(_ value: JSONValue) {
+        guard let object = value.object, let id = object["project_id"]?.string,
+              let path = object["output_dir"]?.string else { return nil }
+        self.id = id; self.outputPath = path
+        self.name = object["name"]?.string ?? URL(fileURLWithPath: path).lastPathComponent
+        self.state = object["state"]?.string ?? "FAILED"
+        self.action = object["action"]?.string ?? "Open project"
+        self.availability = object["availability"]?.string ?? "PROJECT_FILES_UNAVAILABLE"
+        self.reopenAvailable = object["reopen_available"]?.bool ?? (self.availability != "PROJECT_FILES_UNAVAILABLE")
+        self.pageCount = object["page_count"]?.integer
+        self.translationState = object["translation_state"]?.string ?? "NOT_STARTED"
+        self.lastActivity = object["last_activity_at"]?.string ?? ""
+    }
+
+    public var detailForUnavailable: String {
+        switch availability {
+        case "SOURCE_UNAVAILABLE": "Source unavailable. Locate the original document; BookText will not start new OCR automatically."
+        case "PROJECT_FILES_UNAVAILABLE": "Project files unavailable. Restore or locate the existing BookText output."
+        default: "This project is currently unavailable."
+        }
     }
 }
 

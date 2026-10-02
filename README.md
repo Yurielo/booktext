@@ -234,6 +234,8 @@ The app uses the versioned JSONL contract, never terminal prose:
 ```bash
 python3 booktext.py machine preflight --operation export
 python3 booktext.py machine inspect /path/to/book_output
+python3 booktext.py machine project-history
+python3 booktext.py machine project-remove JOB_ID
 python3 booktext.py machine export /path/to/book_output --format html
 python3 booktext.py machine translation /path/to/book_output \
   --source-language en --target-language ru --model qwen3:8b
