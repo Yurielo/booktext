@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -134,6 +135,19 @@ class ReviewOutputTests(unittest.TestCase):
 
 
 class SuryaOutputSafetyTests(unittest.TestCase):
+    def test_context_reserves_image_prompt_without_changing_generation(self):
+        with patch.dict(os.environ, {}, clear=True):
+            env = booktext.surya_runtime_environment()
+        self.assertEqual(env["SURYA_MAX_TOKENS_FULL_PAGE"], "12288")
+        self.assertEqual(env["SURYA_INFERENCE_CTX_PER_SLOT"], "20480")
+        self.assertEqual(env["SURYA_INFERENCE_PARALLEL"], "2")
+        with patch.dict(os.environ, {"SURYA_MAX_TOKENS_FULL_PAGE": "20000",
+                                     "SURYA_INFERENCE_CTX_PER_SLOT": "30000"}, clear=True):
+            self.assertEqual(booktext.surya_runtime_environment()["SURYA_INFERENCE_CTX_PER_SLOT"], "30000")
+        with patch.dict(os.environ, {"SURYA_INFERENCE_CTX_SIZE": "12288"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "cannot fit"):
+                booktext.surya_runtime_environment()
+
     def test_figure_only_page_is_a_valid_empty_ocr_result(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -142,7 +156,7 @@ class SuryaOutputSafetyTests(unittest.TestCase):
             second.write_bytes(b"text")
             output, work = root / "surya", root / "work"
 
-            def write_surya_result(command):
+            def write_surya_result(command, **kwargs):
                 staging = Path(command[command.index("--output_dir") + 1])
                 result_dir = staging / "surya-input"
                 result_dir.mkdir(parents=True)
@@ -168,7 +182,7 @@ class SuryaOutputSafetyTests(unittest.TestCase):
             first.write_bytes(b"one")
             second.write_bytes(b"two")
 
-            def write_incomplete_result(command):
+            def write_incomplete_result(command, **kwargs):
                 staging = Path(command[command.index("--output_dir") + 1])
                 result_dir = staging / "surya-input"
                 result_dir.mkdir(parents=True)

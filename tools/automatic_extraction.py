@@ -18,7 +18,7 @@ from pathlib import Path
 
 from tools.review_decisions import atomic_write_json
 
-POLICY = "automatic-extraction-1"
+POLICY = "automatic-extraction-2"
 
 
 def atomic_text(path, text):
@@ -98,6 +98,63 @@ def text_quality(blocks):
     duplicates = len(words) - len({(w["text"], tuple(w["bbox"])) for w in words})
     return {"usable": bool(text.strip()) and invalid == 0 and duplicates <= len(words) * .1,
             "words": len(words), "invalid_characters": invalid, "duplicate_words": duplicates}
+
+
+def scan_overlay_evidence(page, trace, regions):
+    """Identify invisible native words over a page scan, without guessing quality.
+
+    MuPDF ignore_text (PDF rendering mode 3) is positive provenance evidence.
+    A hidden watermark or a hidden layer without a page raster is insufficient.
+    Glyph origins are mapped into the same device coordinates as native boxes.
+    """
+    raster = [r["bbox"] for r in regions if r["kind"] == "raster"
+              and area(r["bbox"]) >= page["width"] * page["height"] * .8]
+    points = {"hidden": [], "visible": []}
+    if not raster:
+        return set(), {"route": "native_or_residual", "reason": "no_page_scan"}
+    for node in ET.fromstring(trace).iter():
+        if node.tag not in {"ignore_text", "fill_text", "stroke_text"}:
+            continue
+        hidden = node.tag == "ignore_text" or float(node.get("alpha", "1")) == 0
+        a,b,c,d,e,f = map(float, node.get("transform", "1 0 0 1 0 0").split())
+        for glyph in node.iter("g"):
+            if not glyph.get("unicode", "").strip():
+                continue
+            x,y = float(glyph.get("x", "0")),float(glyph.get("y", "0"))
+            points["hidden" if hidden else "visible"].append((a*x+c*y+e,b*x+d*y+f))
+    words = [w for block in page["blocks"] for line in block["lines"] for w in line["words"]]
+    candidates = set()
+    def hits(word, kind):
+        x0,y0,x1,y1 = word["bbox"]
+        return sum(x0-.25 <= x < x1 and y0-.5 <= y <= y1+.5 for x,y in points[kind])
+    for index,word in enumerate(words):
+        if not any(overlap(word["bbox"], bounds) >= area(word["bbox"]) * .8 for bounds in raster):
+            continue
+        if hits(word, "hidden") >= max(1, len(word["text"].strip()) * .5) and hits(word, "visible") == 0:
+            candidates.add(index)
+    # Require a substantive overlay, not a handful of invisible annotations.
+    overlay = candidates if len(candidates) >= 20 else set()
+    return overlay, {"route": "scan_with_ocr_overlay" if overlay else "native_or_residual",
+                     "reason": "invisible_words_over_page_raster" if overlay else "insufficient_overlay_evidence",
+                     "invisible_overlay_words": len(overlay), "native_words": len(words),
+                     "scan_regions": raster if overlay else [], "render_dpi": 300 if overlay else 200,
+                     "quality_claim": "origin_only; existing OCR is not assumed correct or incorrect"}
+
+
+def without_overlay_words(page, indices):
+    """Project the visible native layer; keep native XML evidence untouched."""
+    index = 0
+    blocks = []
+    for block in page["blocks"]:
+        lines = []
+        for line in block["lines"]:
+            words = []
+            for word in line["words"]:
+                if index not in indices: words.append(word)
+                index += 1
+            if words: lines.append({**line, "words": words, "text": " ".join(w["text"] for w in words)})
+        if lines: blocks.append({**block, "lines": lines})
+    return {**page, "blocks": blocks}
 
 
 def trace_regions(xml, width, height):
@@ -325,15 +382,19 @@ def prepare_pdf(source, output, selected, run, *, event=None, options=None):
         if not trace_path.exists():
             trace = run(["mutool", "draw", "-q", "-F", "trace", source, str(number)], capture=True, quiet=True)
             atomic_text(trace_path, trace.stdout)
+        trace_xml = trace_path.read_text()
+        regions = trace_regions(trace_xml, width, height)
+        overlay_words, routing = scan_overlay_evidence(page, trace_xml, regions)
+        visible_page = without_overlay_words(page, overlay_words)
         render_diagnostics = ""
         if not image_path.exists():
-            rendered = run(["pdftoppm", "-cropbox", "-f", str(number), "-l", str(number), "-r", "200", "-singlefile", "-png", source, image_path.with_suffix("")], capture=True, quiet=True)
+            rendered = run(["pdftoppm", "-cropbox", "-f", str(number), "-l", str(number), "-r", str(routing.get("render_dpi", 200)), "-singlefile", "-png", source, image_path.with_suffix("")], capture=True, quiet=True)
             render_diagnostics = (rendered.stderr or "").strip()
             atomic_text(evidence / f"page-{number:04d}-render.txt", render_diagnostics)
         elif (evidence / f"page-{number:04d}-render.txt").exists():
             render_diagnostics = (evidence / f"page-{number:04d}-render.txt").read_text()
         quality = text_quality(page["blocks"])
-        regions = trace_regions(trace_path.read_text(), width, height)
+        visible_quality = text_quality(visible_page["blocks"])
         originals = embedded_assets(source, number, regions, evidence, run)
         visuals, scans, warnings = [], [], []
         if render_diagnostics:
@@ -344,6 +405,8 @@ def prepare_pdf(source, output, selected, run, *, event=None, options=None):
             def pixel_box(bounds): return tuple(round(v * (sx if i%2 == 0 else sy)) for i,v in enumerate(bounds))
             for index, region in enumerate(regions, 1):
                 bounds = region["bbox"]
+                if overlay_words and bounds in routing["scan_regions"]:
+                    scans.append(bounds); continue
                 crop = full.crop(pixel_box(bounds))
                 probe = crop
                 native_words = [word for block in page["blocks"] for line in block["lines"] for word in line["words"]
@@ -381,7 +444,7 @@ def prepare_pdf(source, output, selected, run, *, event=None, options=None):
             excluded = [v["bbox"] for v in visuals]
             # Only words truly inside a figure are excluded; slight overlaps
             # at an image's blank edge still belong to the native text layer.
-            layout = native_layout(page, excluded) if quality["usable"] else []
+            layout = native_layout(visible_page, excluded) if visible_quality["usable"] else []
             needs_ocr = bool(scans) or (not quality["usable"] and (quality["words"] > 0 or not visuals))
             if needs_ocr:
                 masked = full.convert("RGB")
@@ -398,7 +461,8 @@ def prepare_pdf(source, output, selected, run, *, event=None, options=None):
                   "text": text, "layout_blocks": layout, "visuals": visuals, "warnings": warnings,
                   "source_provenance": {"kind": "mixed" if needs_ocr and layout else "surya" if needs_ocr else "native_pdf",
                   "source_sha256": fingerprint, "source_page": number, "quality": quality,
-                  "native_evidence": "extraction/native.xml", "page_size_points": [width,height]}}
+                  "routing": routing, "native_evidence": "extraction/native.xml",
+                  "trace_evidence": str(trace_path.relative_to(output)), "page_size_points": [width,height]}}
         prepared[number] = record
         for artifact in [xml_path, trace_path, image_path, *[Path(visual["image"]) for visual in visuals], *[original[1] for original in originals.values()]]:
             checksums[str(artifact.relative_to(output))] = sha(artifact)

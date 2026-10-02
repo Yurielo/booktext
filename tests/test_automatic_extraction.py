@@ -18,7 +18,7 @@ from tools.machine_protocol import processing_preflight
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def pdf_fixture(path, scan=False):
+def pdf_fixture(path, scan=False, hidden_overlay=False):
     # Real PDF syntax through the real production CLI, no model/test converter.
     stream = b"BT /F1 16 Tf 50 740 Td (DOCUMENT TITLE) Tj /F1 10 Tf 0 -40 Td (This paragraph contains ordinary printed words and a visible illustration.) Tj 0 -14 Td (The second physical line must flow within the same paragraph.) Tj ET 80 480 100 50 re S 85 485 90 40 re S 90 490 80 30 re S"
     objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -29,7 +29,9 @@ def pdf_fixture(path, scan=False):
         for y in range(70,700,35):
             for x in range(70,470,30): draw.rectangle((x,y,x+10,y+9),fill="black")
         raster=zlib.compress(image.tobytes()); stream=b"q 600 0 0 800 0 0 cm /Im1 Do Q"
-        objects[2]=b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>"
+        if hidden_overlay:
+            stream += b" BT /F1 10 Tf 3 Tr 70 721 Td (" + b"old "*30 + b") Tj ET"
+        objects[2]=b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>"
         objects[4]=b"<< /Length "+str(len(stream)).encode()+b" >>\nstream\n"+stream+b"\nendstream"
         objects.append(b"<< /Type /XObject /Subtype /Image /Width 600 /Height 800 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length "+str(len(raster)).encode()+b" >>\nstream\n"+raster+b"\nendstream")
     data = b"%PDF-1.4\n"; offsets = [0]
@@ -42,6 +44,52 @@ def pdf_fixture(path, scan=False):
 
 
 class AutomaticExtractionTests(unittest.TestCase):
+    def test_overlay_requires_hidden_words_over_a_scan_and_preserves_visible_text(self):
+        words = [{"text":"old", "bbox":[10+i*10,10,19+i*10,20]} for i in range(25)]
+        words.append({"text":"Native", "bbox":[10,30,50,40]})
+        page = {"width":300,"height":400,"blocks":[{"bbox":[10,10,290,40],"lines":[{"bbox":[10,10,290,40],"words":words}]}]}
+        hidden = ''.join(f'<g unicode="o" x="{11+i*10}" y="19"/><g unicode="l" x="{14+i*10}" y="19"/>' for i in range(25))
+        trace = f'<page><ignore_text>{hidden}</ignore_text><fill_text><g unicode="N" x="11" y="39"/></fill_text></page>'
+        regions = [{"kind":"raster","bbox":[0,0,300,400]}]
+        indices, evidence = auto.scan_overlay_evidence(page,trace,regions)
+        self.assertEqual(set(range(25)),indices)
+        self.assertEqual("scan_with_ocr_overlay",evidence["route"])
+        projected = auto.without_overlay_words(page,indices)
+        self.assertEqual(["Native"],[w["text"] for b in projected["blocks"] for l in b["lines"] for w in l["words"]])
+        self.assertEqual(26,len(page["blocks"][0]["lines"][0]["words"]))
+        self.assertEqual(set(), auto.scan_overlay_evidence(page,trace,[])[0])
+        self.assertEqual(set(), auto.scan_overlay_evidence(page,trace.replace('ignore_text','fill_text'),regions)[0])
+        self.assertEqual(set(), auto.scan_overlay_evidence(page,'<page><ignore_text><g unicode="o" x="11" y="19"/></ignore_text></page>',regions)[0])
+        # Device-coordinate origin matching also handles rotated/translated
+        # traces and invisible alpha without changing the native source.
+        transformed = ''.join(f'<g unicode="o" x="19" y="{-11-i*10}"/><g unicode="l" x="19" y="{-14-i*10}"/>' for i in range(25))
+        rotated = f'<page><ignore_text transform="0 1 -1 0 0 0">{transformed}</ignore_text></page>'
+        self.assertEqual(set(range(25)), auto.scan_overlay_evidence(page,rotated,regions)[0])
+        self.assertEqual(indices, auto.scan_overlay_evidence(page,trace.replace('<ignore_text>', '<fill_text alpha="0">').replace('</ignore_text>', '</fill_text>'),regions)[0])
+
+    @unittest.skipUnless(all(shutil.which(tool) for tool in ("pdftotext","pdfimages","pdftoppm","mutool")), "Poppler/MuPDF integration")
+    def test_hidden_ocr_over_scan_goes_through_production_primary_ocr_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source=Path(folder)/"old-ocr.pdf"; pdf_fixture(source,scan=True,hidden_overlay=True)
+            output=Path(folder)/"result"
+            def recognize(pages,destination,*args,**kwargs):
+                self.assertEqual(len(pages),1)
+                with Image.open(pages[0][1]) as scan:
+                    self.assertLess(scan.convert("L").getpixel((round(75*scan.width/600),round(75*scan.height/800))),100)
+                raw=destination/"surya-input/results.json"; raw.parent.mkdir(parents=True,exist_ok=True)
+                raw.write_text(json.dumps({"page-0001":[{"page":1,"image_bbox":[0,0,600,800],"blocks":[{"label":"Text","html":"<p>Fresh primary text.</p>","bbox":[70,70,470,100],"reading_order":1}]}]}))
+                return {1:"Fresh primary text."}
+            with patch.object(sys,"argv",["booktext",str(source),"--no-qa","--no-pdf","--output-dir",str(output)]), patch.object(booktext,"require_surya"), patch.object(booktext,"recognize_pages_surya",side_effect=recognize) as ocr, contextlib.redirect_stdout(io.StringIO()):
+                booktext.main()
+            ocr.assert_called_once()
+            book=json.loads((output/"book.json").read_text())
+            self.assertEqual("Fresh primary text.",book["pages"][0]["text"])
+            self.assertEqual([],book["pages"][0]["visuals"])
+            report=json.loads((output/"extraction/report.json").read_text())
+            self.assertEqual("scan_with_ocr_overlay",report["pages"][0]["source_provenance"]["routing"]["route"])
+            self.assertIn("old",(output/"extraction/native.xml").read_text())
+            self.assertNotIn("old",' '.join(b.get("text","") for b in cdm.build_document(output)["blocks"]))
+
     def test_source_aware_preflight_does_not_require_ocr_for_native_analysis(self):
         with patch("tools.machine_protocol._dependency", side_effect=lambda name, **kw: {"name": name, "available": name in {"pdftotext","pdfimages","pdftoppm","pdfinfo","mutool"}}):
             result = processing_preflight(["book.pdf"], ["--no-pdf"])

@@ -8,6 +8,31 @@ are never implicitly migrated or overwritten.
 
 ## Routing and ownership
 
+Policy `automatic-extraction-2` also distinguishes a page scan with a preserved
+invisible OCR layer from visible digital text. MuPDF `ignore_text` glyph origins
+must align with at least 20 native words inside a raster covering 80% of the
+page. Those invisible words are evidence only: the visible scan is rendered at
+300 dpi and sent to primary Surya. Visible native words remain eligible for
+direct extraction and are masked only in the OCR input. A hidden watermark or
+hidden text without a page scan does not trigger this route.
+
+The raw text layer remains in `extraction/native.xml`; rendering provenance and
+route reasons remain in `extraction/report.json`. No lexical heuristic claims
+that one text is correct. Apple Vision retains its existing independent QA role.
+A whole-page scan is not exported as a figure simply because it is a raster.
+Surya layout, structured tables, fallback review and figure crops use the same
+production pipeline as scanned PDFs without a text layer. Old-policy workspaces
+fail closed on resume; select a new output directory to reprocess under v2.
+
+Dense scan OCR reserves 8192 input-image/prompt tokens in each llama.cpp context
+slot in addition to Surya's unchanged 12288 generation-token budget. An explicit
+total context override that cannot fit the per-slot budget fails closed rather
+than silently truncating a page. Larger explicit per-slot budgets are retained.
+The default is two inference slots to bound reserved KV memory; explicit
+`SURYA_INFERENCE_PARALLEL` settings are preserved.
+These budgets are part of the persisted chunk options fingerprint: changing
+them cannot reuse an older potentially truncated checkpoint silently.
+
 For PDF, Poppler's word boxes provide native text and flow/line geometry. Invalid
 characters and duplicate text-layer words reject that text layer. MuPDF drawing
 transforms inventory raster and vector regions. Native text is authoritative
@@ -118,6 +143,12 @@ quotations and unusual identifiers can legitimately trigger review. Validation
 rechecks existing translations offline without rewriting their source evidence.
 
 ## Verification
+
+For scans with no visible native-text blocks, CDM keeps the primary Surya
+reading order rather than interleaving columns by vertical position. Retained
+figure crops with matching raw-layout provenance and bounds occupy that same
+primary position exactly once; unanchored assets are not assigned a guessed
+semantic position.
 
 Run `python3 -m unittest discover -s tests -v` and
 `swift run --package-path BookTextApp BookTextProtocolTests`.
