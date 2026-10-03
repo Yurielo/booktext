@@ -60,7 +60,9 @@ Resume checks source and stage input hashes, CDM and translation validity, and
 export manifest/output hashes. It invalidates only the affected stage and its
 successors. A translation numeric or quality review signal pauses before
 export. A project-scoped worker lock rejects concurrent starts; it is released
-on process exit or interruption.
+on process exit or interruption. `pipeline-cancel` signals an active worker
+only after its recorded PID, command and project root are verified; the worker
+persists the paused stage. For an idle project it records a resumable pause.
 
 ## Durable project history
 

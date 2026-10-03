@@ -692,6 +692,7 @@ def _run_pipeline_locked(root, *, resume=False):
     except sequential_pipeline.PipelineError as error:
         raise MachineError("MODEL_RETIRED" if str(error).startswith("MODEL_RETIRED:") else "validation_failure", str(error)) from error
     job = ensure_job(root, status="running", source=[state["source"]])
+    job = update_job(root, status="running", launcher_pid=os.getpid())
     state["project_id"] = job["job_id"]
     sequential_pipeline.save(root, state)
     emitter = Emitter(job["job_id"])
@@ -831,6 +832,33 @@ def _run_pipeline_locked(root, *, resume=False):
     return EXIT_CODES["success"]
 
 
+def _signal_active_pipeline_worker(root):
+    """Signal only the verified worker holding this project's run lock."""
+    root = Path(root).expanduser().resolve()
+    with (root / ".booktext_pipeline.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return False
+    pid = read_job(root).get("launcher_pid")
+    if not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+        raise MachineError("cancel_unavailable", "active pipeline worker cannot be identified")
+    observed = subprocess.run(["/bin/ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False)
+    command = observed.stdout.strip()
+    worker_roots = [command.split(f"booktext.py machine {verb} ", 1)[1].strip().strip("\"'")
+                    for verb in ("pipeline-start", "pipeline-resume") if f"booktext.py machine {verb} " in command]
+    if observed.returncode or not any(Path(value).expanduser().resolve() == root for value in worker_roots):
+        raise MachineError("cancel_unavailable", "active pipeline worker identity could not be verified")
+    try:
+        os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def _handle(args):
     root = getattr(args, "output_dir", None)
     if args.command == "preflight":
@@ -903,6 +931,9 @@ def _handle(args):
             item = sequential_pipeline.stage(state, state.get("current_stage_id")) if state.get("current_stage_id") else sequential_pipeline.next_pending(state)
             if item is None:
                 raise sequential_pipeline.PipelineError("completed pipeline cannot be cancelled")
+            if _signal_active_pipeline_worker(root):
+                Emitter(read_job(root)["job_id"]).emit("job_completed", phase=_pipeline_phase(item), message="Cancellation requested for active pipeline worker", details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"]})
+                return EXIT_CODES["success"]
             sequential_pipeline.mark_paused(root, state, item, code="cancelled", message="Pipeline paused before starting a new stage", cancellation=True)
         except sequential_pipeline.PipelineError as error:
             raise MachineError("validation_failure", str(error)) from error
@@ -1065,7 +1096,7 @@ def main(argv=None):
         root = getattr(args, "output_dir", None)
         existing_root = root and Path(root).expanduser().resolve().is_dir()
         job_id = read_job(root)["job_id"] if existing_root else "machine"
-        if existing_root and error.code != "PIPELINE_BUSY": update_job(root, status="failed", error_code=error.code, error_details=error.details)
+        if existing_root and error.code not in {"PIPELINE_BUSY", "cancel_unavailable"}: update_job(root, status="failed", error_code=error.code, error_details=error.details)
         Emitter(job_id).emit("job_failed", phase=COMMAND_PHASE.get(getattr(args, "command", None)), code=error.code, message=str(error), details=error.details)
         return EXIT_CODES.get(error.code, EXIT_CODES["validation_failure"])
     except (ValueError, OSError, subprocess.SubprocessError) as error:

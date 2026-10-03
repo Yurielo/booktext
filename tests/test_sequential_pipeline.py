@@ -193,6 +193,17 @@ class SequentialPipelineTests(unittest.TestCase):
         self.assertEqual("PIPELINE_BUSY", captured.exception.code)
         self.assertEqual("PLANNED", sequential_pipeline._load(self.root)["status"])
 
+    def test_cancel_command_signals_active_worker_without_racing_its_checkpoint(self):
+        sequential_pipeline.create(self.root, source=self.source, definition=self.definition())
+        protocol.ensure_job(self.root, status="running", source=[str(self.source)])
+        with mock.patch.object(protocol, "_signal_active_pipeline_worker", return_value=True) as signal_worker:
+            code, payload = events(lambda: protocol.main(["pipeline-cancel", str(self.root)]))
+        self.assertEqual(0, code)
+        self.assertEqual("job_completed", payload[-1]["event_type"])
+        self.assertEqual("PLANNED", sequential_pipeline._load(self.root)["status"])
+        signal_worker.assert_called_once()
+        self.assertEqual(self.root.resolve(), signal_worker.call_args.args[0].resolve())
+
     def test_project_history_projection_exposes_current_stage_direction_and_export(self):
         state, _ = sequential_pipeline.create(self.root, source=self.source, definition=self.definition(translation=True))
         protocol.ensure_job(self.root, status="planned", source=[str(self.source)])

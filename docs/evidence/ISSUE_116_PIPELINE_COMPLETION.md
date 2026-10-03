@@ -62,11 +62,15 @@ unit of chunk 2, started only TRANSLATE and EXPORT, and completed the same
 translated DOCX. No upstream stage or saved translation unit was
 repeated. A subsequent resume of the completed primary run started zero stages.
 
-The native app's Stop path sends a signal to the same Core worker. During the
-real interruption, the worker preserved its translation checkpoint and did not
-start EXPORT. After both completions, no BookText-owned Python/OCR or inference
-child remained. The external Ollama daemon and its bounded model lease were
-left intact.
+The native app's Stop path sends a signal to the same Core worker. The separate
+`pipeline-cancel` command was also exercised during a real TRANSLATE stage:
+it verified the project lock and worker identity, signalled only that worker,
+returned a cancellation-request event, and the worker exited 130 with a
+PAUSED translation stage and no export. Resume then started only TRANSLATE and
+EXPORT and completed. During both interruptions, Core preserved translation
+checkpoints and did not start downstream work. After completion, no
+BookText-owned Python/OCR or inference child remained. The external Ollama
+daemon and its bounded model lease were left intact.
 
 ## Automated checks
 
