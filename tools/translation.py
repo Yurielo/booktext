@@ -1,7 +1,7 @@
 """Provenance-preserving, opt-in EN↔RU translation derived from BookText CDM.
 
 This module never edits OCR, review decisions, final-book files, or the CDM.
-It invokes a caller-selected local provider only when a translation command is
+It invokes the Core-approved local provider only when a translation command is
 explicitly requested.  The resulting artifact is source anchored and can be
 validated for staleness without contacting the provider again.
 """
@@ -9,6 +9,7 @@ validated for staleness without contacting the provider again.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -34,13 +35,8 @@ CHUNK_SCHEMA_VERSION = "1.1"
 SUPPORTED_LANGUAGES = ("en", "ru")
 TEXT_TYPES = {"heading", "paragraph", "list", "caption", "unknown"}
 DEFAULT_LOGICAL_UNIT_CHUNK_SIZE = 12
-PROMPT_VERSION = "qwen-document-translation-v2"
-RESPONSE_JSON_SCHEMA = {
-    "type": "object",
-    "properties": {"translation": {"type": "string"}},
-    "required": ["translation"],
-    "additionalProperties": False,
-}
+PRODUCTION_MODEL = "translategemma:4b"
+PROMPT_VERSION = "translategemma-document-translation-v1"
 QUALITY_POLICY_VERSION = "translation-quality-v2"
 MAX_UNIT_ATTEMPTS = 3
 MAX_PROVIDER_REQUEST_ATTEMPTS = 3
@@ -113,6 +109,15 @@ def _workspace_marker(root):
     return _translation_workspace(root) / ".booktext-translation-workspace.json"
 
 
+def _workspace_owned(marker, workspace):
+    """Accept a copied project whose authenticated workspace moved with it."""
+    if not isinstance(marker, dict) or marker.get("artifact_type") != CHUNK_WORKSPACE_TYPE or not marker.get("workspace_id"):
+        return False
+    recorded = Path(marker.get("path", ""))
+    return (not workspace.is_symlink() and recorded.parts[-2:] == ("translations", "chunks")
+            and workspace.parts[-2:] == ("translations", "chunks"))
+
+
 def pair_name(source_language, target_language):
     if source_language not in SUPPORTED_LANGUAGES or target_language not in SUPPORTED_LANGUAGES or source_language == target_language:
         raise ValueError("translation direction must be en→ru or ru→en")
@@ -183,6 +188,7 @@ def _script_language(text):
 
 
 def _model_info(endpoint, model, timeout):
+    require_production_model(model)
     request = urllib.request.Request(endpoint.rstrip("/") + "/api/tags", headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -192,48 +198,21 @@ def _model_info(endpoint, model, timeout):
     choices = payload.get("models", []) if isinstance(payload, dict) else []
     found = next((item for item in choices if isinstance(item, dict) and item.get("name") == model), None)
     if not found:
-        raise ValueError(f"requested local Ollama model is unavailable: {model}")
+        raise ValueError(f"requested local Ollama model is unavailable: {model}; install with ollama pull {model}")
+    if not isinstance(found.get("digest"), str) or not found["digest"]:
+        raise ValueError("installed TranslateGemma model has no verifiable digest")
     return {"kind": "ollama", "endpoint": endpoint.rstrip("/"), "model": model,
             "model_digest": found.get("digest"), "model_size_bytes": found.get("size"), "api": "/api/chat"}
 
 
-def _extract_translation(content):
-    try:
-        value = json.loads(content)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if not match:
-            raise ValueError("provider did not return a translation JSON object")
-        value = json.loads(match.group(0))
-    translation = value.get("translation") if isinstance(value, dict) else None
-    if not isinstance(translation, str) or not translation.strip():
-        raise ValueError("provider response has no non-empty translation")
-    return translation.strip()
-
-
-def _strip_model_thinking(content):
-    """Remove only an explicit Qwen-style hidden-thinking envelope."""
-    return re.sub(r"^\s*<think>.*?</think>\s*", "", content or "", flags=re.DOTALL)
+def require_production_model(model):
+    if model != PRODUCTION_MODEL:
+        raise ValueError(f"MODEL_RETIRED: BookText translation supports only {PRODUCTION_MODEL}; start a new translation from the saved CDM")
 
 
 def _max_output_tokens_for_source(source):
     """A logical-unit-sized completion cap prevents headings using prose budget."""
     return min(MAX_OUTPUT_TOKENS, max(128, len(source) * 2))
-
-
-def _is_short_heading_request(source, document_context):
-    return isinstance(document_context, dict) and document_context.get("block_type") == "heading" and len(source.strip()) <= 120
-
-
-def _safe_plain_provider_translation(content, *, source, target_language):
-    """Accept a narrowly safe non-JSON answer only as review evidence."""
-    candidate = (content or "").strip()
-    if not candidate or "\n" in candidate or len(candidate) > max(120, len(source) * 4):
-        return None
-    if re.search(r"\b(i cannot|sorry|translation|here is|ответ|перевод)\b", candidate, re.IGNORECASE):
-        return None
-    expected = CYRILLIC_RE if target_language == "ru" else re.compile(r"[A-Za-z]")
-    return candidate if expected.search(candidate) else None
 
 
 def _sentences(text, *, tail=False, limit=CONTEXT_CHAR_BUDGET):
@@ -352,73 +331,55 @@ class TranslationProviderRequestError(ValueError):
 
 
 def _translate_ollama(*, endpoint, model, source, source_language, target_language, before, after, glossary, timeout, keep_alive=DEFAULT_MODEL_KEEP_ALIVE, document_context=None):
-    glossary_text = json.dumps(glossary, ensure_ascii=False, sort_keys=True) if glossary else "{}"
-    prompt = {
-        "prompt_version": PROMPT_VERSION,
-        "task": "Translate only owned_source. Do not correct, summarize, omit, add commentary, or translate numbers/identifiers.",
-        "source_language": source_language,
-        "target_language": target_language,
-        "owned_source": source,
-        "context_before_read_only": before,
-        "context_after_read_only": after,
-        "document_context": document_context or {},
-        "applicable_glossary": _glossary_rules(glossary, source),
-        "response": "Return exactly JSON: {\"translation\": \"...\"}",
-        "safety": "Read-only context is for meaning only and must not appear in translation. Preserve all numeric tokens, fractions, units, citations and proper identifiers exactly when possible.",
-    }
-    # Translation needs a faithful rendered block, not a reasoning trace.
-    # Qwen3 and other thinking-capable local models can otherwise spend the
-    # whole bounded request window on hidden analysis before producing JSON.
-    # This remains an explicit provider setting in the resulting provenance.
-    short_heading = _is_short_heading_request(source, document_context)
-    if short_heading:
-        # Qwen can loop while trying to fill a JSON schema for a one-word
-        # heading.  This is still a source-anchored model request, but its
-        # contract is deliberately simple and bounded to a heading-sized
-        # answer. Context remains read-only evidence in provenance.
-        payload = {"model": model, "stream": False, "think": False, "keep_alive": keep_alive,
-                   "options": {"temperature": 0, "num_predict": 64},
-                   "messages": [{"role": "system", "content": "You are a faithful document translator. Return only the translated heading. No explanation, no JSON, no markdown."},
-                                {"role": "user", "content": f"Source language: {source_language}\nTarget language: {target_language}\nOwned heading: {source}\nRead-only context before: {before}\nRead-only context after: {after}"}]}
-    else:
-        payload = {"model": model, "stream": False, "format": RESPONSE_JSON_SCHEMA, "think": False, "keep_alive": keep_alive,
-                   "options": {"temperature": 0, "num_predict": _max_output_tokens_for_source(source)},
-                   "messages": [{"role": "system", "content": "You are a faithful document translator."},
-                                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}]}
+    """Use the official single-user-message TranslateGemma contract.
+
+    Read-only context is labelled outside the owned text. The exact prompt
+    version is included in the checkpoint fingerprint and final provenance.
+    """
+    require_production_model(model)
+    names = {"en": "English", "ru": "Russian"}
+    applicable = _glossary_rules(glossary, source)
+    context = document_context or {}
+    preface = []
+    if context.get("title"):
+        preface.append(f"Document title (context only): {context['title']}")
+    if context.get("heading_lineage"):
+        preface.append("Section headings (context only): " + json.dumps(context["heading_lineage"], ensure_ascii=False))
+    if before:
+        preface.append("Context before (read only): " + before)
+    if after:
+        preface.append("Context after (read only): " + after)
+    if applicable:
+        preface.append("Terminology for the owned text: " + json.dumps(applicable, ensure_ascii=False, sort_keys=True))
+    preface.append("Translate only the text after the two blank lines. Never include context text, labels, explanations or commentary in the answer. Preserve numbers, units, citations and identifiers where possible.")
+    prompt = (f"You are a professional {names[source_language]} ({source_language}) to {names[target_language]} ({target_language}) translator. "
+              f"Your goal is to accurately convey the meaning and nuances of the original {names[source_language]} text while adhering to {names[target_language]} grammar, vocabulary, and cultural sensitivities.\n"
+              + "\n".join(preface) + "\n"
+              + f"Produce only the {names[target_language]} translation, without any additional explanations or commentary. Please translate the following {names[source_language]} text into {names[target_language]}:\n\n\n{source}")
+    max_tokens = _max_output_tokens_for_source(source)
+    payload = {"model": model, "stream": False, "keep_alive": keep_alive,
+               "options": {"temperature": 0, "num_predict": max_tokens},
+               "messages": [{"role": "user", "content": prompt}]}
     request = urllib.request.Request(endpoint.rstrip("/") + "/api/chat", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
-        raise TranslationProviderRequestError(
-            f"local Ollama translation request failed: {type(error).__name__}: {error}"
-        ) from error
-    content = (((result.get("message") or {}).get("content")) if isinstance(result, dict) else None)
-    if not isinstance(content, str):
-        raise TranslationProviderRequestError("local Ollama response is missing message content")
-    content = _strip_model_thinking(content)
-    if short_heading:
-        extracted = _safe_plain_provider_translation(content, source=source, target_language=target_language)
-        if extracted is None:
-            diagnostic = re.sub(r"\s+", " ", content).strip()[:160]
-            raise TranslationProviderRequestError(f"provider did not return a safe short-heading translation; response_sample={diagnostic!r}")
-        return extracted, {"temperature": 0, "max_output_tokens": 64, "thinking": False, "response_format": "plain_short_heading", "prompt_version": PROMPT_VERSION,
-                           "glossary_json": glossary_text, "keep_alive": keep_alive,
-                           "done_reason": result.get("done_reason"), "eval_count": result.get("eval_count"),
-                           "response_format_fallback": False}
-    response_format_fallback = False
-    try:
-        extracted = _extract_translation(content)
-    except ValueError as error:
-        extracted = _safe_plain_provider_translation(content, source=source, target_language=target_language)
-        if extracted is None:
-            diagnostic = re.sub(r"\s+", " ", content).strip()[:160]
-            raise TranslationProviderRequestError(f"{error}; response_sample={diagnostic!r}") from error
-        response_format_fallback = True
-    return extracted, {"temperature": 0, "max_output_tokens": _max_output_tokens_for_source(source), "thinking": False, "response_format": "json_schema", "prompt_version": PROMPT_VERSION,
-                                           "glossary_json": glossary_text, "keep_alive": keep_alive,
-                                           "done_reason": result.get("done_reason"), "eval_count": result.get("eval_count"),
-                                           "response_format_fallback": response_format_fallback}
+        raise TranslationProviderRequestError(f"local Ollama translation request failed: {type(error).__name__}: {error}") from error
+    if not isinstance(result, dict) or result.get("error"):
+        raise TranslationProviderRequestError("local Ollama provider error: " + str(result.get("error") if isinstance(result, dict) else "invalid response"))
+    message = result.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise TranslationProviderRequestError("local Ollama response has no non-empty translation")
+    if result.get("done_reason") not in (None, "stop"):
+        raise TranslationProviderRequestError("local Ollama translation ended without completion: " + str(result.get("done_reason")))
+    if result.get("done") is False:
+        raise TranslationProviderRequestError("local Ollama translation response is incomplete")
+    return content.strip(), {"temperature": 0, "max_output_tokens": max_tokens, "response_format": "plain_text",
+                             "prompt_version": PROMPT_VERSION, "keep_alive": keep_alive,
+                             "done_reason": result.get("done_reason"), "eval_count": result.get("eval_count"),
+                             "prompt_sha256": _sha_bytes(prompt.encode("utf-8"))}
 
 
 def _eligible(document):
@@ -449,7 +410,7 @@ def _ensure_translation_workspace(root, *, translation_id, source_fingerprint):
                   "workspace_id": str(uuid.uuid4()), "translation_id": translation_id,
                   "source_fingerprint": source_fingerprint, "path": str(workspace), "created_at": _now()}
         _atomic_json(marker_path, marker)
-    if marker.get("artifact_type") != CHUNK_WORKSPACE_TYPE or marker.get("path") != str(workspace):
+    if not _workspace_owned(marker, workspace):
         raise ValueError("translation checkpoint workspace ownership marker is invalid")
     return workspace
 
@@ -466,7 +427,7 @@ def _create_or_load_translation_plan(root, *, translation_id, source_fingerprint
     expected = {"translation_id": translation_id, "source_fingerprint": source_fingerprint,
                 "units": units, "options_fingerprint": _digest(options)}
     if existing is not None:
-        if any(existing.get(key) != value for key, value in expected.items()):
+        if int(existing.get("chunk_size", 0)) != int(chunk_size) or any(existing.get(key) != value for key, value in expected.items()):
             existing.update({"status": "stale", "stale_reason": "source_or_translation_options_changed", "updated_at": _now()})
             _atomic_json(path, existing)
             raise ValueError("existing translation checkpoint plan is stale; source or translation options changed")
@@ -731,11 +692,72 @@ def _reset_translation_workspace(root):
         shutil.rmtree(workspace)
 
 
-def translate_document(output_dir, *, source_language, target_language, provider, model, glossary_path=None, endpoint="http://127.0.0.1:11434", timeout=120, keep_alive=DEFAULT_MODEL_KEEP_ALIVE, chunk_size=DEFAULT_LOGICAL_UNIT_CHUNK_SIZE, restart=False, progress=None, block_ids=None):
+def _archive_existing_manifest(root, pair, existing):
+    """Content-addressed history permits multiple versions of one CDM/pair."""
+    revision = _digest(existing)
+    history = Path(root) / "translations" / "history" / f"{pair}-{revision}.json"
+    history.parent.mkdir(parents=True, exist_ok=True)
+    if not history.exists():
+        _atomic_json(history, existing)
+    elif _load(history) != existing:
+        raise ValueError("translation history hash collision")
+    # Preserve the human-readable projections and any previously exported
+    # formats before a new run can overwrite the current pair paths.
+    files = history.parent / f"{pair}-{revision}-files"
+    files.mkdir(exist_ok=True)
+    for relative in (existing.get("outputs") or {}).values():
+        if not isinstance(relative, str):
+            continue
+        source = (Path(root) / relative).resolve()
+        if source.is_file() and source.is_relative_to(Path(root).resolve()):
+            target = files / source.name
+            if not target.exists():
+                shutil.copy2(source, target)
+    old_exports = Path(root) / "translations" / "exports" / pair
+    archived_exports = files / "exports"
+    if old_exports.is_dir() and not archived_exports.exists():
+        shutil.copytree(old_exports, archived_exports)
+    return history
+
+
+def _archive_checkpoint_workspace(root):
+    workspace = _translation_workspace(root).resolve()
+    if not workspace.exists():
+        return None
+    marker = _load(_workspace_marker(root))
+    if not _workspace_owned(marker, workspace):
+        raise ValueError("refusing to archive unauthenticated translation checkpoint workspace")
+    history = Path(root) / "translations" / "history" / "checkpoints" / marker["workspace_id"]
+    history.parent.mkdir(parents=True, exist_ok=True)
+    if history.exists():
+        raise ValueError("translation checkpoint archive already exists; inspect before retrying")
+    workspace.rename(history)
+    return history
+
+
+def translate_document(output_dir, *, source_language, target_language, provider, model=PRODUCTION_MODEL, glossary_path=None, endpoint="http://127.0.0.1:11434", timeout=120, keep_alive=DEFAULT_MODEL_KEEP_ALIVE, chunk_size=DEFAULT_LOGICAL_UNIT_CHUNK_SIZE, restart=False, migrate=False, progress=None, block_ids=None):
+    """Permit one heavy BookText translation worker per local account."""
+    require_production_model(model)
+    lock_path = Path(tempfile.gettempdir()) / f"booktext-translation-worker-{os.getuid()}.lock"
+    with lock_path.open("a+b") as worker_lock:
+        try:
+            fcntl.flock(worker_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("TRANSLATION_BUSY: another BookText translation is already running") from error
+        try:
+            return _translate_document_unlocked(output_dir, source_language=source_language, target_language=target_language,
+                provider=provider, model=model, glossary_path=glossary_path, endpoint=endpoint, timeout=timeout,
+                keep_alive=keep_alive, chunk_size=chunk_size, restart=restart, migrate=migrate, progress=progress, block_ids=block_ids)
+        finally:
+            fcntl.flock(worker_lock, fcntl.LOCK_UN)
+
+
+def _translate_document_unlocked(output_dir, *, source_language, target_language, provider, model, glossary_path, endpoint, timeout, keep_alive, chunk_size, restart, migrate, progress, block_ids):
     root = Path(output_dir).expanduser().resolve()
     pair = pair_name(source_language, target_language)
     if provider != "ollama":
         raise ValueError("only explicit local Ollama translation is currently supported")
+    require_production_model(model)
     document = _load(root / "book_document.json")
     decisions = _load(root / "review_decisions.json", {})
     canonical_document.validate_document(document, root=root, decisions=decisions)
@@ -762,38 +784,44 @@ def translate_document(output_dir, *, source_language, target_language, provider
         selected_block_ids = [block["block_id"] for block in blocks]
         if len(selected_block_ids) != len(block_ids):
             raise ValueError("block_ids contain an ineligible or unknown CDM block")
-    translation_id = "translation-" + _sha_bytes((document.get("document_id", "") + pair + cdm_sha).encode("utf-8"))[:20]
     options = {"direction": {"source_language": source_language, "target_language": target_language}, "provider": "ollama", "model": model,
                "model_digest": metadata.get("model_digest"), "glossary": glossary_provenance, "keep_alive": keep_alive,
                "prompt_version": PROMPT_VERSION, "quality_policy_version": QUALITY_POLICY_VERSION, "context_char_budget": CONTEXT_CHAR_BUDGET,
                "max_output_tokens": MAX_OUTPUT_TOKENS, "max_retry_source_chars": MAX_RETRY_SOURCE_CHARS,
+               "endpoint": metadata["endpoint"], "temperature": 0, "response_format": "plain_text",
+               "request_timeout_seconds": timeout, "effective_keep_alive": execution_keep_alive,
                "selected_block_ids": selected_block_ids}
     units = [_unit_spec(block) for block in blocks]
     source_fingerprint = _digest({"cdm_sha256": cdm_sha, "units": units, "options": options})
+    translation_id = "translation-" + source_fingerprint[:20]
     destination = translation_path(root, source_language, target_language)
     existing = _load(destination)
     expected_reuse = {"model": model, "model_digest": metadata.get("model_digest"), "glossary": glossary_provenance,
                       "prompt_version": PROMPT_VERSION, "quality_policy_version": QUALITY_POLICY_VERSION, "keep_alive": keep_alive,
-                      "max_output_tokens": MAX_OUTPUT_TOKENS, "max_retry_source_chars": MAX_RETRY_SOURCE_CHARS}
+                      "max_output_tokens": MAX_OUTPUT_TOKENS, "max_retry_source_chars": MAX_RETRY_SOURCE_CHARS,
+                      "endpoint": metadata["endpoint"], "temperature": 0, "response_format": "plain_text",
+                      "request_timeout_seconds": timeout, "effective_keep_alive": execution_keep_alive,
+                      "selected_block_ids": selected_block_ids}
     if not restart and existing and (existing.get("source") or {}).get("cdm_sha256") == cdm_sha and all((existing.get("generation") or {}).get(key) == value for key, value in expected_reuse.items()):
         validation = _validate_manifest(existing, document, cdm_sha=cdm_sha)
         if validation["valid"] and not validation["stale"]:
             return {"path": str(destination), "reused": True, "validation": validation}
     active_plan = _load(_plan_path(root))
-    compatible_active_plan = bool(active_plan) and all(active_plan.get(key) == value for key, value in {
+    compatible_active_plan = bool(active_plan) and int(active_plan.get("chunk_size", 0)) == int(chunk_size) and _digest(active_plan.get("options")) == active_plan.get("options_fingerprint") and all(active_plan.get(key) == value for key, value in {
         "translation_id": translation_id, "source_fingerprint": source_fingerprint,
         "options_fingerprint": _digest(options),
     }.items())
+    active_incomplete = bool(active_plan) and any(chunk.get("status") != "complete" for chunk in active_plan.get("chunks", []))
+    if active_plan and not compatible_active_plan and active_incomplete and not migrate and not restart:
+        raise ValueError("MIGRATION_REQUIRED: existing translation checkpoints use another model, prompt or source; start TranslateGemma from the saved CDM with --migrate (OCR and QA are retained)")
     if existing:
-        history = destination.parent / "history" / f"{pair}-{(existing.get('source') or {}).get('cdm_sha256', 'unknown')[:12]}.json"
-        history.parent.mkdir(parents=True, exist_ok=True)
-        if not history.exists(): _atomic_json(history, existing)
+        _archive_existing_manifest(root, pair, existing)
     # A previous completed derivative may be stale while a newer matching plan
     # is in progress. Preserve that plan and its partial unit checkpoints; only
     # reset an authenticated workspace when the plan itself is incompatible or
     # the user explicitly requests a restart.
-    if restart or (existing and not compatible_active_plan):
-        _reset_translation_workspace(root)
+    if restart or (active_plan and not compatible_active_plan):
+        _archive_checkpoint_workspace(root)
     plan, plan_created = _create_or_load_translation_plan(root, translation_id=translation_id, source_fingerprint=source_fingerprint,
         units=units, options=options, chunk_size=chunk_size)
     if progress:

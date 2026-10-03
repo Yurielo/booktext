@@ -28,7 +28,6 @@ import BookTextCore
     @Published var workflowReviewPolicy = "skip_human_review"
     @Published var workflowTranslate = false
     @Published var workflowTranslationSource = "en"
-    @Published var workflowTranslationModel = "qwen3:8b"
     @Published var workflowExportFormats: Set<String> = ["docx"]
     @Published var cleanupBusy = false
     @Published private(set) var recentOutputPaths: [String] = []
@@ -127,7 +126,7 @@ import BookTextCore
             ["stage_id": "cdm", "type": "CDM", "config": [:]],
         ]
         if workflowTranslate {
-            stages.append(["stage_id": "translate", "type": "TRANSLATE", "config": ["source_language": workflowTranslationSource, "target_language": workflowTranslationSource == "en" ? "ru" : "en", "provider": "ollama", "model": workflowTranslationModel]])
+            stages.append(["stage_id": "translate", "type": "TRANSLATE", "config": ["source_language": workflowTranslationSource, "target_language": workflowTranslationSource == "en" ? "ru" : "en", "provider": "ollama"]])
         }
         if !workflowExportFormats.isEmpty {
             stages.append(["stage_id": "export", "type": "EXPORT", "config": ["formats": ExportFormatSelection.ordered(workflowExportFormats), "document": workflowTranslate ? "TRANSLATION" : "ORIGINAL"]])
@@ -151,6 +150,17 @@ import BookTextCore
         guard let outputURL else { return }
         let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
         do { try client.start(arguments: [resume ? "pipeline-resume" : "pipeline-start", outputURL.path], event: { [weak self] event in Task { @MainActor in self?.receiveRun(event) } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { [weak self] status in Task { @MainActor in self?.finishRun(status) } }) } catch { errorText = error.localizedDescription; presentation.state = .failed }
+    }
+    var legacyTranslationMigrationRequired: Bool { result["project"]?.object?["migration_required"]?.bool == true }
+    func migrateLegacyPipelineTranslation() {
+        guard let outputURL else { return }
+        let client = CoreProcessBridge(configuration: CoreConfiguration(scriptPath: corePath)); bridge = client
+        do { try client.start(arguments: ["pipeline-migrate-translation", outputURL.path], event: { [weak self] event in Task { @MainActor in
+            guard let self else { return }
+            if event.eventType == .jobCompleted { self.runPipeline(resume: true) }
+            if event.eventType == .jobFailed { self.errorText = "\(event.code): \(event.message)" }
+        } }, stderr: { [weak self] text in Task { @MainActor in self?.receiveStderr(text) } }, finished: { _ in }) }
+        catch { errorText = error.localizedDescription }
     }
     private func receiveRun(_ event: MachineEvent) {
         presentation.consume(event)
@@ -303,7 +313,7 @@ struct ContentView: View {
             Label("1  Process document", systemImage: "1.circle")
             HStack { Label("2  Review", systemImage: "2.circle"); Picker("Review", selection: $model.workflowReviewPolicy) { Text("Skip review").tag("skip_human_review"); Text("Review when required").tag("review_when_required") }.labelsHidden().frame(width: 190) }
             Toggle("3  Translate English → Russian", isOn: $model.workflowTranslate)
-            if model.workflowTranslate { HStack { Picker("Source", selection: $model.workflowTranslationSource) { Text("English → Russian").tag("en"); Text("Russian → English").tag("ru") }.labelsHidden(); TextField("Local model", text: $model.workflowTranslationModel).textFieldStyle(.roundedBorder).frame(width: 170) } }
+            if model.workflowTranslate { Picker("Source", selection: $model.workflowTranslationSource) { Text("English → Russian").tag("en"); Text("Russian → English").tag("ru") }.labelsHidden() }
             HStack { Label("4  Export", systemImage: "4.circle"); ForEach([("docx", "DOCX"), ("pdf", "PDF"), ("epub", "EPUB"), ("html", "HTML"), ("markdown", "Markdown")], id: \.0) { format in Toggle(format.1, isOn: workflowFormatBinding(format.0)).toggleStyle(.checkbox) } }
             Text("BookText validates and saves this sequential plan before work starts. Completed stages resume safely after an interruption.").font(.caption).foregroundStyle(.secondary)
         }.padding(14).background(Color.secondary.opacity(0.06)).clipShape(RoundedRectangle(cornerRadius: 10))
@@ -322,7 +332,7 @@ struct ContentView: View {
         }.frame(maxWidth: 720, alignment: .leading)
     }
     private var interrupted: some View {
-        VStack(alignment: .leading, spacing: 16) { documentCard(status: model.snapshot.state == .pipelinePlanned ? "Workflow ready" : "Workflow paused", symbol: model.snapshot.state == .pipelinePlanned ? "checkmark.circle" : "pause.circle"); Text("Completed work is saved. Resume continues from the current stage without repeating completed stages or chunks.").foregroundStyle(.secondary); if model.snapshot.state == .pipelinePaused || model.snapshot.state == .pipelinePlanned { Button(model.snapshot.state == .pipelinePlanned ? "Start Workflow" : "Resume Workflow") { model.runPipeline(resume: model.snapshot.state == .pipelinePaused) }.buttonStyle(.borderedProminent) } else { Button("Choose Source to Resume…", action: chooseFiles).buttonStyle(.borderedProminent) }; Button("Back to Documents", action: model.resetToChooser) }
+        VStack(alignment: .leading, spacing: 16) { documentCard(status: model.snapshot.state == .pipelinePlanned ? "Workflow ready" : "Workflow paused", symbol: model.snapshot.state == .pipelinePlanned ? "checkmark.circle" : "pause.circle"); Text(model.legacyTranslationMigrationRequired ? "The previous Qwen translation is archived when you start a new TranslateGemma run from saved CDM. OCR and review are retained." : "Completed work is saved. Resume continues from the current stage without repeating completed stages or chunks.").foregroundStyle(.secondary); if model.legacyTranslationMigrationRequired { Button("Start TranslateGemma from saved document", action: model.migrateLegacyPipelineTranslation).buttonStyle(.borderedProminent) } else if model.snapshot.state == .pipelinePaused || model.snapshot.state == .pipelinePlanned { Button(model.snapshot.state == .pipelinePlanned ? "Start Workflow" : "Resume Workflow") { model.runPipeline(resume: model.snapshot.state == .pipelinePaused) }.buttonStyle(.borderedProminent) } else { Button("Choose Source to Resume…", action: chooseFiles).buttonStyle(.borderedProminent) }; Button("Back to Documents", action: model.resetToChooser) }
     }
     private var completedDocument: some View {
         VStack(alignment: .leading, spacing: 18) {

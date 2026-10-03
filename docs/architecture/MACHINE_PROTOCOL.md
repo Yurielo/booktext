@@ -25,7 +25,7 @@ booktext machine review OUTPUT_DIR [--page N]
 booktext machine decision OUTPUT_DIR --item ID --action ACTION [...]
 booktext machine final-build OUTPUT_DIR
 booktext machine cdm OUTPUT_DIR
-booktext machine translation OUTPUT_DIR --source-language en --target-language ru --model MODEL [--keep-alive 30s]
+booktext machine translation OUTPUT_DIR --source-language en --target-language ru [--model translategemma:4b] [--keep-alive 30s] [--migrate]
 booktext machine translation-validate OUTPUT_DIR --source-language en --target-language ru
 booktext machine export OUTPUT_DIR --format FORMAT [--format FORMAT ...]
 booktext machine pipeline-create --definition-json JSON SOURCE

@@ -441,13 +441,25 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
     return manifest
 
 
-def export_translation(output_dir, formats, *, source_language, target_language):
+def export_translation(output_dir, formats, *, source_language, target_language, history_sha=None):
     """Export an existing validated derivative translation without model calls."""
     root = Path(output_dir).expanduser().resolve()
-    validation = translation.validate_translation(root, source_language=source_language, target_language=target_language)
+    pair = f"{source_language}-{target_language}"
+    if history_sha is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", history_sha):
+            raise ValueError("history SHA must be a 64-character lowercase hex digest")
+        manifest_path = root / "translations" / "history" / f"{pair}-{history_sha}.json"
+        translation_manifest = _load(manifest_path)
+        if not translation_manifest or translation._digest(translation_manifest) != history_sha:
+            raise ValueError("historical translation is missing or has invalid digest")
+        source_document = _load(root / "book_document.json")
+        validation = translation._validate_manifest(translation_manifest, source_document, cdm_sha=translation.sha_file(root / "book_document.json"))
+    else:
+        validation = translation.validate_translation(root, source_language=source_language, target_language=target_language)
+        manifest_path = translation.translation_path(root, source_language, target_language)
+        translation_manifest = _load(manifest_path)
     if not validation["valid"] or validation["stale"]:
         raise ValueError("translation must be valid and source-matched before export")
-    translation_manifest = _load(translation.translation_path(root, source_language, target_language))
     source_document = _load(root / "book_document.json")
     document = json.loads(json.dumps(source_document, ensure_ascii=False))
     entries = {entry["block_id"]: entry for entry in translation_manifest["blocks"]}
@@ -455,11 +467,11 @@ def export_translation(output_dir, formats, *, source_language, target_language)
         entry = entries.get(block.get("block_id"))
         if entry and isinstance(entry.get("translation"), str):
             block["text"] = entry["translation"]
-    pair = f"{source_language}-{target_language}"
     title = document.get("metadata", {}).get("title") or "BookText export"
     document.setdefault("metadata", {})["title"] = f"{title} ({pair} translation)"
-    return export_document(root, formats, document_override=document, export_relative=f"translations/exports/{pair}", basename=f"book-{pair}", deliverable_label_prefix=f"translation {pair}",
-        provenance={"artifact_type": "booktext.translation_export_manifest", "translation": {"path": str(translation.translation_path(root, source_language, target_language).relative_to(root)), "translation_id": translation_manifest["translation_id"], "validation": validation, "raw_ocr_mutated": False}})
+    suffix = f"/history/{history_sha}" if history_sha else ""
+    return export_document(root, formats, document_override=document, export_relative=f"translations/exports/{pair}{suffix}", basename=f"book-{pair}", deliverable_label_prefix=f"translation {pair}",
+        provenance={"artifact_type": "booktext.translation_export_manifest", "translation": {"path": str(manifest_path.relative_to(root)), "translation_id": translation_manifest["translation_id"], "validation": validation, "raw_ocr_mutated": False}})
 
 
 def _pdf_main(document_path, destination):

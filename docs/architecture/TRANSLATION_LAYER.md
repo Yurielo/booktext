@@ -6,14 +6,16 @@ rewrites raw OCR, QA evidence, review decisions, final-book artifacts, or CDM.
 
 ## Explicit local invocation
 
-The first supported provider is a caller-selected local Ollama model.  There
-is deliberately no default model and no cloud fallback:
+BookText Core supports one production translation model: `translategemma:4b` in local Ollama. The official TranslateGemma prompt uses one user message, explicit English/Russian language names and codes, two blank lines before owned source text, and a plain-text translation-only response. BookText adds labelled read-only document and neighbouring-block context and applicable glossary terms. It does not request JSON or model thinking. [Ollama model and prompt guide](https://ollama.com/library/translategemma).
 
 ```bash
 python3 booktext.py translate OUTPUT_DIR \
-  --source-language en --target-language ru \
-  --provider ollama --model qwen3:8b
+  --source-language en --target-language ru
 ```
+
+An explicit `--model` is accepted only when it is exactly `translategemma:4b`. A retired model request fails before inference with `MODEL_RETIRED`. If an old Qwen checkpoint exists, BookText reports `MIGRATION_REQUIRED`; run the command again with `--migrate` to archive the old checkpoint workspace and start a new translation from saved CDM. The old completed translation remains available for opening and export without Ollama.
+
+For a legacy pipeline, use `booktext machine pipeline-migrate-translation OUTPUT_DIR` and then `booktext machine pipeline-resume OUTPUT_DIR`. Core preserves completed processing, review and CDM stages. A repeated migration command is idempotent. A historical revision can be exported offline with `booktext machine translation-export OUTPUT_DIR --source-language en --target-language ru --history-sha SHA256 --format docx`; the SHA is the suffix of `translations/history/en-ru-SHA256.json`. Historical exports are written under `translations/exports/en-ru/history/SHA256/` and do not overwrite the current translation export.
 
 The reverse direction uses `--source-language ru --target-language en`.  A
 JSON glossary can be supplied with `--glossary glossary.json`; it maps source
@@ -28,19 +30,18 @@ the full CDM only for read-only neighbouring context.
 or another local client. `booktext machine translation-validate …` checks an
 existing result only and never contacts Ollama.
 
-BookText asks thinking-capable local models for a non-reasoning response
-(`think: false`): translation requires the rendered block, not an internal
-reasoning trace. This setting is stored in the per-block provider provenance.
-
-Each BookText translation request asks Ollama for a bounded `keep_alive: 30s`
-lease. Sequential blocks reuse the loaded model during that lease; after the
-last BookText request Ollama unloads the model naturally when the lease
-expires. BookText never calls a global unload, stops `ollama serve`, or kills a
-process by name, because that could interrupt another local client. The bounded
-lease applies on normal completion, provider failure, timeout, and cancellation
-once Ollama finishes the already-received request. Advanced CLI and machine
-callers may pass a bounded `--keep-alive` value such as `30s`; BookText accepts
-only 1 ms through 300 s and defaults to 30 s.
+BookText accepts a requested idle `--keep-alive` from 1 ms through 300 s,
+defaulting to 30 s. Core raises the effective request lease to cover bounded
+request retries: with the default 120 s timeout and three request attempts,
+the effective Ollama lease is capped at 300 s. Retry timeouts are 120, 240
+and 300 s, so a failing unit can take up to 660 s of request waiting per
+quality attempt; short units permit at most three quality attempts. The
+effective lease is recorded in provider provenance. Sequential blocks reuse
+the loaded model; after the final request Ollama releases it when the lease
+expires, unless another client extends the lease. BookText never stops the
+shared daemon or unloads a model by process name. A per-user file lock admits
+one BookText translation worker at a time and releases on failure or
+cancellation.
 
 ## Artifacts and safety
 
@@ -51,8 +52,8 @@ For EN→RU, BookText writes:
 - `translations/book-en-ru.md`: target-language reading projection;
 - `translations/book-en-ru-bilingual.md`: target text with original text
   alongside it;
-- `translations/history/`: preserved earlier derived revisions when the CDM
-  changed.
+- `translations/history/`: content-addressed earlier manifests, readable
+  Markdown projections, prior exports and checkpoint workspaces.
 
 The validated derivative can be exported without re-running OCR or a model:
 
@@ -74,7 +75,7 @@ text. A block already entirely in the target language is explicitly recorded
 as skipped rather than sent to a model. Mixed-language blocks are still
 source-anchored and their direction is recorded.
 
-The layer separates request/JSON success, checkpoint integrity, automated
+The layer separates request/response success, checkpoint integrity, automated
 quality signals and human semantic acceptance. It checks numeric tokens,
 provider completion reason, mixed-script words, repeated output, unchanged
 headings, applicable glossary terms and possible read-only-context leakage.
@@ -90,6 +91,12 @@ preserves the old derived revision before atomically publishing the new one.
 Machine translation is evidence for a later human language review, separate
 from OCR human review. Cloud and paid translation services are intentionally
 out of scope until the Product Owner explicitly chooses one.
+
+`tools/hybrid_context_v13.py`, `tools/hybrid_semantic_audit_v15.py` and
+`tools/hybrid_targeted_audit_v16.py` are archived OCR audit experiments. They
+are not imported by the app, production Core, pipeline, bootstrap or current
+acceptance automation. Their Qwen references remain as historical research
+provenance and are not TranslateGemma translation paths.
 
 ## Resumable logical-unit execution
 

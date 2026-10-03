@@ -2306,13 +2306,13 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if len(sys.argv) > 1 and sys.argv[1] == "translate":
-        from tools.translation import translate_document, validate_translation
+        from tools.translation import PRODUCTION_MODEL, translate_document, validate_translation
         parser = argparse.ArgumentParser(prog="booktext translate", description="Create a derived EN↔RU translation from an existing CDM.")
         parser.add_argument("output_dir")
         parser.add_argument("--source-language", required=True, choices=("en", "ru"))
         parser.add_argument("--target-language", required=True, choices=("en", "ru"))
         parser.add_argument("--provider", default="ollama", choices=("ollama",))
-        parser.add_argument("--model", help="Explicit locally installed Ollama model; required unless --validate is used")
+        parser.add_argument("--model", default=PRODUCTION_MODEL, help=f"BookText translation model (only {PRODUCTION_MODEL})")
         parser.add_argument("--glossary", help="JSON glossary mapping source terms to target terms")
         parser.add_argument("--endpoint", default="http://127.0.0.1:11434")
         parser.add_argument("--timeout", type=int, default=120)
@@ -2320,15 +2320,19 @@ if __name__ == "__main__":
         parser.add_argument("--chunk-size", type=int, default=12, help="Whole logical units per resumable translation checkpoint")
         parser.add_argument("--block-id", action="append", dest="block_ids", help="Translate one source-ordered logical unit; repeat only for a bounded pilot")
         parser.add_argument("--restart", action="store_true", help="Archive current derived translation and restart its owned checkpoints")
+        parser.add_argument("--migrate", action="store_true", help="Archive an incompatible legacy run and restart from the saved CDM")
         parser.add_argument("--validate", action="store_true", help="Validate existing translation only; do not contact a provider")
         options = parser.parse_args(sys.argv[2:])
-        if options.validate:
-            result = validate_translation(options.output_dir, source_language=options.source_language, target_language=options.target_language)
-        else:
-            if not options.model:
-                parser.error("--model is required unless --validate is used")
-            result = translate_document(options.output_dir, source_language=options.source_language, target_language=options.target_language,
-                provider=options.provider, model=options.model, glossary_path=options.glossary, endpoint=options.endpoint, timeout=options.timeout, keep_alive=options.keep_alive, chunk_size=options.chunk_size, restart=options.restart, block_ids=options.block_ids)
+        try:
+            if options.validate:
+                result = validate_translation(options.output_dir, source_language=options.source_language, target_language=options.target_language)
+            else:
+                result = translate_document(options.output_dir, source_language=options.source_language, target_language=options.target_language,
+                    provider=options.provider, model=options.model, glossary_path=options.glossary, endpoint=options.endpoint, timeout=options.timeout, keep_alive=options.keep_alive, chunk_size=options.chunk_size, restart=options.restart, migrate=options.migrate, block_ids=options.block_ids)
+        except ValueError as error:
+            code = next((value for value in ("MODEL_RETIRED", "MIGRATION_REQUIRED", "TRANSLATION_BUSY") if str(error).startswith(value + ":")), "validation_failure")
+            print(json.dumps({"code": code, "message": str(error)}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(5)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(0)
 

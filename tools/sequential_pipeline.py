@@ -102,8 +102,9 @@ def validate_definition(definition):
         config = stages[translation_index]["config"]
         if config.get("source_language") not in {"en", "ru"} or config.get("target_language") not in {"en", "ru"} or config.get("source_language") == config.get("target_language"):
             raise PipelineError("TRANSLATE requires distinct source and target languages")
-        if not isinstance(config.get("model"), str) or not config["model"].strip():
-            raise PipelineError("TRANSLATE requires a local model")
+        from tools.translation import PRODUCTION_MODEL
+        if config.get("model", PRODUCTION_MODEL) != PRODUCTION_MODEL:
+            raise PipelineError("MODEL_RETIRED: create a new TranslateGemma translation run from saved CDM")
     if "EXPORT" in kinds:
         export_index = kinds.index("EXPORT")
         if export_index != len(kinds) - 1:
@@ -152,6 +153,34 @@ def create(root, *, source, definition):
     }
     _atomic(path(root), state)
     return state, True
+
+
+def migrate_legacy_translation(root):
+    """Explicitly reconfigure an incomplete legacy stage without replaying OCR."""
+    from tools.translation import PRODUCTION_MODEL
+    state = _load(root)
+    if not state:
+        raise PipelineError("pipeline does not exist for this project")
+    item = next((value for value in state["stages"] if value["type"] == "TRANSLATE"), None)
+    if item is None or item["status"] == "COMPLETE":
+        raise PipelineError("pipeline has no incomplete translation stage to migrate")
+    old_model = item["config"].get("model", PRODUCTION_MODEL)
+    if old_model == PRODUCTION_MODEL and item["config"].get("migrate"):
+        return state, False
+    if old_model == PRODUCTION_MODEL:
+        raise PipelineError("pipeline already uses the production translation model")
+    state.setdefault("migration_history", []).append({"at": _now(), "previous_definition": json.loads(json.dumps(state["definition"])), "previous_stage": json.loads(json.dumps(item))})
+    item["config"] = {**item["config"], "model": PRODUCTION_MODEL, "migrate": True}
+    item["status"] = "PENDING"
+    item["artifact_refs"] = {}
+    item["validation"] = None
+    for stage in state["definition"]["stages"]:
+        if stage["type"] == "TRANSLATE":
+            stage["config"] = dict(item["config"])
+    state["status"] = "PAUSED"
+    state["current_stage_id"] = item["stage_id"]
+    state["failure"] = None
+    return save(root, state), True
 
 
 def save(root, state):

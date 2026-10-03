@@ -174,13 +174,18 @@ def _unavailable_inspection(root, *, detail):
 
 def _translation_state(root, artifacts):
     plan = _load(Path(root) / "translations" / "chunks" / "translation_plan.json", {}) or {}
-    manifest = _load(Path(root) / "translations" / "en-ru.json", {}) or {}
+    manifests = [(_load(Path(root) / "translations" / f"{pair}.json", {}) or {}) for pair in ("en-ru", "ru-en")]
     chunks = plan.get("chunks") if isinstance(plan, dict) else None
+    if chunks and (plan.get("options") or {}).get("model") not in (None, translation.PRODUCTION_MODEL) and any(chunk.get("status") != "complete" for chunk in chunks if isinstance(chunk, dict)):
+        return "MIGRATION_REQUIRED"
     if isinstance(chunks, list) and chunks and any(chunk.get("status") != "complete" for chunk in chunks if isinstance(chunk, dict)):
         return "RESUMABLE" if any(chunk.get("status") == "complete" for chunk in chunks if isinstance(chunk, dict)) else "IN_PROGRESS"
-    if isinstance(manifest, dict) and manifest.get("artifact_type") == translation.ARTIFACT_TYPE:
-        validation = manifest.get("validation") or {}
-        return "READY" if validation.get("valid", True) and not validation.get("stale", False) else "FAILED"
+    for manifest in manifests:
+        if isinstance(manifest, dict) and manifest.get("artifact_type") == translation.ARTIFACT_TYPE:
+            validation = manifest.get("validation") or {}
+            if validation.get("valid", True) and not validation.get("stale", False):
+                return "READY"
+            return "FAILED"
     return "NOT_STARTED"
 
 
@@ -194,7 +199,10 @@ def _project_projection(root, state, artifacts, counts, summary, final, document
     # The source is required only for resume/processing, not for reopening a
     # completed book, review queue, final build, or already-created translation.
     availability = "SOURCE_UNAVAILABLE" if source_unavailable else "AVAILABLE"
-    if isinstance(pipeline, dict) and pipeline.get("status") == "PLANNED":
+    legacy_pipeline_migration = isinstance(pipeline, dict) and any(item.get("type") == "TRANSLATE" and item.get("status") != "COMPLETE" and (item.get("config") or {}).get("model", translation.PRODUCTION_MODEL) != translation.PRODUCTION_MODEL for item in pipeline.get("stages", []))
+    if legacy_pipeline_migration:
+        current, action = "PIPELINE_PAUSED", "Start TranslateGemma from saved document"
+    elif isinstance(pipeline, dict) and pipeline.get("status") == "PLANNED":
         current, action = "PIPELINE_PLANNED", "Start pipeline"
     elif isinstance(pipeline, dict) and pipeline.get("status") == "RUNNING":
         current, action, availability = "PIPELINE_RUNNING", "Resume pipeline", "AVAILABLE"
@@ -235,6 +243,7 @@ def _project_projection(root, state, artifacts, counts, summary, final, document
         projection["pipeline_status"] = pipeline.get("status")
         projection["pipeline_current_stage"] = pipeline.get("current_stage_id")
         projection["pipeline_completed_stages"] = list(pipeline.get("completed_stage_ids") or [])
+        projection["migration_required"] = any(item.get("type") == "TRANSLATE" and item.get("status") != "COMPLETE" and (item.get("config") or {}).get("model", translation.PRODUCTION_MODEL) != translation.PRODUCTION_MODEL for item in pipeline.get("stages", []))
     return projection
 
 
@@ -344,7 +353,7 @@ def preflight(operation="status"):
     elif operation == "translation":
         # Translation is opt-in and must never make local Ollama a requirement
         # for OCR, review, CDM, or export.
-        optional = [_dependency("ollama")]
+        required = [_dependency("ollama")]
     result = {"protocol_version": PROTOCOL_VERSION, "booktext_version": __version__, "operation": operation,
               "dependencies": {"required": required, "optional": optional},
               "features": {"run": True, "surya": bool(optional and optional[0]["available"] and optional[1]["available"]) if operation in {"run", "status"} else None,
@@ -353,6 +362,13 @@ def preflight(operation="status"):
                            "review": True, "final_build": True, "cdm": True, "translation": operation == "translation", "export": True},
               "errors": [{"code": "missing_required_dependency", "dependency": item["name"], "message": f"Missing required dependency: {item['name']}"} for item in required if not item["available"]]}
     result["ok"] = not result["errors"]
+    if operation == "translation":
+        result["translation_model"] = translation.PRODUCTION_MODEL
+        try:
+            result["translation_model_info"] = translation._model_info("http://127.0.0.1:11434", translation.PRODUCTION_MODEL, 5)
+        except ValueError as error:
+            result["errors"].append({"code": "MODEL_UNAVAILABLE", "model": translation.PRODUCTION_MODEL, "message": str(error)})
+            result["ok"] = False
     return result
 
 
@@ -513,7 +529,7 @@ def _parse_pipeline_definition(value):
     try:
         return definition, sequential_pipeline.validate_definition(definition)
     except sequential_pipeline.PipelineError as error:
-        raise MachineError("invalid_input", str(error)) from error
+        raise MachineError("MODEL_RETIRED" if str(error).startswith("MODEL_RETIRED:") else "invalid_input", str(error)) from error
 
 
 def _pipeline_root(source, core_args, explicit=None):
@@ -572,7 +588,7 @@ def _run_pipeline(root, *, resume=False):
     try:
         sequential_pipeline.validate_definition(state.get("definition"))
     except sequential_pipeline.PipelineError as error:
-        raise MachineError("validation_failure", str(error)) from error
+        raise MachineError("MODEL_RETIRED" if str(error).startswith("MODEL_RETIRED:") else "validation_failure", str(error)) from error
     job = ensure_job(root, status="running", source=[state["source"]])
     state["project_id"] = job["job_id"]
     sequential_pipeline.save(root, state)
@@ -622,7 +638,12 @@ def _run_pipeline(root, *, resume=False):
             elif item["type"] == "TRANSLATE":
                 def translation_progress(event_type, details):
                     emitter.emit("stage_progress", phase="translation", current=details.get("current"), total=details.get("total"), code=event_type, message=event_type.replace("_", " "), details={"pipeline_id": state["pipeline_id"], **details})
-                result = translation.translate_document(root, source_language=config["source_language"], target_language=config["target_language"], provider=config.get("provider", "ollama"), model=config["model"], glossary_path=config.get("glossary"), endpoint=config.get("endpoint", "http://127.0.0.1:11434"), timeout=config.get("timeout", 120), keep_alive=config.get("keep_alive", translation.DEFAULT_MODEL_KEEP_ALIVE), chunk_size=config.get("chunk_size", translation.DEFAULT_LOGICAL_UNIT_CHUNK_SIZE), progress=translation_progress)
+                result = translation.translate_document(root, source_language=config["source_language"], target_language=config["target_language"], provider=config.get("provider", "ollama"), model=config.get("model", translation.PRODUCTION_MODEL), glossary_path=config.get("glossary"), endpoint=config.get("endpoint", "http://127.0.0.1:11434"), timeout=config.get("timeout", 120), keep_alive=config.get("keep_alive", translation.DEFAULT_MODEL_KEEP_ALIVE), chunk_size=config.get("chunk_size", translation.DEFAULT_LOGICAL_UNIT_CHUNK_SIZE), migrate=config.get("migrate", False), progress=translation_progress)
+                if config.pop("migrate", False):
+                    for defined_stage in state["definition"]["stages"]:
+                        if defined_stage["type"] == "TRANSLATE":
+                            defined_stage["config"].pop("migrate", None)
+                    sequential_pipeline.save(root, state)
                 validation = result.get("validation") or {}
                 if not validation.get("valid", False) or validation.get("stale", False):
                     raise MachineError("validation_failure", "translation validation did not pass", details=validation)
@@ -724,9 +745,16 @@ def _handle(args):
                 raise sequential_pipeline.PipelineError("pipeline does not exist for this project")
             result = sequential_pipeline.validate_definition(state["definition"])
         except sequential_pipeline.PipelineError as error:
-            raise MachineError("validation_failure", str(error)) from error
+            raise MachineError("MODEL_RETIRED" if str(error).startswith("MODEL_RETIRED:") else "validation_failure", str(error)) from error
         emitter = Emitter(read_job(root)["job_id"])
         emitter.emit("job_completed", phase="prepare", message="Pipeline validated", details={"pipeline": state, "validation": result})
+        return EXIT_CODES["success"]
+    if args.command == "pipeline-migrate-translation":
+        try:
+            state, changed = sequential_pipeline.migrate_legacy_translation(root)
+        except sequential_pipeline.PipelineError as error:
+            raise MachineError("validation_failure", str(error)) from error
+        Emitter(read_job(root)["job_id"]).emit("job_completed", phase="translation", message="Legacy translation stage prepared for TranslateGemma", details={"pipeline": state, "changed": changed, "action": "pipeline-resume"})
         return EXIT_CODES["success"]
     if args.command in {"pipeline-start", "pipeline-resume"}:
         return _run_pipeline(root, resume=args.command == "pipeline-resume")
@@ -783,13 +811,13 @@ def _handle(args):
         return _invoke(emitter, root, "translation", "translation", lambda: translation.translate_document(root,
             source_language=args.source_language, target_language=args.target_language, provider=args.provider, model=args.model,
             glossary_path=args.glossary, endpoint=args.endpoint, timeout=args.timeout, keep_alive=args.keep_alive,
-            chunk_size=args.chunk_size, restart=args.restart, block_ids=args.block_ids, progress=translation_progress))
+            chunk_size=args.chunk_size, restart=args.restart, migrate=args.migrate, block_ids=args.block_ids, progress=translation_progress))
     if args.command == "translation-validate":
         return _invoke(emitter, root, "translation", "translation validation", lambda: translation.validate_translation(root,
             source_language=args.source_language, target_language=args.target_language))
     if args.command == "translation-export":
         return _invoke(emitter, root, "export", "translation export", lambda: export_document.export_translation(root, args.format,
-            source_language=args.source_language, target_language=args.target_language))
+            source_language=args.source_language, target_language=args.target_language, **({"history_sha": args.history_sha} if args.history_sha else {})))
     if args.command == "final-build":
         return _invoke(emitter, root, "final_build", "final build", lambda: _final_build(root))
     if args.command == "decision":
@@ -857,7 +885,7 @@ def main(argv=None):
     p = sub.add_parser("cleanup"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("run"); p.add_argument("sources", nargs="+"); p.add_argument("core_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("pipeline-create"); p.add_argument("--definition-json", required=True); p.add_argument("--output-dir", type=Path); p.add_argument("source")
-    for command in ("pipeline-validate", "pipeline-start", "pipeline-status", "pipeline-resume", "pipeline-cancel"):
+    for command in ("pipeline-validate", "pipeline-start", "pipeline-status", "pipeline-resume", "pipeline-cancel", "pipeline-migrate-translation"):
         p = sub.add_parser(command); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("cdm"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("document-preview"); p.add_argument("output_dir", type=Path); p.add_argument("--index", type=int, default=0); p.add_argument("--limit", type=int, default=25)
@@ -866,10 +894,10 @@ def main(argv=None):
     def translation_options(p, *, provider=True):
         p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru"))
         if provider:
-            p.add_argument("--provider", default="ollama", choices=("ollama",)); p.add_argument("--model", required=True); p.add_argument("--glossary"); p.add_argument("--endpoint", default="http://127.0.0.1:11434"); p.add_argument("--timeout", type=int, default=120); p.add_argument("--keep-alive", default=translation.DEFAULT_MODEL_KEEP_ALIVE); p.add_argument("--chunk-size", type=int, default=translation.DEFAULT_LOGICAL_UNIT_CHUNK_SIZE); p.add_argument("--block-id", action="append", dest="block_ids", help="Translate only a source-ordered logical-unit pilot; repeat for each owned unit"); p.add_argument("--restart", action="store_true")
+            p.add_argument("--provider", default="ollama", choices=("ollama",)); p.add_argument("--model", default=translation.PRODUCTION_MODEL); p.add_argument("--glossary"); p.add_argument("--endpoint", default="http://127.0.0.1:11434"); p.add_argument("--timeout", type=int, default=120); p.add_argument("--keep-alive", default=translation.DEFAULT_MODEL_KEEP_ALIVE); p.add_argument("--chunk-size", type=int, default=translation.DEFAULT_LOGICAL_UNIT_CHUNK_SIZE); p.add_argument("--block-id", action="append", dest="block_ids", help="Translate only a source-ordered logical-unit pilot; repeat for each owned unit"); p.add_argument("--restart", action="store_true"); p.add_argument("--migrate", action="store_true", help="Explicitly archive incompatible checkpoints and restart from saved CDM")
     translation_options(sub.add_parser("translation"))
     translation_options(sub.add_parser("translation-validate"), provider=False)
-    p = sub.add_parser("translation-export"); p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru")); p.add_argument("--format", action="append", required=True, choices=[*export_document.FORMATS, "all"])
+    p = sub.add_parser("translation-export"); p.add_argument("output_dir", type=Path); p.add_argument("--source-language", required=True, choices=("en", "ru")); p.add_argument("--target-language", required=True, choices=("en", "ru")); p.add_argument("--format", action="append", required=True, choices=[*export_document.FORMATS, "all"]); p.add_argument("--history-sha", help="Export an archived translation revision without inference")
     p = sub.add_parser("final-build"); p.add_argument("output_dir", type=Path)
     p = sub.add_parser("decision"); p.add_argument("output_dir", type=Path); p.add_argument("--item", required=True); p.add_argument("--action", choices=sorted(review_decisions.TEXT_ACTIONS), required=True); p.add_argument("--replacement"); p.add_argument("--note"); p.add_argument("--replace", action="store_true")
     p = sub.add_parser("baseline-preview"); p.add_argument("output_dir", type=Path)
@@ -914,9 +942,10 @@ def main(argv=None):
         Emitter(job_id).emit("job_failed", phase=COMMAND_PHASE.get(getattr(args, "command", None)), code=error.code, message=str(error), details=error.details)
         return EXIT_CODES.get(error.code, EXIT_CODES["validation_failure"])
     except (ValueError, OSError, subprocess.SubprocessError) as error:
+        code = next((value for value in ("MODEL_RETIRED", "MIGRATION_REQUIRED", "TRANSLATION_BUSY") if str(error).startswith(value + ":")), "validation_failure")
         root = getattr(args, "output_dir", None); job_id = ensure_job(root)["job_id"] if root else "machine"
-        if root: update_job(root, status="failed", error_code="validation_failure")
-        Emitter(job_id).emit("job_failed", code="validation_failure", message=str(error), details={"type": type(error).__name__})
+        if root: update_job(root, status="failed", error_code=code)
+        Emitter(job_id).emit("job_failed", code=code, message=str(error), details={"type": type(error).__name__})
         return EXIT_CODES["validation_failure"]
 
 
