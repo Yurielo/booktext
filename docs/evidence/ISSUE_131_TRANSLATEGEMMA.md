@@ -1,7 +1,7 @@
 # Issue 131 TranslateGemma replacement evidence
 
 Date: 2026-10-02. Baseline `origin/main`: `a51bded50469fd0088d50fcf8af70e4e2bb6b17e`.
-Owner chose TranslateGemma Variant A over Qwen Variant B for all five EN→RU comparison excerpts. The comparison provenance and Word report remain under `Documents/BookTextAcceptance/model-comparison-en-ru/` on the owner's Mac. This did not accept RU→EN semantics or changed production wording.
+Owner chose TranslateGemma Variant A over Qwen Variant B for all five EN→RU comparison excerpts. The comparison provenance and Word report remain under `Documents/BookTextAcceptance/model-comparison-en-ru/` on the owner's Mac. On 2026-10-03, after reviewing the compact production comparison report, the owner stated: “перевод хороший. human gate passed”. This accepts the changed production wording, the flagged numeric-review sample, and the separate RU→EN sample for this release.
 
 ## Model and contract
 
@@ -18,7 +18,7 @@ All runs used copied `issue-116-pipeline` artifacts through `booktext.py machine
 | Pilot | Result |
 | --- | --- |
 | Five accepted EN→RU IDs | All five owned units assembled in CDM order; four `machine_translated`, one `needs_numeric_review` (`block-2b605df75fc720425eb6`); no missing or duplicate IDs. Production wording differs from accepted Variant A. |
-| RU→EN | One saved Russian Variant A excerpt translated through production Core; source block `block-5c70e9450e8c0397cfbf`; structural and numeric validation PASS. Semantic acceptance remains open. |
+| RU→EN | One saved Russian Variant A excerpt translated through production Core; source block `block-5c70e9450e8c0397cfbf`; structural and numeric validation PASS; owner semantic acceptance recorded above. |
 | Three adjacent units | Interrupted after verified chunk 1 by sending SIGINT only to the BookText child process; resumed machine invocation reused chunk 1 and translated chunks 2–3. Final coverage and ordering PASS. |
 | Legacy migration | Copied Qwen manifest and checkpoint workspace archived under content-addressed history; new manifest identifies TranslateGemma. Historical Qwen revision exported offline via `--history-sha` without inference. |
 | DOCX export | Existing translation exporter produced a valid DOCX, retaining two CDM figures. |
@@ -34,4 +34,4 @@ Original and pilot SHA-256 hashes match for `book_document.json` (`92d5007156d0e
 - Signed review bundle at `/private/tmp/BookText-issue-131-review.app`: `codesign --verify --deep --strict --verbose=4` PASS; LaunchServices launch confirmed. This is a review build, not an installed release.
 - `git diff --check`: PASS.
 
-`HUMAN_REVIEW_REQUIRED`: the owner must review the compact production comparison DOCX in the Codex task outputs and approve or correct the five new EN→RU responses, the numeric-signal block, and the separate RU→EN sample. Merge, installation and Issue closure remain gated on that decision and final post-merge verification.
+The human semantic gate passed on 2026-10-03. Merge, installed Core and app update, and post-merge verification remain the release steps.
