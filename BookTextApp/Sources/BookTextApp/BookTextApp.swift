@@ -374,6 +374,23 @@ struct ContentView: View {
     private func refreshCurrentOutput() { if let output = model.outputURL { model.inspect(output) } }
     private func projectMetadata(_ project: ProjectHistoryEntry) -> String {
         let pages = project.pageCount.map { "\($0) pages" } ?? "pages unknown"
+        if let status = project.pipelineStatus {
+            let stage = project.pipelineCurrentStageType?.replacingOccurrences(of: "_", with: " ").localizedCapitalized ?? "Workflow"
+            let label: String
+            switch status {
+            case "RUNNING" where project.pipelineCurrentStageType == "TRANSLATE":
+                label = project.pipelineTranslationDirection.map { "Translating · \($0)" } ?? "Translating"
+            case "PAUSED" where project.pipelineFailureCode == "TRANSLATION_REVIEW_REQUIRED":
+                label = "Pipeline paused · Translation validation"
+            case "PAUSED", "FAILED": label = "Pipeline \(status.lowercased()) · \(stage)"
+            case "COMPLETED":
+                let formats = project.pipelineExportFormats.map { $0.uppercased() }.joined(separator: ", ")
+                label = formats.isEmpty ? "Completed" : "Completed · \(formats)"
+            case "PLANNED": label = "Workflow ready"
+            default: label = "Pipeline \(status.lowercased()) · \(stage)"
+            }
+            return "\(label) · \(pages)"
+        }
         let translation = project.translationState == "NOT_STARTED" ? "" : " · translation \(project.translationState.lowercased())"
         return "\(project.state.replacingOccurrences(of: "_", with: " ")) · \(pages)\(translation)"
     }

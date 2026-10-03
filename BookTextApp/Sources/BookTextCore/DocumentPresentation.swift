@@ -219,6 +219,11 @@ public struct ProjectHistoryEntry: Equatable, Sendable, Identifiable {
     public let pageCount: Int?
     public let translationState: String
     public let lastActivity: String
+    public let pipelineStatus: String?
+    public let pipelineCurrentStageType: String?
+    public let pipelineFailureCode: String?
+    public let pipelineTranslationDirection: String?
+    public let pipelineExportFormats: [String]
 
     public init?(_ value: JSONValue) {
         guard let object = value.object, let id = object["project_id"]?.string,
@@ -232,6 +237,11 @@ public struct ProjectHistoryEntry: Equatable, Sendable, Identifiable {
         self.pageCount = object["page_count"]?.integer
         self.translationState = object["translation_state"]?.string ?? "NOT_STARTED"
         self.lastActivity = object["last_activity_at"]?.string ?? ""
+        self.pipelineStatus = object["pipeline_status"]?.string
+        self.pipelineCurrentStageType = object["pipeline_current_stage_type"]?.string
+        self.pipelineFailureCode = object["pipeline_failure_code"]?.string
+        self.pipelineTranslationDirection = object["pipeline_translation_direction"]?.string
+        self.pipelineExportFormats = object["pipeline_export_formats"]?.values?.compactMap(\.string) ?? []
     }
 
     public var detailForUnavailable: String {
