@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+try:
+    from .diagnostic_artifacts import diagnostic_path
+except ImportError:
+    from diagnostic_artifacts import diagnostic_path
+
+# Evidence retention is explicitly opted into before tools/models run.
+diagnostic_path("")
+
 
 import base64
 import json
@@ -212,7 +220,7 @@ def main():
     units = audit.get("units", [])
 
     crop_dir = Path(
-        "/tmp/booktext-hybrid-v4-crops"
+        str(diagnostic_path("booktext-hybrid-v4-crops"))
     )
     crop_dir.mkdir(
         parents=True,

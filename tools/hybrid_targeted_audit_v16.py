@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
+try:
+    from .diagnostic_artifacts import diagnostic_path
+except ImportError:
+    from diagnostic_artifacts import diagnostic_path
+
+# Evidence retention is explicitly opted into before tools/models run.
+diagnostic_path("")
+
 
 import json
 import urllib.request
 from pathlib import Path
 
-SRC = Path("/tmp/booktext-hybrid-v14-consensus-audit.json")
-OUT = Path("/tmp/booktext-hybrid-v16-targeted-audit.json")
+SRC = Path(str(diagnostic_path("booktext-hybrid-v14-consensus-audit.json")))
+OUT = Path(str(diagnostic_path("booktext-hybrid-v16-targeted-audit.json")))
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 MODEL = "qwen3:8b"

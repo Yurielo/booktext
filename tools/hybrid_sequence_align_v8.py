@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+try:
+    from .diagnostic_artifacts import diagnostic_path
+except ImportError:
+    from diagnostic_artifacts import diagnostic_path
+
+# Evidence retention is explicitly opted into before tools/models run.
+diagnostic_path("")
+
 
 import csv
 import json
@@ -362,7 +370,7 @@ def main():
         print("VISION:", vt or "∅")
         print("TESS:  ", tt or "∅")
 
-    outfile = "/tmp/booktext-hybrid-v8-alignment.json"
+    outfile = str(diagnostic_path("booktext-hybrid-v8-alignment.json"))
 
     with open(outfile, "w", encoding="utf-8") as f:
         json.dump(

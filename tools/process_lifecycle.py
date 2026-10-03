@@ -20,6 +20,20 @@ class ManagedProcess:
 
     def __init__(self, command, **kwargs):
         self.command = [str(value) for value in command]
+        # Keep the supervisor lease across owned children creating new sessions.
+        # Environment numbers alone never authorize a descriptor: verify its inode.
+        environment = kwargs.get("env") or os.environ
+        lease = environment.get("BOOKTEXT_OWNED_TMP_LEASE_FD")
+        workspace = environment.get("BOOKTEXT_OWNED_TMP_PATH")
+        if lease and workspace:
+            try:
+                fd = int(lease)
+                opened = os.fstat(fd)
+                expected = os.stat(os.path.join(workspace, ".lease"), follow_symlinks=False)
+                if (opened.st_dev, opened.st_ino) == (expected.st_dev, expected.st_ino):
+                    kwargs["pass_fds"] = tuple(set(kwargs.get("pass_fds", ())) | {fd})
+            except (OSError, ValueError):
+                pass  # No lease authority; no unknown descriptor inheritance.
         self.process = subprocess.Popen(self.command, start_new_session=True, **kwargs)
         self.pgid = os.getpgid(self.process.pid)
         self.cleaned = False

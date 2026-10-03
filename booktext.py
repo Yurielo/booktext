@@ -20,7 +20,7 @@ from tools.process_lifecycle import LifecycleRegistry
 from tools.review_priority import PRIORITIES, prioritise_review, priority_text
 from tools.review_clusters import build_clusters
 from tools import document_identity
-from tools.owned_workspace import OwnedWorkspace
+from tools.owned_workspace import OwnedWorkspace, is_supervised, supervise
 from tools import chunk_lifecycle
 from tools.document_continuity import parse_page_spec
 
@@ -2276,6 +2276,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if not is_supervised():
+        sys.exit(supervise([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]))
     if len(sys.argv) > 1 and sys.argv[1] == "machine":
         from tools.machine_protocol import main as machine_protocol_main
         sys.exit(machine_protocol_main(sys.argv[2:]))
