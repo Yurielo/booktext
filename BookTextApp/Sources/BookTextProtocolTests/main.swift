@@ -119,10 +119,13 @@ func projectHistoryUsesCoreProjectionAndStableIdentity() throws {
     let item = JSONValue.object([
         "project_id": .string("job-stable"), "name": .string("A book"), "output_dir": .string("/tmp/book"),
         "state": .string("REVIEW_REQUIRED"), "action": .string("Review items"), "availability": .string("AVAILABLE"),
-        "page_count": .number(7), "translation_state": .string("NOT_STARTED"), "last_activity_at": .string("2026-01-01T00:00:00Z")
+        "page_count": .number(7), "translation_state": .string("NOT_STARTED"), "last_activity_at": .string("2026-01-01T00:00:00Z"),
+        "pipeline_status": .string("PAUSED"), "pipeline_current_stage_type": .string("TRANSLATE"),
+        "pipeline_translation_direction": .string("EN → RU"), "pipeline_export_formats": .array([.string("docx")])
     ])
     let entry = try unwrap(ProjectHistoryEntry(item), "Core history entry must decode")
     try check(entry.id == "job-stable" && entry.pageCount == 7, "stable Core identity and page count")
+    try check(entry.pipelineStatus == "PAUSED" && entry.pipelineCurrentStageType == "TRANSLATE" && entry.pipelineTranslationDirection == "EN → RU" && entry.pipelineExportFormats == ["docx"], "history must show Core-owned pipeline progress")
     let data: [String: JSONValue] = [
         "project": .object(["state": .string("REVIEW_REQUIRED")]),
         "run_summary": .object(["processed": .number(7)]),

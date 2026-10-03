@@ -8,6 +8,7 @@ export semantics a second time.  In machine mode stdout is *only* JSONL.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -243,6 +244,14 @@ def _project_projection(root, state, artifacts, counts, summary, final, document
         projection["pipeline_status"] = pipeline.get("status")
         projection["pipeline_current_stage"] = pipeline.get("current_stage_id")
         projection["pipeline_completed_stages"] = list(pipeline.get("completed_stage_ids") or [])
+        current_stage = next((item for item in pipeline.get("stages", []) if item.get("stage_id") == pipeline.get("current_stage_id")), None)
+        translation_stage = next((item for item in pipeline.get("stages", []) if item.get("type") == "TRANSLATE"), None)
+        export_stage = next((item for item in pipeline.get("stages", []) if item.get("type") == "EXPORT"), None)
+        translation_config = (translation_stage.get("config") or {}) if translation_stage else {}
+        projection["pipeline_current_stage_type"] = current_stage.get("type") if current_stage else None
+        projection["pipeline_failure_code"] = (pipeline.get("failure") or pipeline.get("cancellation") or {}).get("code")
+        projection["pipeline_translation_direction"] = f"{translation_config.get('source_language', '').upper()} → {translation_config.get('target_language', '').upper()}" if translation_stage else None
+        projection["pipeline_export_formats"] = list((export_stage.get("config") or {}).get("formats") or []) if export_stage else []
         projection["migration_required"] = any(item.get("type") == "TRANSLATE" and item.get("status") != "COMPLETE" and (item.get("config") or {}).get("model", translation.PRODUCTION_MODEL) != translation.PRODUCTION_MODEL for item in pipeline.get("stages", []))
     return projection
 
@@ -494,7 +503,7 @@ def _pipeline_phase(item):
 
 def _pipeline_refs(root, names):
     artifacts = artifact_map(root)
-    refs = {name: artifacts[name] for name in names if name in artifacts and artifacts[name]["exists"]}
+    refs = {name: _pipeline_ref(root, root / artifacts[name]["path"]) for name in names if name in artifacts and artifacts[name]["exists"]}
     # Translation exports are deliberately namespaced by language pair rather
     # than stored in the original-document exports directory.  The pipeline's
     # logical EXPORT artifact is valid in either production location.
@@ -502,8 +511,16 @@ def _pipeline_refs(root, names):
         translated = sorted((Path(root) / "translations" / "exports").glob("*/export_manifest.json"))
         if translated:
             manifest = translated[0]
-            refs["exports"] = {"path": str(manifest.relative_to(root)), "exists": True}
+            refs["exports"] = _pipeline_ref(root, manifest)
     return refs
+
+
+def _pipeline_ref(root, target):
+    target = Path(target)
+    value = {"path": str(target.relative_to(root)), "exists": target.exists()}
+    if target.is_file():
+        value["sha256"] = review_decisions.sha256_file(target)
+    return value
 
 
 def _final_build(root):
@@ -554,7 +571,16 @@ def _pipeline_create(source, definition_json, explicit_root=None):
     core_args = process["config"].get("core_args", [])
     if not isinstance(core_args, list) or any(not isinstance(item, str) for item in core_args):
         raise MachineError("invalid_input", "PROCESS core_args must be an array of strings")
+    if core_args.count("--output-dir") > 1:
+        raise MachineError("invalid_input", "PROCESS output directory may be specified once")
     root = _pipeline_root(source_path, core_args, explicit_root)
+    if "--output-dir" in core_args:
+        position = core_args.index("--output-dir") + 1
+        if position >= len(core_args):
+            raise MachineError("invalid_input", "PROCESS output directory is missing")
+        configured = Path(core_args[position]).expanduser().resolve()
+        if configured != root:
+            raise MachineError("invalid_input", "PROCESS output directory differs from pipeline project")
     try:
         state, created = sequential_pipeline.create(root, source=source_path, definition=definition)
     except sequential_pipeline.PipelineError as error:
@@ -566,19 +592,95 @@ def _pipeline_create(source, definition_json, explicit_root=None):
     return root, state, {"created": created, **validation}
 
 
-def _validate_completed_pipeline_stage(root, item):
+def _validate_completed_pipeline_stage(root, item, state):
+    try:
+        return _validate_completed_pipeline_stage_unchecked(root, item, state)
+    except (MachineError, ValueError, TypeError, OSError, KeyError):
+        return False
+
+
+def _validate_completed_pipeline_stage_unchecked(root, item, state):
     refs = item.get("artifact_refs") or {}
     if not refs:
         return False
     for reference in refs.values():
         relative = reference.get("path") if isinstance(reference, dict) else None
-        if not isinstance(relative, str) or not (Path(root) / relative).exists():
+        if not isinstance(relative, str):
             return False
+        target = (Path(root) / relative).resolve()
+        if not target.is_relative_to(root) or not target.exists():
+            return False
+        if reference.get("sha256") and (not target.is_file() or review_decisions.sha256_file(target) != reference["sha256"]):
+            return False
+    if item["type"] == "PROCESS":
+        source = Path(state["source"])
+        expected = (item.get("validation") or {}).get("source_sha256")
+        if expected and source.is_file() and review_decisions.sha256_file(source) != expected:
+            return False
+    if item["type"] == "FINAL_BUILD":
+        report = _load(root / "final_build.json", {}) or {}
+        for source in (report.get("source") or {}).values():
+            if isinstance(source, dict) and source.get("filename") and source.get("sha256"):
+                target = root / source["filename"]
+                if not target.is_file() or review_decisions.sha256_file(target) != source["sha256"]:
+                    return False
+    if item["type"] == "CDM":
+        try:
+            canonical_document.validate_document(_load(root / "book_document.json"), root=root,
+                decisions=_load(root / "review_decisions.json"))
+        except (ValueError, TypeError, OSError):
+            return False
+    if item["type"] == "TRANSLATE":
+        config = item["config"]
+        try:
+            validation = translation.validate_translation(root, source_language=config["source_language"], target_language=config["target_language"])
+        except (ValueError, OSError, TypeError):
+            return False
+        if not validation.get("valid") or validation.get("stale") or validation.get("needs_numeric_review") or validation.get("needs_quality_review"):
+            return False
+    if item["type"] == "EXPORT":
+        manifest = _load(root / refs["exports"]["path"], {}) if "exports" in refs else {}
+        requested = item["config"]["formats"]
+        generated = manifest.get("generated") or {}
+        if any(fmt not in generated or not generated[fmt].get("valid") for fmt in requested):
+            return False
+        if manifest.get("validation", {}).get("cdm") != "PASS":
+            return False
+        cdm = manifest.get("cdm") or {}
+        if cdm.get("sha256") != review_decisions.sha256_file(root / "book_document.json"):
+            return False
+        if item["config"].get("document") == "TRANSLATION":
+            translation_stage = next(value for value in state["stages"] if value["type"] == "TRANSLATE")
+            config = translation_stage["config"]
+            expected = translation.translation_path(root, config["source_language"], config["target_language"])
+            if manifest.get("translation", {}).get("path") != str(expected.relative_to(root)):
+                return False
+        for fmt in requested:
+            output = (root / generated[fmt].get("path", "")).resolve()
+            if not output.is_relative_to(root) or not output.is_file() or review_decisions.sha256_file(output) != generated[fmt].get("sha256"):
+                return False
     return True
 
 
 def _run_pipeline(root, *, resume=False):
     root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise MachineError("invalid_input", "pipeline project does not exist")
+    # A second app/CLI invocation must not start duplicate OCR or exports.
+    # The lock file remains stable across relaunches; the OS releases its lock
+    # if the worker is interrupted or the Mac reboots.
+    with (root / ".booktext_pipeline.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise MachineError("PIPELINE_BUSY", "pipeline is already running for this project") from error
+        try:
+            return _run_pipeline_locked(root, resume=resume)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _run_pipeline_locked(root, *, resume=False):
     try:
         state = sequential_pipeline._load(root)
     except sequential_pipeline.PipelineError as error:
@@ -590,18 +692,21 @@ def _run_pipeline(root, *, resume=False):
     except sequential_pipeline.PipelineError as error:
         raise MachineError("MODEL_RETIRED" if str(error).startswith("MODEL_RETIRED:") else "validation_failure", str(error)) from error
     job = ensure_job(root, status="running", source=[state["source"]])
+    job = update_job(root, status="running", launcher_pid=os.getpid())
     state["project_id"] = job["job_id"]
     sequential_pipeline.save(root, state)
     emitter = Emitter(job["job_id"])
     emitter.emit("pipeline_resumed" if resume else "pipeline_started", phase="prepare", message="Pipeline resumed" if resume else "Pipeline started", details={"pipeline_id": state["pipeline_id"], "output_dir": str(root), "stages": [item["type"] for item in state["stages"]], "source": state["source"]})
     project_history.record(root, job)
+    invalidate_successors = False
     for item in state["stages"]:
         if item.get("status") == "COMPLETE":
-            if _validate_completed_pipeline_stage(root, item):
+            if not invalidate_successors and _validate_completed_pipeline_stage(root, item, state):
                 continue
             item.update({"status": "PENDING", "validation": {"valid": False, "reason": "required artifact missing"}})
             state["completed_stage_ids"] = [identifier for identifier in state.get("completed_stage_ids", []) if identifier != item["stage_id"]]
             sequential_pipeline.save(root, state)
+            invalidate_successors = True
         if item.get("status") == "PAUSED" or item.get("status") == "FAILED":
             item["status"] = "PENDING"
             sequential_pipeline.save(root, state)
@@ -612,16 +717,28 @@ def _run_pipeline(root, *, resume=False):
         try:
             config = item["config"]
             if item["type"] == "PROCESS":
-                result = _run_existing(emitter, [state["source"]], config.get("core_args", []), complete_job=False)
+                core_args = list(config.get("core_args", []))
+                if "--output-dir" not in core_args:
+                    core_args.extend(["--output-dir", str(root)])
+                result = _run_existing(emitter, [state["source"]], core_args, complete_job=False)
                 if result == EXIT_CODES["cancelled"]:
                     sequential_pipeline.mark_paused(root, state, item, code="cancelled", message="Processing cancelled at a safe checkpoint", cancellation=True)
                     update_job(root, status="cancelled", last_phase=phase, partial=True, pipeline_id=state["pipeline_id"])
                     emitter.emit("pipeline_paused", phase=phase, code="cancelled", message="Pipeline paused; completed work is retained", details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"]})
                     return EXIT_CODES["cancelled"]
-                validation, refs = {"valid": True, "book_manifest": "PASS"}, _pipeline_refs(root, ("book_manifest", "run_summary", "raw_review", "review", "clusters"))
+                if result != EXIT_CODES["success"]:
+                    raise MachineError("processing_failure", "processing did not complete successfully", details={"exit_code": result})
+                validation, refs = {"valid": True, "book_manifest": "PASS", "source_sha256": review_decisions.sha256_file(state["source"])}, _pipeline_refs(root, ("book_manifest", "run_summary", "raw_review", "review", "clusters"))
             elif item["type"] == "REVIEW_POLICY":
-                priority = _load(root / "review_priority.json", {}) or {}
-                counts = priority.get("counts", {}) if isinstance(priority, dict) else {}
+                priority = review_decisions.load_json(root / "review_priority.json")
+                book = review_decisions.load_json(root / "book.json")
+                decisions_path = root / "review_decisions.json"
+                if decisions_path.is_file():
+                    decisions = review_decisions.load_json(decisions_path)
+                    _, _, report = review_decisions.build_final(book, priority, decisions, book_path=root / "book.json", priority_path=root / "review_priority.json", decisions_path=decisions_path, booktext_version="0.1.0")
+                    counts = report["unresolved_priority_counts"]
+                else:
+                    counts = priority.get("counts", {})
                 unresolved = int(counts.get("HIGH", 0) or 0) + int(counts.get("MEDIUM", 0) or 0)
                 if config["policy"] == "review_when_required" and unresolved:
                     sequential_pipeline.mark_paused(root, state, item, code="REVIEW_REQUIRED", message=f"{unresolved} HIGH/MEDIUM review items require a human decision")
@@ -644,10 +761,15 @@ def _run_pipeline(root, *, resume=False):
                         if defined_stage["type"] == "TRANSLATE":
                             defined_stage["config"].pop("migrate", None)
                     sequential_pipeline.save(root, state)
-                validation = result.get("validation") or {}
+                validation = translation.validate_translation(root, source_language=config["source_language"], target_language=config["target_language"])
                 if not validation.get("valid", False) or validation.get("stale", False):
                     raise MachineError("validation_failure", "translation validation did not pass", details=validation)
-                refs = _pipeline_refs(root, ("translations",))
+                if validation.get("needs_numeric_review") or validation.get("needs_quality_review"):
+                    sequential_pipeline.mark_paused(root, state, item, code="TRANSLATION_REVIEW_REQUIRED", message="Translation quality signals require review")
+                    update_job(root, status="paused", last_phase=phase, pipeline_id=state["pipeline_id"])
+                    emitter.emit("pipeline_paused", phase=phase, code="TRANSLATION_REVIEW_REQUIRED", message="Translation quality signals require review before export", details={"pipeline_id": state["pipeline_id"], "validation": validation})
+                    return EXIT_CODES["success"]
+                refs = {"translations": _pipeline_ref(root, translation.translation_path(root, config["source_language"], config["target_language"]))}
             elif item["type"] == "EXPORT":
                 formats = config["formats"]
                 if config.get("document") == "TRANSLATION":
@@ -656,7 +778,13 @@ def _run_pipeline(root, *, resume=False):
                     result = export_document.export_translation(root, formats, source_language=translation_config["source_language"], target_language=translation_config["target_language"])
                 else:
                     result = export_document.export_document(root, formats)
-                validation, refs = {"valid": True, "formats": formats, "result": result}, _pipeline_refs(root, ("exports", "deliverables"))
+                if config.get("document") == "TRANSLATION":
+                    pair = f"{translation_config['source_language']}-{translation_config['target_language']}"
+                    manifest_path = root / "translations" / "exports" / pair / "export_manifest.json"
+                else:
+                    manifest_path = root / "exports" / "export_manifest.json"
+                refs = {"exports": _pipeline_ref(root, manifest_path)}
+                validation = {"valid": _validate_completed_pipeline_stage(root, {**item, "artifact_refs": refs}, state), "formats": formats, "result": result}
             else:
                 raise MachineError("validation_failure", "unsupported pipeline stage")
         except KeyboardInterrupt:
@@ -702,6 +830,33 @@ def _run_pipeline(root, *, resume=False):
     emitter.emit("pipeline_completed", phase=completed["last_phase"], message="Pipeline completed", details={"pipeline_id": state["pipeline_id"], "output_dir": str(root), "artifacts": artifact_map(root)})
     emitter.emit("job_completed", phase=completed["last_phase"], message="Pipeline completed", details={"pipeline": state, "output_dir": str(root), "artifacts": artifact_map(root)})
     return EXIT_CODES["success"]
+
+
+def _signal_active_pipeline_worker(root):
+    """Signal only the verified worker holding this project's run lock."""
+    root = Path(root).expanduser().resolve()
+    with (root / ".booktext_pipeline.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return False
+    pid = read_job(root).get("launcher_pid")
+    if not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+        raise MachineError("cancel_unavailable", "active pipeline worker cannot be identified")
+    observed = subprocess.run(["/bin/ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False)
+    command = observed.stdout.strip()
+    worker_roots = [command.split(f"booktext.py machine {verb} ", 1)[1].strip().strip("\"'")
+                    for verb in ("pipeline-start", "pipeline-resume") if f"booktext.py machine {verb} " in command]
+    if observed.returncode or not any(Path(value).expanduser().resolve() == root for value in worker_roots):
+        raise MachineError("cancel_unavailable", "active pipeline worker identity could not be verified")
+    try:
+        os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def _handle(args):
@@ -776,6 +931,9 @@ def _handle(args):
             item = sequential_pipeline.stage(state, state.get("current_stage_id")) if state.get("current_stage_id") else sequential_pipeline.next_pending(state)
             if item is None:
                 raise sequential_pipeline.PipelineError("completed pipeline cannot be cancelled")
+            if _signal_active_pipeline_worker(root):
+                Emitter(read_job(root)["job_id"]).emit("job_completed", phase=_pipeline_phase(item), message="Cancellation requested for active pipeline worker", details={"pipeline_id": state["pipeline_id"], "stage_id": item["stage_id"]})
+                return EXIT_CODES["success"]
             sequential_pipeline.mark_paused(root, state, item, code="cancelled", message="Pipeline paused before starting a new stage", cancellation=True)
         except sequential_pipeline.PipelineError as error:
             raise MachineError("validation_failure", str(error)) from error
@@ -937,8 +1095,8 @@ def main(argv=None):
     except MachineError as error:
         root = getattr(args, "output_dir", None)
         existing_root = root and Path(root).expanduser().resolve().is_dir()
-        job_id = ensure_job(root)["job_id"] if existing_root else "machine"
-        if existing_root: update_job(root, status="failed", error_code=error.code, error_details=error.details)
+        job_id = read_job(root)["job_id"] if existing_root else "machine"
+        if existing_root and error.code not in {"PIPELINE_BUSY", "cancel_unavailable"}: update_job(root, status="failed", error_code=error.code, error_details=error.details)
         Emitter(job_id).emit("job_failed", phase=COMMAND_PHASE.get(getattr(args, "command", None)), code=error.code, message=str(error), details=error.details)
         return EXIT_CODES.get(error.code, EXIT_CODES["validation_failure"])
     except (ValueError, OSError, subprocess.SubprocessError) as error:

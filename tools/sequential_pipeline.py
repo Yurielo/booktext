@@ -76,6 +76,8 @@ def _stage_ids(stages):
 def validate_definition(definition):
     if not isinstance(definition, dict):
         raise PipelineError("pipeline definition must be an object")
+    if definition.get("schema_version") != SCHEMA_VERSION:
+        raise PipelineError("pipeline definition has an unsupported schema")
     stages = definition.get("stages")
     if not isinstance(stages, list) or not stages:
         raise PipelineError("pipeline definition requires ordered stages")
@@ -111,8 +113,10 @@ def validate_definition(definition):
             raise PipelineError("EXPORT must be the final pipeline stage")
         config = stages[export_index]["config"]
         formats = config.get("formats")
-        if not isinstance(formats, list) or not formats or any(not isinstance(item, str) or not item for item in formats):
-            raise PipelineError("EXPORT requires one or more formats")
+        if not isinstance(formats, list) or not formats or any(item not in {"docx", "pdf", "epub", "html", "markdown"} for item in formats) or len(formats) != len(set(formats)):
+            raise PipelineError("EXPORT requires distinct supported formats")
+        if "TRANSLATE" in kinds and "document" not in config:
+            raise PipelineError("EXPORT must explicitly choose ORIGINAL or TRANSLATION")
         document = config.get("document", "ORIGINAL")
         if document not in {"ORIGINAL", "TRANSLATION"}:
             raise PipelineError("EXPORT document must be ORIGINAL or TRANSLATION")
@@ -131,6 +135,8 @@ def create(root, *, source, definition):
     if existing:
         if existing.get("definition") != definition:
             raise PipelineError("a different pipeline already belongs to this project")
+        if existing.get("source") != str(Path(source).expanduser().resolve()):
+            raise PipelineError("pipeline source does not match this project")
         return existing, False
     root.mkdir(parents=True, exist_ok=True)
     now = _now()

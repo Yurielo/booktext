@@ -46,8 +46,9 @@ A pipeline is an optional, persisted, strictly ordered plan stored as
 `.booktext_pipeline.json` inside its existing BookText output. It supports only
 the product stages `PROCESS`, `REVIEW_POLICY`, `FINAL_BUILD`, `CDM`,
 `TRANSLATE`, and `EXPORT`; it is not a scripting or DAG interface. Core validates
-the full definition before work begins. Each stage is committed atomically and
-records only existing artifact references.
+the full definition before work begins, including export formats and an
+explicit ORIGINAL/TRANSLATION target when translation is enabled. Each stage
+is committed atomically and records existing artifact references with hashes.
 
 `skip_human_review` continues from raw/canonical OCR without accepting Vision
 or writing corrective decisions. `review_when_required` pauses with
@@ -55,6 +56,13 @@ or writing corrective decisions. `review_when_required` pauses with
 completed artifact first and starts the first incomplete stage; valid OCR and
 translation checkpoints are never repeated. A translated export explicitly uses
 the selected translation derivative rather than the source-language CDM.
+Resume checks source and stage input hashes, CDM and translation validity, and
+export manifest/output hashes. It invalidates only the affected stage and its
+successors. A translation numeric or quality review signal pauses before
+export. A project-scoped worker lock rejects concurrent starts; it is released
+on process exit or interruption. `pipeline-cancel` signals an active worker
+only after its recorded PID, command and project root are verified; the worker
+persists the paused stage. For an idle project it records a resumable pause.
 
 ## Durable project history
 
@@ -76,7 +84,8 @@ are reported as `PROJECT_FILES_UNAVAILABLE`. `project-remove` removes only an
 index row and never deletes source or BookText artifacts.
 
 Pipeline projects additionally project `PIPELINE_PLANNED`, `PIPELINE_RUNNING`,
-or `PIPELINE_PAUSED`, with the current and completed stage IDs. The history
+or `PIPELINE_PAUSED`, with the current and completed stage IDs, current stage
+type, translation direction, failure code and requested export formats. The history
 index remains only a discovery aid: the project-owned Core pipeline file is the
 source of truth on every reopen.
 
