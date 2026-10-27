@@ -161,6 +161,35 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertEqual([b["text"] for b in document["blocks"] if b["type"] == "paragraph"],
                          ["Left top.", "Left bottom.", "Right top."])
 
+    def test_native_two_column_mapping_is_preserved_as_visual_fallback_not_invented_cells(self):
+        from PIL import Image
+        (self.root / "surya/surya-input/results.json").unlink()
+        (self.root / "review_decisions.json").unlink()
+        Image.new("RGB", (500, 500), "white").save(self.root / "pages/p1.png")
+        def line(text, x0, y0, x1, y1):
+            return {"text": text, "bbox": [x0, y0, x1, y1], "words": [{"text": text, "bbox": [x0, y0, x1, y1]}]}
+        lines = [line("The symbols are:", 10, 10, 70, 16)]
+        for offset, left, right in ((20, "Saturn", "triangle"), (30, "Jupiter", "quadrangle"), (40, "Mars", "pentagon")):
+            lines.extend([line(left, 20, offset, 46, offset + 6), line(right, 62, offset, 96, offset + 6)])
+        lines.append(line("The list continues.", 10, 55, 80, 61))
+        self.book["pages"] = [{"page": 1, "text": "The symbols are:", "page_image": "pages/p1.png",
+            "source_provenance": {"page_size_points": [100, 100]}, "visuals": [], "tables": {"tables": []},
+            "layout_blocks": [{"label": "Text", "extraction": "native_pdf_words", "reading_order": 1,
+                               "bbox": [10, 10, 96, 61], "lines": lines,
+                               "text": "\n".join(item["text"] for item in lines)}]}]
+        self.priority["items"] = []
+        write(self.root / "book.json", self.book); write(self.root / "review_priority.json", self.priority)
+        document = build_document(self.root)
+        fallback = next(block for block in document["blocks"] if block.get("table_status") == "fallback_review")
+        self.assertNotIn("cells", fallback)
+        self.assertEqual(fallback["diagnostic"], "native_two_column_mapping_geometry")
+        self.assertTrue((self.root / fallback["fallback_visual"]).is_file())
+        publication = "\n".join(block.get("text", "") for block in document["blocks"])
+        self.assertIn("The symbols are:", publication)
+        self.assertIn("The list continues.", publication)
+        self.assertNotIn("Saturn triangle", publication)
+        validate_document(document, root=self.root, decisions={"decisions": []})
+
     def test_scan_figure_stays_at_anchored_primary_position_once(self):
         (self.root / "review_decisions.json").unlink()
         self.book["pages"] = [{"page": 1, "text": "Left caption. Right column.", "layout_blocks": [],

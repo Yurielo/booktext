@@ -85,6 +85,10 @@ def render_markdown(document, root, asset_map=None):
         elif kind == "table":
             lines.extend([""])
             if block.get("table_status") == "structured": lines.append(_markdown_table(_grid(root, block)))
+            elif block.get("fallback_visual"):
+                # The source crop preserves a real table without claiming
+                # unverified native geometry is a grid of machine cells.
+                lines.append(f"![]({asset_map.get(block['fallback_visual'], _asset_path(block['fallback_visual']))})")
             else: continue
         elif kind == "figure":
             lines.extend(["", f"![]({asset_map.get(block.get('image'), _asset_path(block.get('image')))})"])
@@ -110,7 +114,11 @@ def render_html(document, root, asset_map=None):
         elif kind == "list": parts.append(f"<ul data-source-page=\"{page}\"><li>{text}</li></ul>")
         elif kind == "unknown": parts.append(f"<p data-source-page=\"{page}\">{text}</p>")
         elif kind == "table":
-            if block.get("table_status") == "fallback_review": continue
+            if block.get("table_status") == "fallback_review":
+                if block.get("fallback_visual"):
+                    image = html.escape(asset_map.get(block["fallback_visual"], _asset_path(block["fallback_visual"])), quote=True)
+                    parts.append(f'<figure data-source-page="{page}"><img src="{image}" alt="source table"></figure>')
+                continue
             else:
                 grid = _grid(root, block); rows = []
                 for row_index, row in enumerate(grid):
@@ -375,17 +383,18 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
     needs_local_assets = any(fmt in requested for fmt in ("markdown", "html", "docx", "epub"))
     if needs_local_assets:
         for block in document["blocks"]:
-            if block["type"] != "figure" or not block.get("image"): continue
-            source = root / block["image"]
+            image = block.get("image") if block["type"] == "figure" else block.get("fallback_visual") if block["type"] == "table" else None
+            if not image: continue
+            source = root / image
             if not source.is_file(): raise ValueError("CDM figure asset is missing")
             destination = export_dir / "assets" / f"{block['block_id']}{source.suffix.lower()}"
             destination.parent.mkdir(exist_ok=True); shutil.copyfile(source, destination)
-            asset_map[block["image"]] = str(destination.relative_to(export_dir))
+            asset_map[image] = str(destination.relative_to(export_dir))
     markdown, html_text = render_markdown(document, root, asset_map), render_html(document, root, asset_map)
     paths = {"markdown": export_dir / f"{basename}.md", "html": export_dir / f"{basename}.html", "docx": export_dir / f"{basename}.docx", "epub": export_dir / f"{basename}.epub", "pdf": export_dir / f"{basename}.pdf", "pdf_image": export_dir / f"{basename}-image.pdf"}
     if "markdown" in requested: _write(paths["markdown"], markdown)
     if "html" in requested: _write(paths["html"], html_text)
-    has_figures = any(block.get("type") == "figure" for block in document["blocks"])
+    has_figures = any(block.get("type") == "figure" or bool(block.get("fallback_visual")) for block in document["blocks"])
     if "docx" in requested:
         docx_markdown = export_dir / f".{basename}-docx-input.md"
         _write(docx_markdown, markdown)
@@ -430,12 +439,16 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
     block_counts = {kind: sum(block["type"] == kind for block in document["blocks"]) for kind in ("unknown", "table")}
     visual_mode = "classified_or_recovered_visual_crops" if has_figures else "no_visual_evidence"
     warnings = list(document.get("warnings", []))
-    fallback_pages = sorted({block.get("provenance", {}).get("source_page") for block in document["blocks"] if block["type"] == "table" and block.get("table_status") == "fallback_review"})
-    for page in fallback_pages:
-        warnings.append({"kind": "fallback_table_not_rendered", "page": page, "message": "No verified table cells: retained in CDM/review evidence, not rendered as publication text."})
+    fallback_blocks = [block for block in document["blocks"] if block["type"] == "table" and block.get("table_status") == "fallback_review"]
+    for block in fallback_blocks:
+        page = block.get("provenance", {}).get("source_page")
+        if block.get("fallback_visual"):
+            warnings.append({"kind": "fallback_table_source_visual_preserved", "page": page, "message": "No verified table cells: source table visual retained without a fabricated grid."})
+        else:
+            warnings.append({"kind": "fallback_table_not_rendered", "page": page, "message": "No verified table cells: retained in CDM/review evidence, not rendered as publication text."})
     if visual_mode == "no_visual_evidence":
         warnings.append({"kind": "no_visual_evidence_for_docx", "message": "CDM has no figure blocks or retained source-page assets; DOCX cannot safely add images."})
-    manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": warnings, "visual_preservation": {"mode": visual_mode, "figure_count": sum(block.get("type") == "figure" for block in document["blocks"]), "policy": "Only CDM figure blocks are embedded. Prepared source pages are provenance, never whole-page figure fallbacks."}, "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
+    manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": warnings, "visual_preservation": {"mode": visual_mode, "figure_count": sum(block.get("type") == "figure" for block in document["blocks"]), "fallback_table_visual_count": sum(bool(block.get("fallback_visual")) for block in fallback_blocks), "policy": "Only CDM figure blocks and explicit fallback-table source crops are embedded. Prepared source pages are provenance, never whole-page figure fallbacks."}, "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
     if provenance:
         manifest.update(provenance)
     _write(export_dir / "export_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
@@ -504,7 +517,11 @@ def _pdf_main(document_path, destination):
             prefix = "• " if kind == "list" else ""
             story.extend([Paragraph(prefix + html.escape(block.get("text", "")).replace("\n", "<br/>"), styles["BodyText"]), Spacer(1, 5)])
         elif kind == "table":
-            if block.get("table_status") == "fallback_review": continue
+            if block.get("table_status") == "fallback_review":
+                asset = root / block.get("fallback_visual", "")
+                if asset.is_file():
+                    image = Image(str(asset)); image._restrictSize(650, 450); story.extend([image, Spacer(1, 8)])
+                continue
             else:
                 table = Table(_grid(root, block), repeatRows=1)
                 table.setStyle(TableStyle([("GRID", (0,0), (-1,-1), .25, colors.grey), ("FONTNAME", (0,0), (-1,-1), "BookTextUnicode" if Path(font).is_file() else "Helvetica"), ("FONTSIZE", (0,0), (-1,-1), 7), ("BACKGROUND", (0,0), (-1,0), colors.lightgrey)])); story.extend([table, Spacer(1, 8)])

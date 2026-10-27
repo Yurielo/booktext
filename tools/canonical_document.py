@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -176,6 +178,117 @@ def _fallback_text_blocks(text):
             and len(letters) >= 3
         )
         yield ("heading" if explicit_article or uppercase_short else "paragraph"), value
+
+
+def _native_fragment(raw, lines):
+    """Keep an exact subset of a saved native-layout block as native evidence."""
+    if not lines:
+        return None
+    bounds = [min(line["bbox"][0] for line in lines), min(line["bbox"][1] for line in lines),
+              max(line["bbox"][2] for line in lines), max(line["bbox"][3] for line in lines)]
+    return {**raw, "bbox": bounds, "lines": lines, "text": "\n".join(line["text"] for line in lines)}
+
+
+def _native_mapping_rows(lines):
+    """Return one conservative two-column mapping run, if geometry proves it.
+
+    This is deliberately *not* table reconstruction.  It only recognizes a
+    consecutive run of at least three rows which each have exactly two saved
+    native text lines, aligned on the same baseline with a material x-gap.
+    The consumer preserves a crop of the source region and never derives
+    cells, headers, or a machine-readable grid from these lines.
+    """
+    if len(lines) < 3:
+        return None
+    heights = [line["bbox"][3] - line["bbox"][1] for line in lines]
+    median_height = sorted(heights)[len(heights) // 2] if heights else 0
+    tolerance = max(1.0, median_height * .45)
+    rows, index = [], 0
+    while index < len(lines):
+        row, baseline = [lines[index]], lines[index]["bbox"][1]
+        index += 1
+        while index < len(lines) and abs(lines[index]["bbox"][1] - baseline) <= tolerance:
+            row.append(lines[index]); index += 1
+        if len(row) == 2:
+            left, right = sorted(row, key=lambda value: value["bbox"][0])
+            gap = right["bbox"][0] - left["bbox"][2]
+            short_mapping_terms = all(1 <= len(str(value.get("text", "")).split()) <= 5 for value in (left, right))
+            if gap >= max(12.0, median_height * 1.4) and short_mapping_terms:
+                rows.append((lines.index(left), lines.index(right), left, right))
+                continue
+        rows.append(None)
+    best = None
+    for start, row in enumerate(rows):
+        if row is None:
+            continue
+        end = start
+        while end + 1 < len(rows) and rows[end + 1] is not None:
+            previous, following = rows[end], rows[end + 1]
+            if following[2]["bbox"][1] - previous[2]["bbox"][3] > max(14.0, median_height * 2.2):
+                break
+            end += 1
+        if end - start + 1 >= 3:
+            candidate = rows[start:end + 1]
+            if best is None or len(candidate) > len(best):
+                best = candidate
+    if best is None:
+        return None
+    first = min(row[0] for row in best); last = max(row[1] for row in best)
+    # PDF text extraction occasionally joins the final right/left cells onto
+    # one line. Include precisely one adjacent indented continuation in the
+    # preserved visual, rather than pretending that it is a verified cell row.
+    left_edge = min(row[2]["bbox"][0] for row in best)
+    right_edge = max(row[3]["bbox"][2] for row in best)
+    if last + 1 < len(lines):
+        continuation = lines[last + 1]
+        close = continuation["bbox"][1] - lines[last]["bbox"][3] <= max(14.0, median_height * 2.2)
+        indented = continuation["bbox"][0] >= left_edge + max(12.0, median_height * 1.4)
+        within = continuation["bbox"][2] <= right_edge + max(12.0, median_height * 1.4)
+        if close and indented and within:
+            last += 1
+    return first, last
+
+
+def _native_table_fallback_crop(root, *, page, raw_index, lines, page_ref, dimensions):
+    """Create a deterministic source crop for an unverified native table."""
+    if not page_ref.get("prepared_page") or not dimensions or len(dimensions) != 2:
+        return None
+    source = (root / page_ref["prepared_page"]).resolve()
+    if not source.is_relative_to(root) or not source.is_file():
+        return None
+    bounds = [min(line["bbox"][0] for line in lines), min(line["bbox"][1] for line in lines),
+              max(line["bbox"][2] for line in lines), max(line["bbox"][3] for line in lines)]
+    from PIL import Image
+    with Image.open(source) as image:
+        image.load()
+        sx, sy = image.width / dimensions[0], image.height / dimensions[1]
+        # Two points retain rules/descenders at the edge but never expand to a
+        # whole source page.  The source coordinates remain authoritative.
+        padded = [max(0, bounds[0] - 2), max(0, bounds[1] - 2),
+                  min(dimensions[0], bounds[2] + 2), min(dimensions[1], bounds[3] + 2)]
+        pixels = tuple(round(value * (sx if index % 2 == 0 else sy)) for index, value in enumerate(padded))
+        if pixels[2] <= pixels[0] or pixels[3] <= pixels[1]:
+            return None
+        identity = _hash_bytes((str(page) + str(raw_index) + repr(padded) + _hash_file(source)).encode())[:16]
+        relative = Path("images") / "native_table_fallbacks" / f"page-{page:04d}-layout-{raw_index:02d}-{identity}.png"
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        expected = image.crop(pixels)
+        if destination.exists():
+            with Image.open(destination) as existing:
+                existing.load()
+                if existing.size != expected.size or existing.mode != expected.mode or existing.tobytes() != expected.tobytes():
+                    raise ValueError("stale native table fallback crop; refusing reuse")
+        else:
+            descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.stem}.", suffix=".png", dir=destination.parent)
+            os.close(descriptor)
+            Path(temporary).unlink(missing_ok=True)
+            try:
+                expected.save(temporary, format="PNG", dpi=(sx * 72, sy * 72))
+                Path(temporary).replace(destination)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+    return str(relative), padded
 
 
 def _final_pages(book, priority, decisions, book_path, priority_path, decisions_path, version):
@@ -367,24 +480,53 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                                     abs(a-b) < .01 for a,b in zip(bounds,other))):
                             add_visual(visual)
                     continue
-                text = _block_text(raw)
-                if not text:
-                    continue
-                kind = _type_for_label(label)
-                fragments = [raw]
                 dimensions = (record.get("source_provenance") or {}).get("page_size_points")
-                if kind == "paragraph" and raw.get("extraction") == "native_pdf_words" and raw.get("lines") and dimensions:
-                    # Reuse saved word geometry, even for an older output. Raw
-                    # OCR/native artifacts and human decision anchors stay put.
-                    from tools.automatic_extraction import native_layout
-                    fragments = native_layout({"blocks": [raw]}, [])
-                for part, fragment in enumerate(fragments):
-                    suffix = "" if part == 0 else f":paragraph:{part+1}"
-                    add({"block_id": _stable_id("block", f"{document_id}:{page}:raw:{index}{suffix}"), "type": kind, "text": _block_text(fragment),
-                         "level": None if kind == "heading" else None,
-                         "provenance": {**page_ref, "layout_label": label, "layout_reading_order": raw.get("reading_order"), "bbox": fragment.get("bbox"), "polygon": raw.get("polygon"), "confidence": raw.get("confidence"), "raw_ocr_ref": raw_surya_ref,
-                                        "native_paragraph_part": part+1 if len(fragments)>1 else None,
-                                        "line_geometry": text_normalization.line_geometry(fragment.get("lines"), dimensions, fragment.get("bbox")) if raw.get("extraction") == "native_pdf_words" else None}})
+                segments = [("text", raw)]
+                if (label.casefold() in {"text", "paragraph", "body"} and raw.get("extraction") == "native_pdf_words"
+                        and isinstance(raw.get("lines"), list) and dimensions):
+                    mapping = _native_mapping_rows(raw["lines"])
+                    if mapping:
+                        first, last = mapping
+                        crop = _native_table_fallback_crop(root, page=page, raw_index=index,
+                                                            lines=raw["lines"][first:last+1], page_ref=page_ref,
+                                                            dimensions=dimensions)
+                        if crop:
+                            image, bounds = crop
+                            segments = []
+                            before, after = _native_fragment(raw, raw["lines"][:first]), _native_fragment(raw, raw["lines"][last+1:])
+                            if before: segments.append(("text", before))
+                            segments.append(("native_table_fallback", {"image": image, "bbox": bounds,
+                                "line_start": first + 1, "line_end": last + 1}))
+                            if after: segments.append(("text", after))
+                for segment_index, (segment_kind, value) in enumerate(segments, start=1):
+                    if segment_kind == "native_table_fallback":
+                        add({"block_id": _stable_id("table", f"{document_id}:{page}:native-layout:{index}:{value['line_start']}-{value['line_end']}"),
+                             "type": "table", "table_status": "fallback_review", "review_required": True,
+                             "fallback_visual": value["image"], "diagnostic": "native_two_column_mapping_geometry",
+                             "provenance": {**page_ref, "layout_label": label, "layout_reading_order": raw.get("reading_order"),
+                                            "bbox": value["bbox"], "raw_ocr_ref": raw_surya_ref,
+                                            "native_line_range": [value["line_start"], value["line_end"]],
+                                            "source": {"kind": "native_pdf_layout_table_crop", "source_page": page,
+                                                       "native_evidence": page_ref.get("raw_native_ref"),
+                                                       "cell_status": "unverified; no cells inferred"}}})
+                        continue
+                    text = _block_text(value)
+                    if not text:
+                        continue
+                    kind = _type_for_label(label)
+                    fragments = [value]
+                    if kind == "paragraph" and value.get("extraction") == "native_pdf_words" and value.get("lines") and dimensions:
+                        # Reuse saved word geometry, even for an older output. Raw
+                        # OCR/native artifacts and human decision anchors stay put.
+                        from tools.automatic_extraction import native_layout
+                        fragments = native_layout({"blocks": [value]}, [])
+                    for part, fragment in enumerate(fragments):
+                        suffix = f":segment:{segment_index}" + ("" if part == 0 else f":paragraph:{part+1}")
+                        add({"block_id": _stable_id("block", f"{document_id}:{page}:raw:{index}{suffix}"), "type": kind, "text": _block_text(fragment),
+                             "level": None if kind == "heading" else None,
+                             "provenance": {**page_ref, "layout_label": label, "layout_reading_order": raw.get("reading_order"), "bbox": fragment.get("bbox"), "polygon": raw.get("polygon"), "confidence": raw.get("confidence"), "raw_ocr_ref": raw_surya_ref,
+                                            "native_paragraph_part": part+1 if len(fragments)>1 else None,
+                                            "line_geometry": text_normalization.line_geometry(fragment.get("lines"), dimensions, fragment.get("bbox")) if value.get("extraction") == "native_pdf_words" else None}})
         for table in sorted(tables_by_index.values(), key=lambda value: value.get("index", 0)):
             add_table(table)
         for visual in visuals:
@@ -483,6 +625,9 @@ def validate_document(document, *, root=None, decisions=None):
             elif block.get("table_status") == "fallback_review":
                 if "cells" in block:
                     raise ValueError("fallback table must not contain cells")
+                visual = block.get("fallback_visual")
+                if visual and root is not None and not (Path(root) / visual).is_file():
+                    raise ValueError("broken fallback table visual reference")
             else:
                 raise ValueError("unsupported table status")
         for decision_id in provenance.get("correction_decision_ids", []):

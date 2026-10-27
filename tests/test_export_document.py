@@ -34,7 +34,7 @@ class ExportDocumentTests(unittest.TestCase):
             {"block_id":"f","type":"figure","reading_order":4,"image":"images/figure.png","description":"Auxiliary","caption_id":None,"provenance":{"source_page":1}},
             {"block_id":"t1","type":"table","reading_order":5,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-01.json","tsv":"tables/page-0313-table-01.tsv","html":"tables/page-0313-table-01.html"},"provenance":{"source_page":313}},
             {"block_id":"t2","type":"table","reading_order":6,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-02.json","tsv":"tables/page-0313-table-02.tsv","html":"tables/page-0313-table-02.html"},"provenance":{"source_page":313}},
-            {"block_id":"fallback","type":"table","reading_order":7,"table_status":"fallback_review","review_required":True,"provenance":{"source_page":319}},
+            {"block_id":"fallback","type":"table","reading_order":7,"table_status":"fallback_review","review_required":True,"fallback_visual":"images/figure.png","provenance":{"source_page":319}},
             {"block_id":"t3","type":"table","reading_order":8,"table_status":"structured","artifacts":{"json":"tables/page-0320-table-01.json","tsv":"tables/page-0320-table-01.tsv","html":"tables/page-0320-table-01.html"},"provenance":{"source_page":320}},
             {"block_id":"t4","type":"table","reading_order":9,"table_status":"structured","artifacts":{"json":"tables/page-0321-table-01.json","tsv":"tables/page-0321-table-01.tsv","html":"tables/page-0321-table-01.html"},"provenance":{"source_page":321}},
         ]}
@@ -54,6 +54,7 @@ class ExportDocumentTests(unittest.TestCase):
         markdown = (self.root / "exports/book.md").read_text(encoding="utf-8")
         html = (self.root / "exports/book.html").read_text(encoding="utf-8")
         self.assertIn("Corrected prose", markdown); self.assertIn("Unclassified content", markdown); self.assertNotIn("Unknown layout block", markdown); self.assertNotIn("fallback review", markdown)
+        self.assertIn("fallback.png", markdown)
         self.assertNotIn("\n---\n", markdown)
         self.assertEqual(markdown.count("| A | B |"), 4)
         self.assertIn("Heading &amp; &lt;safe&gt;", html); self.assertIn("Unclassified content", html); self.assertNotIn("Table fallback review", html); self.assertNotIn("<hr", html)
@@ -76,7 +77,7 @@ class ExportDocumentTests(unittest.TestCase):
             self.assertEqual("", "".join(page.extract_text() or "" for page in pypdf.PdfReader(self.root / "exports/book-image.pdf").pages).strip())
         except ImportError:
             pass
-        self.assertTrue(any(item["kind"] == "fallback_table_not_rendered" and item["page"] == 319 for item in manifest["warnings"]))
+        self.assertTrue(any(item["kind"] == "fallback_table_source_visual_preserved" and item["page"] == 319 for item in manifest["warnings"]))
         first_markdown = markdown; first_html = html
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive: first_docx_xml = archive.read("word/document.xml")
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive: first_epub_xhtml = archive.read("EPUB/text/ch001.xhtml")
@@ -202,6 +203,7 @@ class ExportDocumentTests(unittest.TestCase):
 
     def test_docx_never_treats_a_prepared_source_page_as_a_figure(self):
         self.document["blocks"] = [block for block in self.document["blocks"] if block["type"] != "figure"]
+        next(block for block in self.document["blocks"] if block["block_id"] == "fallback").pop("fallback_visual")
         self.document["blocks"].insert(0, {"block_id": "break", "type": "page_break", "reading_order": 0, "provenance": {"source_page": 1}})
         for order, block in enumerate(self.document["blocks"], start=1):
             block["reading_order"] = order
@@ -216,7 +218,8 @@ class ExportDocumentTests(unittest.TestCase):
             self.assertFalse(any(name.startswith("word/media/") for name in archive.namelist()))
         self.assertEqual(manifest["visual_preservation"], {
             "mode": "no_visual_evidence", "figure_count": 0,
-            "policy": "Only CDM figure blocks are embedded. Prepared source pages are provenance, never whole-page figure fallbacks.",
+            "fallback_table_visual_count": 0,
+            "policy": "Only CDM figure blocks and explicit fallback-table source crops are embedded. Prepared source pages are provenance, never whole-page figure fallbacks.",
         })
         self.assertTrue(any(item["kind"] == "no_visual_evidence_for_docx" for item in manifest["warnings"]))
 

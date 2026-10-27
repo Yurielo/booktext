@@ -91,8 +91,8 @@ enum FinalBookSection: String, CaseIterable, Identifiable {
     func openCompletedExport() { guard let relative = completedExportPath, let url = safeFile(relative) else { return }; NSWorkspace.shared.open(url) }
     func revealCompletedExport() { guard let relative = completedExportPath, let url = safeFile(relative) else { return }; NSWorkspace.shared.activateFileViewerSelecting([url]) }
     func openArtifact(_ key: String) { guard let path = inspection["artifacts"]?.object?[key]?.object?["path"]?.string, let url = safeFile(path) else { return }; NSWorkspace.shared.open(url) }
-    func localImage(_ block: [String: JSONValue]) -> NSImage? {
-        guard let path = block["image"]?.string, let url = safeFile(path) else { return nil }
+    func localImage(_ block: [String: JSONValue], key: String = "image") -> NSImage? {
+        guard let path = block[key]?.string, let url = safeFile(path) else { return nil }
         return NSImage(contentsOf: url)
     }
     private func safeFile(_ relative: String) -> URL? {
@@ -231,7 +231,10 @@ struct FinalBookView: View {
 
     @ViewBuilder private func tableBlock(_ block: [String: JSONValue]) -> some View {
         if block["table_status"]?.string == "fallback_review" {
-            Text("Table preserved as review evidence; no unverified cells are shown.").font(.caption).foregroundStyle(.orange).padding(8).frame(maxWidth: .infinity, alignment: .leading).background(Color.orange.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 6))
+            VStack(alignment: .leading, spacing: 6) {
+                if let image = model.localImage(block, key: "fallback_visual") { Image(nsImage: image).resizable().scaledToFit().frame(maxWidth: 680) }
+                Text("Table preserved from the source image; unverified cells are not shown as data.").font(.caption).foregroundStyle(.orange)
+            }.padding(8).frame(maxWidth: .infinity, alignment: .leading).background(Color.orange.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 6))
         } else {
             let rows = block["table_preview"]?.values ?? []
             VStack(alignment: .leading, spacing: 3) {

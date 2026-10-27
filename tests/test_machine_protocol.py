@@ -123,6 +123,24 @@ class MachineProtocolTests(unittest.TestCase):
             table = next(block for block in payload[-1]["details"]["result"]["blocks"] if block["type"] == "table")
             self.assertEqual([["H"], ["1"]], table["table_preview"])
 
+    def test_document_preview_exposes_fallback_source_visual_without_cells(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.fixture(temporary)
+            code, _payload = events(lambda: protocol.main(["cdm", str(root)]))
+            self.assertEqual(0, code)
+            (root / "images").mkdir(); (root / "images" / "source-table.png").write_bytes(b"source crop")
+            document = json.loads((root / "book_document.json").read_text(encoding="utf-8"))
+            document["blocks"].insert(-1, {"block_id": "fallback", "type": "table", "reading_order": 0,
+                "table_status": "fallback_review", "review_required": True, "fallback_visual": "images/source-table.png",
+                "provenance": {"source_page": 1, "source": {"cell_status": "unverified; no cells inferred"}}})
+            for order, block in enumerate(document["blocks"], start=1): block["reading_order"] = order
+            (root / "book_document.json").write_text(json.dumps(document), encoding="utf-8")
+            code, payload = events(lambda: protocol.main(["document-preview", str(root), "--index", "0", "--limit", "10"]))
+            self.assertEqual(0, code); self.assert_protocol(payload)
+            table = next(block for block in payload[-1]["details"]["result"]["blocks"] if block["block_id"] == "fallback")
+            self.assertEqual("images/source-table.png", table["fallback_visual"])
+            self.assertNotIn("table_preview", table)
+
     @mock.patch("tools.machine_protocol.translation.translate_document", return_value={"path": "translations/en-ru.json", "validation": {"valid": True}})
     def test_translation_uses_versioned_machine_operation_without_ocr(self, translate):
         with tempfile.TemporaryDirectory() as temporary:
