@@ -332,7 +332,7 @@ def publish(args) -> dict:
                 "receipt": str(receipt_dir), "message": str(error)}
     if any(item == event for item in state["history"]):
         return {"status": "ALREADY_PUBLISHED", "event_id": event["event_id"],
-                "current": state["products"]["booktext"]["current"]}
+                "current": state["products"]["booktext"]["current"], "receipt": str(receipt_dir)}
     if state["products"]["booktext"]["current"] != event.get("predecessor"):
         return {"status": "PUBLICATION_STALE", "event_id": event.get("event_id"),
                 "current": state["products"]["booktext"]["current"],

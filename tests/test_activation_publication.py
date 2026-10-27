@@ -137,6 +137,19 @@ class ActivationPublicationTests(unittest.TestCase):
                 action="rollback", rollback_of="sha256:old",
             )
 
+    def test_initial_registration_is_not_a_booktext_adapter_operation(self):
+        state = {"products": {"booktext": {"current": None}}, "history": []}
+        app = {"path": "/Applications/BookText.app", "version": "0.1.0", "build": "1",
+               "source_commit": None, "digest": "b" * 64}
+        core = {"root": "/Core", "source_commit": "a" * 40, "tree": "c" * 40}
+        with self.assertRaisesRegex(activation.ActivationError, "initial registration is out of scope"):
+            activation.build_event(
+                registry=FakeRegistry(), state=state, app=app, core=core, target="local-primary",
+                native_reference="https://example.test/activation",
+                native_evidence={"status": "SUCCEEDED", "native_evidence": {"activation": "completed"}},
+                activated_at=None, recorded_at="2026-10-27T00:00:00+00:00",
+            )
+
     def test_core_source_identity_requires_a_clean_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Core"
@@ -218,6 +231,7 @@ class ActivationPublicationTests(unittest.TestCase):
                 retried = activation.publish(args)
             self.assertEqual("ALREADY_PUBLISHED", retried["status"])
             self.assertEqual(event["event_id"], retried["current"])
+            self.assertEqual(str(receipt.resolve()), retried["receipt"])
 
 
 if __name__ == "__main__":
