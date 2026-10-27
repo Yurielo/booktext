@@ -457,3 +457,6 @@ python3 -m py_compile booktext.py tools/extract_surya_tables.py
 ```
 
 Temporary lifecycle and evidence retention: [owned TMP audit](docs/OWNED_TMP_LIFECYCLE.md). Use `scripts/test_suite.sh` for interruption-safe tests; historical diagnostics require `BOOKTEXT_DIAGNOSTIC_DIR` outside TMP.
+
+Central activated-release registration and the post-Activation publisher are
+documented in [Central activation publication](docs/architecture/CENTRAL_ACTIVATION_PUBLICATION.md).

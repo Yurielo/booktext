@@ -17,6 +17,8 @@ class NativeAppBuildWorkflowTests(unittest.TestCase):
         self.assertLess(sign_index, verify_index)
         self.assertIn('rm -rf "$app_dir"', script)
         self.assertIn('*.app', script)
+        self.assertIn('BookTextSourceCommit', script)
+        self.assertIn('status --porcelain --untracked-files=all', script)
 
     def test_icon_is_declared_and_shipped_as_a_bundle_resource(self):
         root = Path(__file__).resolve().parents[1]

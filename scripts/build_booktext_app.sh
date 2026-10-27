@@ -17,6 +17,14 @@ mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp "$repo_root/BookTextApp/Info.plist" "$app_dir/Contents/Info.plist"
 cp "$build_dir/BookText" "$app_dir/Contents/MacOS/BookText"
 cp "$repo_root/BookTextApp/Resources/BookText.icns" "$app_dir/Contents/Resources/BookText.icns"
+# Record the exact GUI source only for a clean source tree. Development builds
+# from a dirty checkout remain usable, but cannot later claim a source commit.
+gui_source_commit="unavailable"
+if git -C "$repo_root" rev-parse --verify HEAD >/dev/null 2>&1 \
+  && [[ -z "$(git -C "$repo_root" status --porcelain --untracked-files=all)" ]]; then
+  gui_source_commit=$(git -C "$repo_root" rev-parse HEAD)
+fi
+/usr/libexec/PlistBuddy -c "Add :BookTextSourceCommit string $gui_source_commit" "$app_dir/Contents/Info.plist"
 # Local-only BookText.app uses macOS's supported ad-hoc identity.  This is
 # deliberately after all Contents mutations and verification is mandatory.
 # Finder/iCloud may attach FinderInfo to a newly created .app directory even
