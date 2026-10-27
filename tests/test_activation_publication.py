@@ -1,7 +1,10 @@
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools import activation_publication as activation
 
@@ -11,8 +14,10 @@ class FakeRegistry:
         return "subject-hash"
 
     def encode(self, value):
-        import json
         return (json.dumps(value, sort_keys=True) + "\n").encode()
+
+    def decode(self, value):
+        return json.loads(value)
 
     def sha256(self, value):
         return hashlib.sha256(value).hexdigest()
@@ -22,6 +27,23 @@ class FakeRegistry:
 
 
 class ActivationPublicationTests(unittest.TestCase):
+    def _pending_receipt(self, root: Path, *, predecessor="sha256:prior"):
+        state = {"products": {"booktext": {"current": predecessor}}, "history": [{"event_id": predecessor, "generation": 1}]}
+        app = {"path": "/Applications/BookText.app", "version": "0.1.1", "build": "2",
+               "source_commit": None, "digest": "b" * 64}
+        core = {"root": "/Core", "source_commit": "a" * 40, "tree": "c" * 40}
+        event, proof = activation.build_event(
+            registry=FakeRegistry(), state=state, app=app, core=core,
+            target="local-primary", native_reference="https://example.test/activation",
+            native_evidence={"status": "SUCCEEDED", "native_evidence": {"activation": "completed"}},
+            activated_at=None, recorded_at="2026-10-27T00:00:00+00:00",
+        )
+        receipt = root / "receipt"
+        receipt.mkdir()
+        (receipt / "event.json").write_text(json.dumps(event), encoding="utf-8")
+        (receipt / "native-activation.json").write_bytes(proof)
+        return event, proof, receipt
+
     def test_file_list_digest_matches_central_algorithm_and_ignores_symlinks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -132,6 +154,70 @@ class ActivationPublicationTests(unittest.TestCase):
             (root / "dirty.txt").write_text("local", encoding="utf-8")
             with self.assertRaisesRegex(activation.ActivationError, "not clean"):
                 activation.inspect_core(root / "booktext.py")
+
+    def test_prepare_is_idempotent_and_preserves_existing_receipt_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            support = root / "support"
+            native_reference = "https://example.test/native-activation"
+            destination = support / hashlib.sha256(native_reference.encode("utf-8")).hexdigest()
+            destination.mkdir(parents=True)
+            (destination / "event.json").write_text(
+                json.dumps({"product": "booktext", "event_id": "sha256:retained"}), encoding="utf-8"
+            )
+            (destination / "native-activation.json").write_text("retained proof", encoding="utf-8")
+            before = {path.name: path.read_bytes() for path in destination.iterdir()}
+            args = SimpleNamespace(support=support, native_reference=native_reference)
+            with patch.object(activation, "inspect_app", side_effect=AssertionError("must not re-observe app")):
+                result = activation.prepare(args)
+            self.assertEqual("ALREADY_PREPARED", result["status"])
+            self.assertEqual("sha256:retained", result["event_id"])
+            self.assertEqual(before, {path.name: path.read_bytes() for path in destination.iterdir()})
+
+    def test_prepare_rejects_incomplete_existing_receipt_without_resealing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            support = Path(temporary) / "support"
+            native_reference = "https://example.test/native-activation"
+            destination = support / hashlib.sha256(native_reference.encode("utf-8")).hexdigest()
+            destination.mkdir(parents=True)
+            (destination / "event.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(activation.ActivationError, "incomplete activation receipt"):
+                activation.prepare(SimpleNamespace(support=support, native_reference=native_reference))
+
+    def test_stale_publication_keeps_exact_pending_receipt_for_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            event, proof, receipt = self._pending_receipt(Path(temporary))
+            stale_state = {"products": {"booktext": {"current": "sha256:later"}}, "history": []}
+            args = SimpleNamespace(receipt=receipt, registry_root=Path(temporary) / "registry")
+            before = {path.name: path.read_bytes() for path in receipt.iterdir()}
+            with patch.object(activation, "load_registry_module", return_value=(args.registry_root, FakeRegistry())), \
+                 patch.object(activation, "read_remote_state", return_value=("head", {}, stale_state)), \
+                 patch.object(activation, "_run", side_effect=AssertionError("stale receipt must not publish")):
+                result = activation.publish(args)
+            self.assertEqual("PUBLICATION_STALE", result["status"])
+            self.assertEqual(event["event_id"], result["event_id"])
+            self.assertEqual(before, {path.name: path.read_bytes() for path in receipt.iterdir()})
+            self.assertEqual(proof, (receipt / "native-activation.json").read_bytes())
+
+    def test_publication_failure_keeps_exact_receipt_and_retry_observes_idempotence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            event, proof, receipt = self._pending_receipt(Path(temporary))
+            args = SimpleNamespace(receipt=receipt, registry_root=Path(temporary) / "registry")
+            pending_state = {"products": {"booktext": {"current": event["predecessor"]}}, "history": []}
+            before = {path.name: path.read_bytes() for path in receipt.iterdir()}
+            with patch.object(activation, "load_registry_module", return_value=(args.registry_root, FakeRegistry())), \
+                 patch.object(activation, "read_remote_state", return_value=("head", {}, pending_state)), \
+                 patch.object(activation, "_run", side_effect=activation.ActivationError("network unavailable")):
+                result = activation.publish(args)
+            self.assertEqual("PUBLICATION_PENDING", result["status"])
+            self.assertEqual(before, {path.name: path.read_bytes() for path in receipt.iterdir()})
+
+            published_state = {"products": {"booktext": {"current": event["event_id"]}}, "history": [event]}
+            with patch.object(activation, "load_registry_module", return_value=(args.registry_root, FakeRegistry())), \
+                 patch.object(activation, "read_remote_state", return_value=("head", {}, published_state)):
+                retried = activation.publish(args)
+            self.assertEqual("ALREADY_PUBLISHED", retried["status"])
+            self.assertEqual(event["event_id"], retried["current"])
 
 
 if __name__ == "__main__":

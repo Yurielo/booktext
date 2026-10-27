@@ -231,16 +231,35 @@ def _write_atomic(path: Path, data: bytes) -> None:
         raise
 
 
+def _prepared_receipt(destination: Path) -> dict:
+    """Return the durable receipt identity without ever recreating it.
+
+    A native activation is an external lifecycle fact.  If a concurrent
+    completion already created its receipt, or if a later retry encounters it,
+    keep those exact bytes rather than observing the app again and producing a
+    competing event.
+    """
+    event_path = destination / "event.json"
+    proof_path = destination / "native-activation.json"
+    if not event_path.is_file() or not proof_path.is_file():
+        raise ActivationError(
+            f"incomplete activation receipt already exists at {destination}; preserve it for review"
+        )
+    try:
+        event = json.loads(event_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ActivationError(f"invalid retained activation receipt at {destination}") from error
+    if not isinstance(event, dict) or event.get("product") != "booktext" or not event.get("event_id"):
+        raise ActivationError(f"invalid retained BookText event at {destination}")
+    return {"status": "ALREADY_PREPARED", "event_id": event["event_id"], "receipt": str(destination)}
+
+
 def prepare(args) -> dict:
     support = args.support.expanduser().resolve()
     identity = hashlib.sha256(args.native_reference.encode("utf-8")).hexdigest()
     destination = support / identity
     if destination.exists():
-        event_path = destination / "event.json"
-        if not event_path.is_file():
-            raise ActivationError(f"incomplete activation receipt already exists at {destination}; preserve it for review")
-        event = json.loads(event_path.read_text(encoding="utf-8"))
-        return {"status": "ALREADY_PREPARED", "event_id": event.get("event_id"), "receipt": str(destination)}
+        return _prepared_receipt(destination)
 
     with args.native_evidence.expanduser().open("r", encoding="utf-8") as handle:
         native = json.load(handle)
@@ -272,7 +291,7 @@ def prepare(args) -> dict:
             os.rename(staging, destination)
         except FileExistsError:
             shutil.rmtree(staging)
-            return {"status": "ALREADY_PREPARED", "event_id": None, "receipt": str(destination)}
+            return _prepared_receipt(destination)
     except BaseException:
         if staging.exists() and staging.parent == support:
             shutil.rmtree(staging)
