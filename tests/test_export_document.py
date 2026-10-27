@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
-from tools.export_document import export_document, export_translation, _enable_docx_text_wrapping, _format_wide_docx_tables, WP, W, A
+from tools.export_document import export_document, export_translation, render_markdown, _enable_docx_text_wrapping, _format_wide_docx_tables, WP, W, A
 from tools import translation
 
 
@@ -67,6 +67,9 @@ class ExportDocumentTests(unittest.TestCase):
             self.assertNotIn(b'allowOverlap="1"', xml)
             self.assertNotIn(b"Unknown layout", xml)
             self.assertNotIn(b"Table fallback review", xml)
+            root = ET.fromstring(xml)
+            source_table = next(node for node in root.findall(f".//{WP}docPr") if node.get("descr") == "Source table")
+            self.assertEqual(f"{WP}inline", next(parent for parent in root.iter() if source_table in list(parent)).tag)
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive:
             self.assertIn("mimetype", archive.namelist()); self.assertTrue(any(name.endswith(".png") for name in archive.namelist()))
         self.assertGreater((self.root / "exports/book.pdf").stat().st_size, 100)
@@ -86,6 +89,12 @@ class ExportDocumentTests(unittest.TestCase):
         self.assertEqual(first_html, (self.root / "exports/book.html").read_text(encoding="utf-8"))
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive: self.assertEqual(first_docx_xml, archive.read("word/document.xml"))
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive: self.assertEqual(first_epub_xhtml, archive.read("EPUB/text/ch001.xhtml"))
+
+    def test_source_footnote_marker_is_not_reinterpreted_as_a_list(self):
+        document = json.loads(json.dumps(self.document))
+        document["blocks"] = [{"block_id": "p", "type": "paragraph", "reading_order": 1,
+                               "text": "* Source footnote marker remains prose.", "provenance": {"source_page": 1}}]
+        self.assertIn("\\* Source footnote marker", render_markdown(document, self.root))
 
     def test_explicit_selection_never_defaults_to_all_or_leaves_helper_markdown(self):
         with self.assertRaisesRegex(ValueError, "select at least one export format"):

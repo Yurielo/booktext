@@ -62,6 +62,18 @@ def _markdown_table(grid):
     return "\n".join([header, divider, *body])
 
 
+def _markdown_text(value):
+    """Keep source punctuation from accidentally becoming Markdown syntax."""
+    text = str(value or "")
+    # A source footnote marker such as ``* With regard`` is prose, not a
+    # list.  Escaping only a leading marker leaves authentic interior text
+    # intact and avoids changing CDM text/provenance.
+    if re.match(r"^\s*(?:[*+-]|\d+[.)])\s+", text):
+        prefix = re.match(r"^(\s*)(.*)$", text)
+        text = prefix.group(1) + "\\" + prefix.group(2)
+    return text
+
+
 def render_markdown(document, root, asset_map=None):
     asset_map = asset_map or {}
     lines = [f"# {document['metadata'].get('title') or 'BookText export'}", "", "<!-- Generated from BookText CDM; CDM remains the machine source. -->"]
@@ -76,19 +88,19 @@ def render_markdown(document, root, asset_map=None):
             lines.extend(["", f"<!-- source-page: {page} -->"])
             if block.get("boundary_kind") == "excerpt_gap":
                 lines.extend(["", "*" + block["text"] + "*"])
-        elif kind == "heading": lines.extend(["", "## " + block.get("text", "")])
-        elif kind == "paragraph": lines.extend(["", block.get("text", "")])
-        elif kind == "list": lines.extend(["", "- " + block.get("text", "")])
+        elif kind == "heading": lines.extend(["", "## " + _markdown_text(block.get("text", ""))])
+        elif kind == "paragraph": lines.extend(["", _markdown_text(block.get("text", ""))])
+        elif kind == "list": lines.extend(["", "- " + _markdown_text(block.get("text", ""))])
         # Unknown is a conservative CDM classification, not reader-facing
         # content. Keep its text without a developer diagnostic label.
-        elif kind == "unknown": lines.extend(["", block.get("text", "")])
+        elif kind == "unknown": lines.extend(["", _markdown_text(block.get("text", ""))])
         elif kind == "table":
             lines.extend([""])
             if block.get("table_status") == "structured": lines.append(_markdown_table(_grid(root, block)))
             elif block.get("fallback_visual"):
                 # The source crop preserves a real table without claiming
                 # unverified native geometry is a grid of machine cells.
-                lines.append(f"![]({asset_map.get(block['fallback_visual'], _asset_path(block['fallback_visual']))})")
+                lines.append(f"![Source table]({asset_map.get(block['fallback_visual'], _asset_path(block['fallback_visual']))})")
             else: continue
         elif kind == "figure":
             lines.extend(["", f"![]({asset_map.get(block.get('image'), _asset_path(block.get('image')))})"])
@@ -169,6 +181,12 @@ def _enable_docx_text_wrapping(destination):
         cx, cy = int(extent.get("cx")), int(extent.get("cy"))
         if min(cx, cy, width, height) <= 0:
             raise ValueError("DOCX drawing/page has invalid size")
+        properties = inline.find(f"{WP}docPr")
+        if properties is not None and properties.get("descr") == "Source table":
+            # A source-preserved fallback table is already one visual block.
+            # Floating it would reflow adjacent paragraphs around an
+            # unverified crop and make the reader output misleading.
+            continue
         scale = min(1, width / cx, height / cy)
         extent.set("cx", str(round(cx * scale))); extent.set("cy", str(round(cy * scale)))
         for transform in inline.findall(f".//{A}xfrm/{A}ext"):
