@@ -24,6 +24,8 @@ class ExportDocumentTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
         (self.root / "images").mkdir(); (self.root / "images/figure.png").write_bytes(PNG)
+        from PIL import Image
+        Image.new("RGB", (2, 2), "red").save(self.root / "images/fallback.png")
         for table in ("page-0313-table-01", "page-0313-table-02", "page-0320-table-01", "page-0321-table-01"):
             write(self.root / f"tables/{table}.json", {"grid":[["A", "B"], ["1", "2"]]})
             write(self.root / f"tables/{table}.tsv", "A\tB\n1\t2\n"); write(self.root / f"tables/{table}.html", "<table><tr><td>A</td></tr></table>")
@@ -34,7 +36,7 @@ class ExportDocumentTests(unittest.TestCase):
             {"block_id":"f","type":"figure","reading_order":4,"image":"images/figure.png","description":"Auxiliary","caption_id":None,"provenance":{"source_page":1}},
             {"block_id":"t1","type":"table","reading_order":5,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-01.json","tsv":"tables/page-0313-table-01.tsv","html":"tables/page-0313-table-01.html"},"provenance":{"source_page":313}},
             {"block_id":"t2","type":"table","reading_order":6,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-02.json","tsv":"tables/page-0313-table-02.tsv","html":"tables/page-0313-table-02.html"},"provenance":{"source_page":313}},
-            {"block_id":"fallback","type":"table","reading_order":7,"table_status":"fallback_review","review_required":True,"fallback_visual":"images/figure.png","provenance":{"source_page":319}},
+            {"block_id":"fallback","type":"table","reading_order":7,"table_status":"fallback_review","review_required":True,"fallback_visual":"images/fallback.png","provenance":{"source_page":319}},
             {"block_id":"t3","type":"table","reading_order":8,"table_status":"structured","artifacts":{"json":"tables/page-0320-table-01.json","tsv":"tables/page-0320-table-01.tsv","html":"tables/page-0320-table-01.html"},"provenance":{"source_page":320}},
             {"block_id":"t4","type":"table","reading_order":9,"table_status":"structured","artifacts":{"json":"tables/page-0321-table-01.json","tsv":"tables/page-0321-table-01.tsv","html":"tables/page-0321-table-01.html"},"provenance":{"source_page":321}},
         ]}
@@ -68,8 +70,9 @@ class ExportDocumentTests(unittest.TestCase):
             self.assertNotIn(b"Unknown layout", xml)
             self.assertNotIn(b"Table fallback review", xml)
             root = ET.fromstring(xml)
-            source_table = next(node for node in root.findall(f".//{WP}docPr") if node.get("descr") == "Source table")
-            self.assertEqual(f"{WP}inline", next(parent for parent in root.iter() if source_table in list(parent)).tag)
+            self.assertFalse(any(node.get("descr") == "Source table" for node in root.findall(f".//{WP}docPr")))
+            self.assertEqual(1, len(root.findall(f".//{WP}inline")))
+            self.assertEqual(1, len(root.findall(f".//{WP}anchor")))
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive:
             self.assertIn("mimetype", archive.namelist()); self.assertTrue(any(name.endswith(".png") for name in archive.namelist()))
         self.assertGreater((self.root / "exports/book.pdf").stat().st_size, 100)

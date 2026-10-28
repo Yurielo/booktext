@@ -35,6 +35,7 @@ FORMATS = ("markdown", "html", "docx", "epub", "pdf", "pdf_image")
 WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 
 
 def _load(path): return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -100,7 +101,7 @@ def render_markdown(document, root, asset_map=None):
             elif block.get("fallback_visual"):
                 # The source crop preserves a real table without claiming
                 # unverified native geometry is a grid of machine cells.
-                lines.append(f"![Source table]({asset_map.get(block['fallback_visual'], _asset_path(block['fallback_visual']))})")
+                lines.append(f"![]({asset_map.get(block['fallback_visual'], _asset_path(block['fallback_visual']))})")
             else: continue
         elif kind == "figure":
             lines.extend(["", f"![]({asset_map.get(block.get('image'), _asset_path(block.get('image')))})"])
@@ -151,7 +152,7 @@ def _pandoc(markdown, destination, root):
     subprocess.run([executable, str(markdown), "--resource-path", resources, "-o", str(destination)], check=True, capture_output=True, text=True)
 
 
-def _enable_docx_text_wrapping(destination):
+def _enable_docx_text_wrapping(destination, *, inline_image_hashes=()):
     """Wrap small figures; keep large illustrations in the paginated flow.
 
     Pandoc creates valid inline drawings, but Word lays those out as text
@@ -164,6 +165,14 @@ def _enable_docx_text_wrapping(destination):
     if xml is None:
         raise ValueError("DOCX has no word/document.xml")
     root = ET.fromstring(xml)
+    relationships = {}
+    relationship_xml = files.get("word/_rels/document.xml.rels")
+    if relationship_xml:
+        for relationship in ET.fromstring(relationship_xml):
+            identifier, target = relationship.get("Id"), relationship.get("Target")
+            if identifier and target:
+                relationships[identifier] = (Path("word") / target).as_posix()
+    inline_image_hashes = set(inline_image_hashes)
     parents = {child: parent for parent in root.iter() for child in parent}
     section = root.find(f".//{W}sectPr")
     size = section.find(f"{W}pgSz") if section is not None else None
@@ -181,8 +190,10 @@ def _enable_docx_text_wrapping(destination):
         cx, cy = int(extent.get("cx")), int(extent.get("cy"))
         if min(cx, cy, width, height) <= 0:
             raise ValueError("DOCX drawing/page has invalid size")
-        properties = inline.find(f"{WP}docPr")
-        if properties is not None and properties.get("descr") == "Source table":
+        blip = inline.find(f".//{A}blip")
+        embedded = blip.get(f"{R}embed") if blip is not None else None
+        asset = files.get(relationships.get(embedded, ""), b"")
+        if asset and hashlib.sha256(asset).hexdigest() in inline_image_hashes:
             # A source-preserved fallback table is already one visual block.
             # Floating it would reflow adjacent paragraphs around an
             # unverified crop and make the reader output misleading.
@@ -418,7 +429,9 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
         _write(docx_markdown, markdown)
         try:
             _pandoc(docx_markdown, paths["docx"], root)
-            _enable_docx_text_wrapping(paths["docx"])
+            fallback_hashes = {_sha(root / block["fallback_visual"]) for block in document["blocks"]
+                               if block.get("type") == "table" and block.get("fallback_visual")}
+            _enable_docx_text_wrapping(paths["docx"], inline_image_hashes=fallback_hashes)
             _format_wide_docx_tables(paths["docx"])
         finally:
             docx_markdown.unlink(missing_ok=True)
