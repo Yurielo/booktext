@@ -161,7 +161,7 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertEqual([b["text"] for b in document["blocks"] if b["type"] == "paragraph"],
                          ["Left top.", "Left bottom.", "Right top."])
 
-    def test_native_two_column_mapping_is_preserved_as_visual_fallback_not_invented_cells(self):
+    def test_native_two_column_mapping_becomes_verified_structured_native_text_table(self):
         from PIL import Image
         (self.root / "surya/surya-input/results.json").unlink()
         (self.root / "review_decisions.json").unlink()
@@ -180,14 +180,17 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.priority["items"] = []
         write(self.root / "book.json", self.book); write(self.root / "review_priority.json", self.priority)
         document = build_document(self.root)
-        fallback = next(block for block in document["blocks"] if block.get("table_status") == "fallback_review")
-        self.assertNotIn("cells", fallback)
-        self.assertEqual(fallback["diagnostic"], "native_two_column_mapping_geometry")
-        self.assertTrue((self.root / fallback["fallback_visual"]).is_file())
+        table = next(block for block in document["blocks"] if block.get("table_status") == "structured")
+        self.assertNotIn("cells", table)
+        self.assertEqual(table["rows"], 3)
+        self.assertEqual(table["columns"], 2)
+        grid = json.loads((self.root / table["artifacts"]["json"]).read_text(encoding="utf-8"))["grid"]
+        self.assertEqual(grid, [["Saturn", "triangle"], ["Jupiter", "quadrangle"], ["Mars", "pentagon"]])
+        self.assertEqual(table["provenance"]["source"]["cell_status"], "verified_native_text_geometry")
         publication = "\n".join(block.get("text", "") for block in document["blocks"])
         self.assertIn("The symbols are:", publication)
         self.assertIn("The list continues.", publication)
-        self.assertNotIn("Saturn triangle", publication)
+        self.assertNotIn("Saturn\ntriangle", publication)
         validate_document(document, root=self.root, decisions={"decisions": []})
 
     def test_scan_figure_stays_at_anchored_primary_position_once(self):

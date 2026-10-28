@@ -8,11 +8,11 @@ starts OCR, a model, or an external process; raw OCR remains in ``book.json``.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import html
 import json
-import os
 import re
-import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -190,13 +190,13 @@ def _native_fragment(raw, lines):
 
 
 def _native_mapping_rows(lines):
-    """Return one conservative two-column mapping run, if geometry proves it.
+    """Return a conservative, geometry-verified native two-column table run.
 
-    This is deliberately *not* table reconstruction.  It only recognizes a
-    consecutive run of at least three rows which each have exactly two saved
-    native text lines, aligned on the same baseline with a material x-gap.
-    The consumer preserves a crop of the source region and never derives
-    cells, headers, or a machine-readable grid from these lines.
+    The source is a PDF text layer: every accepted cell is an existing native
+    text line.  We require at least three consecutive, two-line rows with
+    aligned baselines and a material column gap.  An ambiguous adjacent line
+    is deliberately *not* absorbed into a cell: it remains ordinary source
+    text, rather than being guessed into a grid.
     """
     if len(lines) < 3:
         return None
@@ -234,61 +234,28 @@ def _native_mapping_rows(lines):
     if best is None:
         return None
     first = min(row[0] for row in best); last = max(row[1] for row in best)
-    # PDF text extraction occasionally joins the final right/left cells onto
-    # one line. Include precisely one adjacent indented continuation in the
-    # preserved visual, rather than pretending that it is a verified cell row.
-    left_edge = min(row[2]["bbox"][0] for row in best)
-    right_edge = max(row[3]["bbox"][2] for row in best)
-    if last + 1 < len(lines):
-        continuation = lines[last + 1]
-        close = continuation["bbox"][1] - lines[last]["bbox"][3] <= max(14.0, median_height * 2.2)
-        indented = continuation["bbox"][0] >= left_edge + max(12.0, median_height * 1.4)
-        within = continuation["bbox"][2] <= right_edge + max(12.0, median_height * 1.4)
-        if close and indented and within:
-            last += 1
-    return first, last
+    return first, last, [[str(row[2]["text"]).strip(), str(row[3]["text"]).strip()] for row in best]
 
 
-def _native_table_fallback_crop(root, *, page, raw_index, lines, page_ref, dimensions):
-    """Create a deterministic source crop for an unverified native table."""
-    if not page_ref.get("prepared_page") or not dimensions or len(dimensions) != 2:
-        return None
-    source = (root / page_ref["prepared_page"]).resolve()
-    if not source.is_relative_to(root) or not source.is_file():
-        return None
-    bounds = [min(line["bbox"][0] for line in lines), min(line["bbox"][1] for line in lines),
-              max(line["bbox"][2] for line in lines), max(line["bbox"][3] for line in lines)]
-    from PIL import Image
-    with Image.open(source) as image:
-        image.load()
-        sx, sy = image.width / dimensions[0], image.height / dimensions[1]
-        # Two points retain rules/descenders at the edge but never expand to a
-        # whole source page.  The source coordinates remain authoritative.
-        padded = [max(0, bounds[0] - 2), max(0, bounds[1] - 2),
-                  min(dimensions[0], bounds[2] + 2), min(dimensions[1], bounds[3] + 2)]
-        pixels = tuple(round(value * (sx if index % 2 == 0 else sy)) for index, value in enumerate(padded))
-        if pixels[2] <= pixels[0] or pixels[3] <= pixels[1]:
-            return None
-        identity = _hash_bytes((str(page) + str(raw_index) + repr(padded) + _hash_file(source)).encode())[:16]
-        relative = Path("images") / "native_table_fallbacks" / f"page-{page:04d}-layout-{raw_index:02d}-{identity}.png"
-        destination = root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        expected = image.crop(pixels)
-        if destination.exists():
-            with Image.open(destination) as existing:
-                existing.load()
-                if existing.size != expected.size or existing.mode != expected.mode or existing.tobytes() != expected.tobytes():
-                    raise ValueError("stale native table fallback crop; refusing reuse")
-        else:
-            descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.stem}.", suffix=".png", dir=destination.parent)
-            os.close(descriptor)
-            Path(temporary).unlink(missing_ok=True)
-            try:
-                expected.save(temporary, format="PNG", dpi=(sx * 72, sy * 72))
-                Path(temporary).replace(destination)
-            finally:
-                Path(temporary).unlink(missing_ok=True)
-    return str(relative), padded
+def _write_native_table_artifacts(root, *, page, raw_index, grid, bbox, page_ref):
+    """Persist a verified native-PDF table using the structured table contract."""
+    tables = root / "tables"
+    tables.mkdir(parents=True, exist_ok=True)
+    stem = f"page-{page:04d}-native-table-{raw_index:02d}"
+    paths = {kind: tables / f"{stem}.{kind}" for kind in ("json", "tsv", "html")}
+    payload = {
+        "schema_version": "1.0", "artifact_type": "booktext.native_pdf_geometry_table",
+        "source": "native_pdf_words_geometry", "page": page, "table_index": raw_index,
+        "bbox": bbox, "rows": grid, "grid": grid, "row_count": len(grid), "column_count": 2,
+        "provenance": {"native_evidence": page_ref.get("raw_native_ref"),
+                       "cell_status": "verified_native_text_geometry"},
+    }
+    paths["json"].write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with paths["tsv"].open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle, delimiter="\t").writerows(grid)
+    rows = "".join("<tr>" + "".join(f"<td>{html.escape(cell)}</td>" for cell in row) + "</tr>" for row in grid)
+    paths["html"].write_text(f"<table>{rows}</table>\n", encoding="utf-8")
+    return {kind: f"tables/{path.name}" for kind, path in paths.items()}
 
 
 def _final_pages(book, priority, decisions, book_path, priority_path, decisions_path, version):
@@ -486,29 +453,30 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                         and isinstance(raw.get("lines"), list) and dimensions):
                     mapping = _native_mapping_rows(raw["lines"])
                     if mapping:
-                        first, last = mapping
-                        crop = _native_table_fallback_crop(root, page=page, raw_index=index,
-                                                            lines=raw["lines"][first:last+1], page_ref=page_ref,
-                                                            dimensions=dimensions)
-                        if crop:
-                            image, bounds = crop
-                            segments = []
-                            before, after = _native_fragment(raw, raw["lines"][:first]), _native_fragment(raw, raw["lines"][last+1:])
-                            if before: segments.append(("text", before))
-                            segments.append(("native_table_fallback", {"image": image, "bbox": bounds,
-                                "line_start": first + 1, "line_end": last + 1}))
-                            if after: segments.append(("text", after))
+                        first, last, grid = mapping
+                        bounds = [min(line["bbox"][0] for line in raw["lines"][first:last+1]),
+                                  min(line["bbox"][1] for line in raw["lines"][first:last+1]),
+                                  max(line["bbox"][2] for line in raw["lines"][first:last+1]),
+                                  max(line["bbox"][3] for line in raw["lines"][first:last+1])]
+                        artifacts = _write_native_table_artifacts(root, page=page, raw_index=index, grid=grid,
+                                                                  bbox=bounds, page_ref=page_ref)
+                        segments = []
+                        before, after = _native_fragment(raw, raw["lines"][:first]), _native_fragment(raw, raw["lines"][last+1:])
+                        if before: segments.append(("text", before))
+                        segments.append(("native_table", {"grid": grid, "bbox": bounds, "artifacts": artifacts,
+                            "line_start": first + 1, "line_end": last + 1}))
+                        if after: segments.append(("text", after))
                 for segment_index, (segment_kind, value) in enumerate(segments, start=1):
-                    if segment_kind == "native_table_fallback":
+                    if segment_kind == "native_table":
                         add({"block_id": _stable_id("table", f"{document_id}:{page}:native-layout:{index}:{value['line_start']}-{value['line_end']}"),
-                             "type": "table", "table_status": "fallback_review", "review_required": True,
-                             "fallback_visual": value["image"], "diagnostic": "native_two_column_mapping_geometry",
+                             "type": "table", "table_status": "structured", "rows": len(value["grid"]), "columns": 2,
+                             "artifacts": value["artifacts"],
                              "provenance": {**page_ref, "layout_label": label, "layout_reading_order": raw.get("reading_order"),
                                             "bbox": value["bbox"], "raw_ocr_ref": raw_surya_ref,
                                             "native_line_range": [value["line_start"], value["line_end"]],
-                                            "source": {"kind": "native_pdf_layout_table_crop", "source_page": page,
+                                            "source": {"kind": "native_pdf_words_geometry", "source_page": page,
                                                        "native_evidence": page_ref.get("raw_native_ref"),
-                                                       "cell_status": "unverified; no cells inferred"}}})
+                                                       "cell_status": "verified_native_text_geometry"}}})
                         continue
                     text = _block_text(value)
                     if not text:
