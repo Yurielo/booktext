@@ -328,6 +328,62 @@ def _format_wide_docx_tables(destination):
     return changed
 
 
+def _format_native_geometry_docx_tables(destination, *, grids=()):
+    """Keep verified native-PDF mappings as text tables, not invented headers.
+
+    Pandoc's Markdown table syntax necessarily treats its first row as a
+    header.  Native PDF geometry does not supply that semantic evidence, so
+    remove the resulting header treatment and grid decoration from precisely
+    the matching source-derived tables in the final DOCX.
+    """
+    expected = {tuple(tuple(str(cell) for cell in row) for row in grid) for grid in grids}
+    if not expected:
+        return 0
+    with zipfile.ZipFile(destination) as archive:
+        files = {entry.filename: archive.read(entry.filename) for entry in archive.infolist()}
+    root = ET.fromstring(files["word/document.xml"])
+    changed = 0
+    for table in root.findall(f".//{W}tbl"):
+        rows = []
+        for row in table.findall(f"{W}tr"):
+            rows.append(tuple("".join(node.text or "" for node in cell.iter(f"{W}t")) for cell in row.findall(f"{W}tc")))
+        if tuple(rows) not in expected:
+            continue
+        properties = table.find(f"{W}tblPr")
+        if properties is None:
+            properties = ET.Element(f"{W}tblPr")
+            table.insert(0, properties)
+        look = properties.find(f"{W}tblLook")
+        if look is None:
+            look = ET.SubElement(properties, f"{W}tblLook")
+        look.attrib.update({f"{W}firstRow": "0", f"{W}lastRow": "0", f"{W}noHBand": "1", f"{W}noVBand": "1"})
+        borders = properties.find(f"{W}tblBorders")
+        if borders is None:
+            borders = ET.SubElement(properties, f"{W}tblBorders")
+        for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            edge = borders.find(f"{W}{side}")
+            if edge is None:
+                edge = ET.SubElement(borders, f"{W}{side}")
+            edge.attrib.clear(); edge.set(f"{W}val", "nil")
+        for row in table.findall(f"{W}tr"):
+            row_properties = row.find(f"{W}trPr")
+            if row_properties is not None:
+                for header in list(row_properties.findall(f"{W}tblHeader")):
+                    row_properties.remove(header)
+            for run_properties in row.findall(f".//{W}rPr"):
+                for bold in list(run_properties.findall(f"{W}b")) + list(run_properties.findall(f"{W}bCs")):
+                    run_properties.remove(bold)
+        changed += 1
+    if changed:
+        files["word/document.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        temporary = destination.with_suffix(".native-tables.tmp.docx")
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, value in files.items():
+                archive.writestr(name, value)
+        temporary.replace(destination)
+    return changed
+
+
 def _renderer_python():
     candidates = [os.environ.get("BOOKTEXT_EXPORT_PYTHON"), sys.executable, str(Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3")]
     for candidate in candidates:
@@ -433,6 +489,10 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
                                if block.get("type") == "table" and block.get("fallback_visual")}
             _enable_docx_text_wrapping(paths["docx"], inline_image_hashes=fallback_hashes)
             _format_wide_docx_tables(paths["docx"])
+            native_grids = [_grid(root, block) for block in document["blocks"]
+                            if block.get("type") == "table" and block.get("table_status") == "structured"
+                            and (block.get("provenance", {}).get("source") or {}).get("kind") == "native_pdf_words_geometry"]
+            _format_native_geometry_docx_tables(paths["docx"], grids=native_grids)
         finally:
             docx_markdown.unlink(missing_ok=True)
     if "epub" in requested:

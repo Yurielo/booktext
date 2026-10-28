@@ -27,14 +27,15 @@ class ExportDocumentTests(unittest.TestCase):
         from PIL import Image
         Image.new("RGB", (2, 2), "red").save(self.root / "images/fallback.png")
         for table in ("page-0313-table-01", "page-0313-table-02", "page-0320-table-01", "page-0321-table-01"):
-            write(self.root / f"tables/{table}.json", {"grid":[["A", "B"], ["1", "2"]]})
-            write(self.root / f"tables/{table}.tsv", "A\tB\n1\t2\n"); write(self.root / f"tables/{table}.html", "<table><tr><td>A</td></tr></table>")
+            grid = [["native left", "native right"], ["native two", "native value"]] if table == "page-0313-table-01" else [["A", "B"], ["1", "2"]]
+            write(self.root / f"tables/{table}.json", {"grid":grid})
+            write(self.root / f"tables/{table}.tsv", "\n".join("\t".join(row) for row in grid) + "\n"); write(self.root / f"tables/{table}.html", "<table><tr><td>A</td></tr></table>")
         self.document = {"schema_version":"1.0","artifact_type":"booktext.canonical_document","document_id":"d","metadata":{"booktext_version":"0.1.0","title":None},"source_pages":[{"source_page":1},{"source_page":313},{"source_page":319},{"source_page":320},{"source_page":321}],"source":{},"review":{"unresolved_priority_counts":{"HIGH":1,"MEDIUM":2}},"warnings":[],"notes":[],"blocks":[
             {"block_id":"h","type":"heading","reading_order":1,"text":"Heading & <safe>","level":None,"provenance":{"source_page":1}},
             {"block_id":"p","type":"paragraph","reading_order":2,"text":"Corrected prose","provenance":{"source_page":1,"correction_decision_ids":["decision-1"]}},
             {"block_id":"u","type":"unknown","reading_order":3,"text":"Unclassified content","provenance":{"source_page":1}},
             {"block_id":"f","type":"figure","reading_order":4,"image":"images/figure.png","description":"Auxiliary","caption_id":None,"provenance":{"source_page":1}},
-            {"block_id":"t1","type":"table","reading_order":5,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-01.json","tsv":"tables/page-0313-table-01.tsv","html":"tables/page-0313-table-01.html"},"provenance":{"source_page":313}},
+            {"block_id":"t1","type":"table","reading_order":5,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-01.json","tsv":"tables/page-0313-table-01.tsv","html":"tables/page-0313-table-01.html"},"provenance":{"source_page":313,"source":{"kind":"native_pdf_words_geometry"}}},
             {"block_id":"t2","type":"table","reading_order":6,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-02.json","tsv":"tables/page-0313-table-02.tsv","html":"tables/page-0313-table-02.html"},"provenance":{"source_page":313}},
             {"block_id":"fallback","type":"table","reading_order":7,"table_status":"fallback_review","review_required":True,"fallback_visual":"images/fallback.png","provenance":{"source_page":319}},
             {"block_id":"t3","type":"table","reading_order":8,"table_status":"structured","artifacts":{"json":"tables/page-0320-table-01.json","tsv":"tables/page-0320-table-01.tsv","html":"tables/page-0320-table-01.html"},"provenance":{"source_page":320}},
@@ -58,7 +59,7 @@ class ExportDocumentTests(unittest.TestCase):
         self.assertIn("Corrected prose", markdown); self.assertIn("Unclassified content", markdown); self.assertNotIn("Unknown layout block", markdown); self.assertNotIn("fallback review", markdown)
         self.assertIn("fallback.png", markdown)
         self.assertNotIn("\n---\n", markdown)
-        self.assertEqual(markdown.count("| A | B |"), 4)
+        self.assertEqual(markdown.count("| A | B |"), 3)
         self.assertIn("Heading &amp; &lt;safe&gt;", html); self.assertIn("Unclassified content", html); self.assertNotIn("Table fallback review", html); self.assertNotIn("<hr", html)
         with zipfile.ZipFile(self.root / "exports/book.docx") as archive:
             self.assertIn("word/document.xml", archive.namelist())
@@ -73,6 +74,11 @@ class ExportDocumentTests(unittest.TestCase):
             self.assertFalse(any(node.get("descr") == "Source table" for node in root.findall(f".//{WP}docPr")))
             self.assertEqual(1, len(root.findall(f".//{WP}inline")))
             self.assertEqual(1, len(root.findall(f".//{WP}anchor")))
+            native = next(table for table in root.findall(f".//{W}tbl")
+                          if "native left" in "".join(node.text or "" for node in table.iter(f"{W}t")))
+            properties = native.find(f"{W}tblPr")
+            self.assertEqual("0", properties.find(f"{W}tblLook").get(f"{W}firstRow"))
+            self.assertEqual({"nil"}, {edge.get(f"{W}val") for edge in properties.find(f"{W}tblBorders")})
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive:
             self.assertIn("mimetype", archive.namelist()); self.assertTrue(any(name.endswith(".png") for name in archive.namelist()))
         self.assertGreater((self.root / "exports/book.pdf").stat().st_size, 100)
