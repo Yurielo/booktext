@@ -34,7 +34,7 @@ class ExportDocumentTests(unittest.TestCase):
             {"block_id":"h","type":"heading","reading_order":1,"text":"Heading & <safe>","level":None,"provenance":{"source_page":1}},
             {"block_id":"p","type":"paragraph","reading_order":2,"text":"Corrected prose","provenance":{"source_page":1,"correction_decision_ids":["decision-1"]}},
             {"block_id":"u","type":"unknown","reading_order":3,"text":"Unclassified content","provenance":{"source_page":1}},
-            {"block_id":"f","type":"figure","reading_order":4,"image":"images/figure.png","description":"Auxiliary","caption_id":None,"provenance":{"source_page":1}},
+            {"block_id":"f","type":"figure","reading_order":4,"image":"images/figure.png","description":"Auxiliary","caption_id":None,"provenance":{"source_page":1,"bbox":[60,0,80,20],"page_size_points":[100,100]}},
             {"block_id":"t1","type":"table","reading_order":5,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-01.json","tsv":"tables/page-0313-table-01.tsv","html":"tables/page-0313-table-01.html"},"provenance":{"source_page":313,"source":{"kind":"native_pdf_words_geometry"}}},
             {"block_id":"t2","type":"table","reading_order":6,"table_status":"structured","artifacts":{"json":"tables/page-0313-table-02.json","tsv":"tables/page-0313-table-02.tsv","html":"tables/page-0313-table-02.html"},"provenance":{"source_page":313}},
             {"block_id":"fallback","type":"table","reading_order":7,"table_status":"fallback_review","review_required":True,"fallback_visual":"images/fallback.png","provenance":{"source_page":319}},
@@ -74,11 +74,16 @@ class ExportDocumentTests(unittest.TestCase):
             self.assertFalse(any(node.get("descr") == "Source table" for node in root.findall(f".//{WP}docPr")))
             self.assertEqual(1, len(root.findall(f".//{WP}inline")))
             self.assertEqual(1, len(root.findall(f".//{WP}anchor")))
+            position = root.find(f".//{WP}anchor/{WP}positionH/{WP}posOffset")
+            self.assertGreater(int(position.text), 0)
+            wrapping = root.find(f".//{WP}anchor/{WP}wrapSquare")
+            self.assertEqual("left", wrapping.get("wrapText"))
             native = next(table for table in root.findall(f".//{W}tbl")
                           if "native left" in "".join(node.text or "" for node in table.iter(f"{W}t")))
             properties = native.find(f"{W}tblPr")
             self.assertEqual("0", properties.find(f"{W}tblLook").get(f"{W}firstRow"))
             self.assertEqual({"nil"}, {edge.get(f"{W}val") for edge in properties.find(f"{W}tblBorders")})
+            self.assertLess(int(properties.find(f"{W}tblW").get(f"{W}w")), 5000)
         with zipfile.ZipFile(self.root / "exports/book.epub") as archive:
             self.assertIn("mimetype", archive.namelist()); self.assertTrue(any(name.endswith(".png") for name in archive.namelist()))
         self.assertGreater((self.root / "exports/book.pdf").stat().st_size, 100)

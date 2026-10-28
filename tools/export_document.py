@@ -152,7 +152,7 @@ def _pandoc(markdown, destination, root):
     subprocess.run([executable, str(markdown), "--resource-path", resources, "-o", str(destination)], check=True, capture_output=True, text=True)
 
 
-def _enable_docx_text_wrapping(destination, *, inline_image_hashes=()):
+def _enable_docx_text_wrapping(destination, *, inline_image_hashes=(), anchor_x_by_hash=None):
     """Wrap small figures; keep large illustrations in the paginated flow.
 
     Pandoc creates valid inline drawings, but Word lays those out as text
@@ -173,6 +173,7 @@ def _enable_docx_text_wrapping(destination, *, inline_image_hashes=()):
             if identifier and target:
                 relationships[identifier] = (Path("word") / target).as_posix()
     inline_image_hashes = set(inline_image_hashes)
+    anchor_x_by_hash = anchor_x_by_hash or {}
     parents = {child: parent for parent in root.iter() for child in parent}
     section = root.find(f".//{W}sectPr")
     size = section.find(f"{W}pgSz") if section is not None else None
@@ -193,7 +194,8 @@ def _enable_docx_text_wrapping(destination, *, inline_image_hashes=()):
         blip = inline.find(f".//{A}blip")
         embedded = blip.get(f"{R}embed") if blip is not None else None
         asset = files.get(relationships.get(embedded, ""), b"")
-        if asset and hashlib.sha256(asset).hexdigest() in inline_image_hashes:
+        asset_hash = hashlib.sha256(asset).hexdigest() if asset else None
+        if asset_hash in inline_image_hashes:
             # A source-preserved fallback table is already one visual block.
             # Floating it would reflow adjacent paragraphs around an
             # unverified crop and make the reader output misleading.
@@ -215,7 +217,9 @@ def _enable_docx_text_wrapping(destination, *, inline_image_hashes=()):
         inline.attrib.update({"distT": "0", "distB": "0", "distL": "114300", "distR": "114300", "simplePos": "0", "relativeHeight": "251658240", "behindDoc": "0", "locked": "0", "layoutInCell": "1", "allowOverlap": "0"})
         simple = ET.Element(f"{WP}simplePos", {"x": "0", "y": "0"})
         horizontal = ET.Element(f"{WP}positionH", {"relativeFrom": "column"})
-        ET.SubElement(horizontal, f"{WP}posOffset").text = "0"
+        requested_x = anchor_x_by_hash.get(asset_hash)
+        offset = 0 if requested_x is None else round(max(0, min(1, requested_x)) * max(0, width - int(extent.get("cx"))))
+        ET.SubElement(horizontal, f"{WP}posOffset").text = str(offset)
         vertical = ET.Element(f"{WP}positionV", {"relativeFrom": "paragraph"})
         ET.SubElement(vertical, f"{WP}posOffset").text = "0"
         inline.insert(0, simple); inline.insert(1, horizontal); inline.insert(2, vertical)
@@ -224,7 +228,11 @@ def _enable_docx_text_wrapping(destination, *, inline_image_hashes=()):
         wrap_index = 3
         while wrap_index < len(inline) and inline[wrap_index].tag in {f"{WP}extent", f"{WP}effectExtent"}:
             wrap_index += 1
-        inline.insert(wrap_index, ET.Element(f"{WP}wrapSquare", {"wrapText": "bothSides"}))
+        # A source visual attested on the right side of a page reserves the
+        # right side for itself.  Let prose use only the left side; wrapping
+        # on both sides would splice one source sentence around the figure.
+        wrap = "left" if requested_x is not None and requested_x >= .5 else "bothSides"
+        inline.insert(wrap_index, ET.Element(f"{WP}wrapSquare", {"wrapText": wrap}))
         converted += 1
     if not converted:
         return 0
@@ -328,7 +336,7 @@ def _format_wide_docx_tables(destination):
     return changed
 
 
-def _format_native_geometry_docx_tables(destination, *, grids=()):
+def _format_native_geometry_docx_tables(destination, *, grids=(), widths_by_grid=None):
     """Keep verified native-PDF mappings as text tables, not invented headers.
 
     Pandoc's Markdown table syntax necessarily treats its first row as a
@@ -341,7 +349,12 @@ def _format_native_geometry_docx_tables(destination, *, grids=()):
         return 0
     with zipfile.ZipFile(destination) as archive:
         files = {entry.filename: archive.read(entry.filename) for entry in archive.infolist()}
+    widths_by_grid = widths_by_grid or {}
     root = ET.fromstring(files["word/document.xml"])
+    section = root.find(f".//{W}sectPr")
+    size = section.find(f"{W}pgSz") if section is not None else None
+    margins = section.find(f"{W}pgMar") if section is not None else None
+    available = (int(size.get(f"{W}w", 12240)) if size is not None else 12240) - (int(margins.get(f"{W}left", 1440)) if margins is not None else 1440) - (int(margins.get(f"{W}right", 1440)) if margins is not None else 1440)
     changed = 0
     for table in root.findall(f".//{W}tbl"):
         rows = []
@@ -349,6 +362,7 @@ def _format_native_geometry_docx_tables(destination, *, grids=()):
             rows.append(tuple("".join(node.text or "" for node in cell.iter(f"{W}t")) for cell in row.findall(f"{W}tc")))
         if tuple(rows) not in expected:
             continue
+        grid_key = tuple(rows)
         properties = table.find(f"{W}tblPr")
         if properties is None:
             properties = ET.Element(f"{W}tblPr")
@@ -373,6 +387,26 @@ def _format_native_geometry_docx_tables(destination, *, grids=()):
             for run_properties in row.findall(f".//{W}rPr"):
                 for bold in list(run_properties.findall(f"{W}b")) + list(run_properties.findall(f"{W}bCs")):
                     run_properties.remove(bold)
+        fraction = widths_by_grid.get(grid_key)
+        if fraction is not None:
+            width = round(available * max(.35, min(.6, fraction)))
+            table_width = properties.find(f"{W}tblW")
+            if table_width is None:
+                table_width = ET.SubElement(properties, f"{W}tblW")
+            table_width.attrib.update({f"{W}w": str(width), f"{W}type": "dxa"})
+            table_grid = table.find(f"{W}tblGrid")
+            columns = list(table_grid) if table_grid is not None else []
+            per_column = width // len(columns) if columns else width
+            for column in columns:
+                column.set(f"{W}w", str(per_column))
+            for cell in table.findall(f".//{W}tc"):
+                cell_properties = cell.find(f"{W}tcPr")
+                if cell_properties is None:
+                    cell_properties = ET.SubElement(cell, f"{W}tcPr")
+                cell_width = cell_properties.find(f"{W}tcW")
+                if cell_width is None:
+                    cell_width = ET.SubElement(cell_properties, f"{W}tcW")
+                cell_width.attrib.update({f"{W}w": str(per_column), f"{W}type": "dxa"})
         changed += 1
     if changed:
         files["word/document.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
@@ -487,12 +521,28 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
             _pandoc(docx_markdown, paths["docx"], root)
             fallback_hashes = {_sha(root / block["fallback_visual"]) for block in document["blocks"]
                                if block.get("type") == "table" and block.get("fallback_visual")}
-            _enable_docx_text_wrapping(paths["docx"], inline_image_hashes=fallback_hashes)
+            figure_x = {}
+            for block in document["blocks"]:
+                if block.get("type") != "figure" or not block.get("image"):
+                    continue
+                figure_provenance = block.get("provenance") or {}
+                bounds, dimensions = figure_provenance.get("bbox"), figure_provenance.get("page_size_points")
+                if (isinstance(bounds, list) and len(bounds) == 4 and isinstance(dimensions, list) and len(dimensions) == 2
+                        and isinstance(bounds[0], (int, float)) and isinstance(dimensions[0], (int, float)) and dimensions[0] > 0):
+                    figure_x[_sha(root / block["image"])] = bounds[0] / dimensions[0]
+            _enable_docx_text_wrapping(paths["docx"], inline_image_hashes=fallback_hashes, anchor_x_by_hash=figure_x)
             _format_wide_docx_tables(paths["docx"])
             native_grids = [_grid(root, block) for block in document["blocks"]
                             if block.get("type") == "table" and block.get("table_status") == "structured"
                             and (block.get("provenance", {}).get("source") or {}).get("kind") == "native_pdf_words_geometry"]
-            _format_native_geometry_docx_tables(paths["docx"], grids=native_grids)
+            native_widths = {}
+            for block in document["blocks"]:
+                if block.get("type") != "table" or (block.get("provenance", {}).get("source") or {}).get("kind") != "native_pdf_words_geometry":
+                    continue
+                bounds, dimensions = (block.get("provenance") or {}).get("bbox"), (block.get("provenance") or {}).get("page_size_points")
+                if isinstance(bounds, list) and len(bounds) == 4 and isinstance(dimensions, list) and len(dimensions) == 2 and dimensions[0]:
+                    native_widths[tuple(tuple(str(cell) for cell in row) for row in _grid(root, block))] = max(.46, (bounds[2] - bounds[0]) / dimensions[0] * 1.4)
+            _format_native_geometry_docx_tables(paths["docx"], grids=native_grids, widths_by_grid=native_widths)
         finally:
             docx_markdown.unlink(missing_ok=True)
     if "epub" in requested:

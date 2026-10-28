@@ -214,6 +214,22 @@ class CanonicalDocumentTests(unittest.TestCase):
         document = build_document(self.root)
         self.assertEqual([b["type"] for b in document["blocks"]], ["paragraph", "figure", "paragraph", "page_break"])
 
+    def test_native_side_figure_is_ordered_before_the_following_text_region(self):
+        (self.root / "review_decisions.json").unlink()
+        (self.root / "surya/surya-input/results.json").unlink()
+        self.book["pages"] = [{"page": 1, "text": "Before. After.",
+            "source_provenance": {"page_size_points": [100, 100]},
+            "layout_blocks": [
+                {"label": "Text", "reading_order": 1, "bbox": [0, 0, 40, 20], "text": "Before."},
+                {"label": "Text", "reading_order": 2, "bbox": [0, 50, 40, 70], "text": "After."},
+            ],
+            "visuals": [{"index": 1, "image": "images/figure.png", "bbox": [50, 30, 90, 90], "type": "source_figure"}],
+            "tables": {"tables": []}}]
+        self.priority["items"] = []
+        write(self.root / "book.json", self.book); write(self.root / "review_priority.json", self.priority)
+        document = build_document(self.root)
+        self.assertEqual([block["type"] for block in document["blocks"]], ["paragraph", "figure", "paragraph", "page_break"])
+
     def test_v2_extraction_evidence_is_verified_before_offline_build(self):
         import hashlib
         self.book["extraction_policy"] = "automatic-extraction-2"

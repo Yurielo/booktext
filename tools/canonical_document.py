@@ -377,7 +377,8 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
     for record in pages:
         page = record["page"]
         warnings.extend(record.get("extraction_warnings", []))
-        page_ref = {"source_page": page, "prepared_page": _relative_if_file(root, record.get("page_image")), "raw_ocr_ref": raw_surya_ref}
+        page_ref = {"source_page": page, "prepared_page": _relative_if_file(root, record.get("page_image")), "raw_ocr_ref": raw_surya_ref,
+                    "page_size_points": (record.get("source_provenance") or {}).get("page_size_points")}
         if record.get("layout_blocks") is not None:
             page_ref["raw_native_ref"] = _relative_if_file(root, (record.get("source_provenance") or {}).get("native_evidence"))
             page_ref["source_sha256"] = (record.get("source_provenance") or {}).get("source_sha256")
@@ -548,7 +549,12 @@ def build_document(output_dir, *, booktext_version="0.1.0"):
                 if bounds:
                     for i,block in enumerate(content):
                         other = block["provenance"].get("bbox")
-                        if other and other[1] >= bounds[3]: position = i; break
+                        # A figure that shares vertical space with text belongs
+                        # before the first following text region.  Comparing
+                        # against its bottom pushed right-side illustrations
+                        # to the end of a page instead of preserving their
+                        # source reading position.
+                        if other and other[1] >= bounds[1]: position = i; break
                 content.insert(position, figure)
             blocks[page_start:] = content
             for i,block in enumerate(blocks, 1): block["reading_order"] = i
