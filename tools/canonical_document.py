@@ -234,7 +234,32 @@ def _native_mapping_rows(lines):
     if best is None:
         return None
     first = min(row[0] for row in best); last = max(row[1] for row in best)
-    return first, last, [[str(row[2]["text"]).strip(), str(row[3]["text"]).strip()] for row in best]
+    grid = [[str(row[2]["text"]).strip(), str(row[3]["text"]).strip()] for row in best]
+    # A native PDF can occasionally store the final two-column row as a
+    # single text line.  Keep that exact line *inside* the table, while never
+    # guessing where its two cells divide.  The repeated left-column prefix,
+    # vertical adjacency, and matching row width make this a table member;
+    # its second cell is intentionally empty rather than fabricated.
+    if last + 1 < len(lines):
+        continuation = lines[last + 1]
+        left_edge = min(row[2]["bbox"][0] for row in best)
+        right_edge = max(row[3]["bbox"][2] for row in best)
+        close = continuation["bbox"][1] - lines[last]["bbox"][3] <= max(14.0, median_height * 2.2)
+        # A first row may have a longer left label and therefore start farther
+        # left than the repeated data rows.  Align against the data-row median.
+        data_lefts = sorted(row[2]["bbox"][0] for row in best[1:]) or [left_edge]
+        data_left = data_lefts[len(data_lefts) // 2]
+        aligned = abs(continuation["bbox"][0] - data_left) <= max(8.0, median_height * 1.2)
+        within = continuation["bbox"][2] <= right_edge + max(12.0, median_height * 1.4)
+        prefixes = {re.match(r"^\s*([A-Za-z]+)", row[0]).group(1).casefold()
+                    for row in grid[1:] if re.match(r"^\s*([A-Za-z]+)", row[0])}
+        text = str(continuation.get("text", "")).strip()
+        token = re.match(r"^\s*([A-Za-z]+)", text)
+        shape_tail = re.search(r"\b(?:a|an)\s+[A-Za-z][A-Za-z -]*$", text, flags=re.I)
+        if close and aligned and within and token and token.group(1).casefold() in prefixes and shape_tail:
+            grid.append([text, ""])
+            last += 1
+    return first, last, grid
 
 
 def _write_native_table_artifacts(root, *, page, raw_index, grid, bbox, page_ref):
@@ -248,7 +273,7 @@ def _write_native_table_artifacts(root, *, page, raw_index, grid, bbox, page_ref
         "source": "native_pdf_words_geometry", "page": page, "table_index": raw_index,
         "bbox": bbox, "rows": grid, "grid": grid, "row_count": len(grid), "column_count": 2,
         "provenance": {"native_evidence": page_ref.get("raw_native_ref"),
-                       "cell_status": "verified_native_text_geometry"},
+                       "cell_status": "verified_native_text_geometry; unsplit native rows retain one empty cell"},
     }
     paths["json"].write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     with paths["tsv"].open("w", encoding="utf-8", newline="") as handle:
