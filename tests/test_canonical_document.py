@@ -172,6 +172,12 @@ class CanonicalDocumentTests(unittest.TestCase):
         for offset, left, right in ((20, "of Saturn", "triangle"), (30, "of Jupiter", "quadrangle"), (40, "of Mars", "pentagon")):
             lines.extend([line(left, 20, offset, 46, offset + 6), line(right, 62, offset, 96, offset + 6)])
         lines.append(line("of Moon a nonagon", 20, 50, 96, 56))
+        lines[-1]["words"] = [
+            {"text": "of", "bbox": [20, 50, 26, 56]},
+            {"text": "Moon", "bbox": [29, 50, 45, 56]},
+            {"text": "a", "bbox": [63, 50, 67, 56]},
+            {"text": "nonagon", "bbox": [70, 50, 96, 56]},
+        ]
         lines.append(line("The list continues.", 10, 65, 80, 71))
         self.book["pages"] = [{"page": 1, "text": "The symbols are:", "page_image": "pages/p1.png",
             "source_provenance": {"page_size_points": [100, 100]}, "visuals": [], "tables": {"tables": []},
@@ -186,7 +192,7 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertEqual(table["rows"], 4)
         self.assertEqual(table["columns"], 2)
         grid = json.loads((self.root / table["artifacts"]["json"]).read_text(encoding="utf-8"))["grid"]
-        self.assertEqual(grid, [["of Saturn", "triangle"], ["of Jupiter", "quadrangle"], ["of Mars", "pentagon"], ["of Moon a nonagon", ""]])
+        self.assertEqual(grid, [["of Saturn", "triangle"], ["of Jupiter", "quadrangle"], ["of Mars", "pentagon"], ["of Moon", "a nonagon"]])
         self.assertEqual(table["provenance"]["source"]["cell_status"], "verified_native_text_geometry")
         publication = "\n".join(block.get("text", "") for block in document["blocks"])
         self.assertIn("The symbols are:", publication)

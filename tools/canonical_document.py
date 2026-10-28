@@ -257,7 +257,21 @@ def _native_mapping_rows(lines):
         token = re.match(r"^\s*([A-Za-z]+)", text)
         shape_tail = re.search(r"\b(?:a|an)\s+[A-Za-z][A-Za-z -]*$", text, flags=re.I)
         if close and aligned and within and token and token.group(1).casefold() in prefixes and shape_tail:
-            grid.append([text, ""])
+            # Prefer actual native *word* geometry over a textual split.  The
+            # established right column provides an observed boundary; only a
+            # material word gap across that boundary becomes two cells.
+            right_starts = sorted(row[3]["bbox"][0] for row in best)
+            right_start = right_starts[len(right_starts) // 2]
+            words = [word for word in continuation.get("words", [])
+                     if isinstance(word, dict) and isinstance(word.get("bbox"), list) and len(word["bbox"]) == 4
+                     and str(word.get("text", "")).strip()]
+            split = next((position for position, word in enumerate(words)
+                          if word["bbox"][0] >= right_start - max(1.0, median_height * .2)), None)
+            if split and words[split - 1]["bbox"][2] < words[split]["bbox"][0] - max(1.0, median_height * .5):
+                grid.append([" ".join(str(word["text"]).strip() for word in words[:split]),
+                             " ".join(str(word["text"]).strip() for word in words[split:])])
+            else:
+                grid.append([text, ""])
             last += 1
     return first, last, grid
 
