@@ -93,10 +93,12 @@ from OCR human review. Cloud and paid translation services are intentionally
 out of scope until the Product Owner explicitly chooses one.
 
 `tools/hybrid_context_v13.py`, `tools/hybrid_semantic_audit_v15.py` and
-`tools/hybrid_targeted_audit_v16.py` are archived OCR audit experiments. They
-are not imported by the app, production Core, pipeline, bootstrap or current
-acceptance automation. Their Qwen references remain as historical research
-provenance and are not TranslateGemma translation paths.
+`tools/hybrid_targeted_audit_v16.py` preserve their archival entry-point names
+only. They return `RETIRED_DIAGNOSTIC` and perform no model inference or local
+model-service request. They are not imported by the app, production Core,
+pipeline, bootstrap or current acceptance automation. Historical OCR-audit
+artifacts remain evidence, not a production capability or a TranslateGemma
+translation path.
 
 ## Resumable logical-unit execution
 

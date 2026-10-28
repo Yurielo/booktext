@@ -127,12 +127,12 @@ class MachineProtocolTests(unittest.TestCase):
     def test_translation_uses_versioned_machine_operation_without_ocr(self, translate):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.fixture(temporary)
-            code, payload = events(lambda: protocol.main(["translation", str(root), "--source-language", "en", "--target-language", "ru", "--model", "qwen3:8b", "--block-id", "unit-2", "--block-id", "unit-5"]))
+            code, payload = events(lambda: protocol.main(["translation", str(root), "--source-language", "en", "--target-language", "ru", "--model", "translategemma:4b", "--block-id", "unit-2", "--block-id", "unit-5"]))
             self.assertEqual(0, code); self.assert_protocol(payload)
             self.assertEqual("translation", payload[-1]["phase"])
             translate.assert_called_once()
             kwargs = translate.call_args.kwargs
-            self.assertEqual("qwen3:8b", kwargs["model"])
+            self.assertEqual("translategemma:4b", kwargs["model"])
             self.assertEqual("en", kwargs["source_language"])
             self.assertEqual("ru", kwargs["target_language"])
             self.assertEqual("30s", kwargs["keep_alive"])
