@@ -35,6 +35,7 @@ FORMATS = ("markdown", "html", "docx", "epub", "pdf", "pdf_image")
 WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 
 
 def _load(path): return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -62,6 +63,18 @@ def _markdown_table(grid):
     return "\n".join([header, divider, *body])
 
 
+def _markdown_text(value):
+    """Keep source punctuation from accidentally becoming Markdown syntax."""
+    text = str(value or "")
+    # A source footnote marker such as ``* With regard`` is prose, not a
+    # list.  Escaping only a leading marker leaves authentic interior text
+    # intact and avoids changing CDM text/provenance.
+    if re.match(r"^\s*(?:[*+-]|\d+[.)])\s+", text):
+        prefix = re.match(r"^(\s*)(.*)$", text)
+        text = prefix.group(1) + "\\" + prefix.group(2)
+    return text
+
+
 def render_markdown(document, root, asset_map=None):
     asset_map = asset_map or {}
     lines = [f"# {document['metadata'].get('title') or 'BookText export'}", "", "<!-- Generated from BookText CDM; CDM remains the machine source. -->"]
@@ -76,15 +89,19 @@ def render_markdown(document, root, asset_map=None):
             lines.extend(["", f"<!-- source-page: {page} -->"])
             if block.get("boundary_kind") == "excerpt_gap":
                 lines.extend(["", "*" + block["text"] + "*"])
-        elif kind == "heading": lines.extend(["", "## " + block.get("text", "")])
-        elif kind == "paragraph": lines.extend(["", block.get("text", "")])
-        elif kind == "list": lines.extend(["", "- " + block.get("text", "")])
+        elif kind == "heading": lines.extend(["", "## " + _markdown_text(block.get("text", ""))])
+        elif kind == "paragraph": lines.extend(["", _markdown_text(block.get("text", ""))])
+        elif kind == "list": lines.extend(["", "- " + _markdown_text(block.get("text", ""))])
         # Unknown is a conservative CDM classification, not reader-facing
         # content. Keep its text without a developer diagnostic label.
-        elif kind == "unknown": lines.extend(["", block.get("text", "")])
+        elif kind == "unknown": lines.extend(["", _markdown_text(block.get("text", ""))])
         elif kind == "table":
             lines.extend([""])
             if block.get("table_status") == "structured": lines.append(_markdown_table(_grid(root, block)))
+            elif block.get("fallback_visual"):
+                # The source crop preserves a real table without claiming
+                # unverified native geometry is a grid of machine cells.
+                lines.append(f"![]({asset_map.get(block['fallback_visual'], _asset_path(block['fallback_visual']))})")
             else: continue
         elif kind == "figure":
             lines.extend(["", f"![]({asset_map.get(block.get('image'), _asset_path(block.get('image')))})"])
@@ -110,7 +127,11 @@ def render_html(document, root, asset_map=None):
         elif kind == "list": parts.append(f"<ul data-source-page=\"{page}\"><li>{text}</li></ul>")
         elif kind == "unknown": parts.append(f"<p data-source-page=\"{page}\">{text}</p>")
         elif kind == "table":
-            if block.get("table_status") == "fallback_review": continue
+            if block.get("table_status") == "fallback_review":
+                if block.get("fallback_visual"):
+                    image = html.escape(asset_map.get(block["fallback_visual"], _asset_path(block["fallback_visual"])), quote=True)
+                    parts.append(f'<figure data-source-page="{page}"><img src="{image}" alt="source table"></figure>')
+                continue
             else:
                 grid = _grid(root, block); rows = []
                 for row_index, row in enumerate(grid):
@@ -131,7 +152,7 @@ def _pandoc(markdown, destination, root):
     subprocess.run([executable, str(markdown), "--resource-path", resources, "-o", str(destination)], check=True, capture_output=True, text=True)
 
 
-def _enable_docx_text_wrapping(destination):
+def _enable_docx_text_wrapping(destination, *, inline_image_hashes=(), anchor_x_by_hash=None):
     """Wrap small figures; keep large illustrations in the paginated flow.
 
     Pandoc creates valid inline drawings, but Word lays those out as text
@@ -144,6 +165,15 @@ def _enable_docx_text_wrapping(destination):
     if xml is None:
         raise ValueError("DOCX has no word/document.xml")
     root = ET.fromstring(xml)
+    relationships = {}
+    relationship_xml = files.get("word/_rels/document.xml.rels")
+    if relationship_xml:
+        for relationship in ET.fromstring(relationship_xml):
+            identifier, target = relationship.get("Id"), relationship.get("Target")
+            if identifier and target:
+                relationships[identifier] = (Path("word") / target).as_posix()
+    inline_image_hashes = set(inline_image_hashes)
+    anchor_x_by_hash = anchor_x_by_hash or {}
     parents = {child: parent for parent in root.iter() for child in parent}
     section = root.find(f".//{W}sectPr")
     size = section.find(f"{W}pgSz") if section is not None else None
@@ -161,6 +191,15 @@ def _enable_docx_text_wrapping(destination):
         cx, cy = int(extent.get("cx")), int(extent.get("cy"))
         if min(cx, cy, width, height) <= 0:
             raise ValueError("DOCX drawing/page has invalid size")
+        blip = inline.find(f".//{A}blip")
+        embedded = blip.get(f"{R}embed") if blip is not None else None
+        asset = files.get(relationships.get(embedded, ""), b"")
+        asset_hash = hashlib.sha256(asset).hexdigest() if asset else None
+        if asset_hash in inline_image_hashes:
+            # A source-preserved fallback table is already one visual block.
+            # Floating it would reflow adjacent paragraphs around an
+            # unverified crop and make the reader output misleading.
+            continue
         scale = min(1, width / cx, height / cy)
         extent.set("cx", str(round(cx * scale))); extent.set("cy", str(round(cy * scale)))
         for transform in inline.findall(f".//{A}xfrm/{A}ext"):
@@ -178,7 +217,9 @@ def _enable_docx_text_wrapping(destination):
         inline.attrib.update({"distT": "0", "distB": "0", "distL": "114300", "distR": "114300", "simplePos": "0", "relativeHeight": "251658240", "behindDoc": "0", "locked": "0", "layoutInCell": "1", "allowOverlap": "0"})
         simple = ET.Element(f"{WP}simplePos", {"x": "0", "y": "0"})
         horizontal = ET.Element(f"{WP}positionH", {"relativeFrom": "column"})
-        ET.SubElement(horizontal, f"{WP}posOffset").text = "0"
+        requested_x = anchor_x_by_hash.get(asset_hash)
+        offset = 0 if requested_x is None else round(max(0, min(1, requested_x)) * max(0, width - int(extent.get("cx"))))
+        ET.SubElement(horizontal, f"{WP}posOffset").text = str(offset)
         vertical = ET.Element(f"{WP}positionV", {"relativeFrom": "paragraph"})
         ET.SubElement(vertical, f"{WP}posOffset").text = "0"
         inline.insert(0, simple); inline.insert(1, horizontal); inline.insert(2, vertical)
@@ -187,7 +228,11 @@ def _enable_docx_text_wrapping(destination):
         wrap_index = 3
         while wrap_index < len(inline) and inline[wrap_index].tag in {f"{WP}extent", f"{WP}effectExtent"}:
             wrap_index += 1
-        inline.insert(wrap_index, ET.Element(f"{WP}wrapSquare", {"wrapText": "bothSides"}))
+        # A source visual attested on the right side of a page reserves the
+        # right side for itself.  Let prose use only the left side; wrapping
+        # on both sides would splice one source sentence around the figure.
+        wrap = "left" if requested_x is not None and requested_x >= .5 else "bothSides"
+        inline.insert(wrap_index, ET.Element(f"{WP}wrapSquare", {"wrapText": wrap}))
         converted += 1
     if not converted:
         return 0
@@ -291,6 +336,88 @@ def _format_wide_docx_tables(destination):
     return changed
 
 
+def _format_native_geometry_docx_tables(destination, *, grids=(), widths_by_grid=None):
+    """Keep verified native-PDF mappings as text tables, not invented headers.
+
+    Pandoc's Markdown table syntax necessarily treats its first row as a
+    header.  Native PDF geometry does not supply that semantic evidence, so
+    remove the resulting header treatment and grid decoration from precisely
+    the matching source-derived tables in the final DOCX.
+    """
+    expected = {tuple(tuple(str(cell) for cell in row) for row in grid) for grid in grids}
+    if not expected:
+        return 0
+    with zipfile.ZipFile(destination) as archive:
+        files = {entry.filename: archive.read(entry.filename) for entry in archive.infolist()}
+    widths_by_grid = widths_by_grid or {}
+    root = ET.fromstring(files["word/document.xml"])
+    section = root.find(f".//{W}sectPr")
+    size = section.find(f"{W}pgSz") if section is not None else None
+    margins = section.find(f"{W}pgMar") if section is not None else None
+    available = (int(size.get(f"{W}w", 12240)) if size is not None else 12240) - (int(margins.get(f"{W}left", 1440)) if margins is not None else 1440) - (int(margins.get(f"{W}right", 1440)) if margins is not None else 1440)
+    changed = 0
+    for table in root.findall(f".//{W}tbl"):
+        rows = []
+        for row in table.findall(f"{W}tr"):
+            rows.append(tuple("".join(node.text or "" for node in cell.iter(f"{W}t")) for cell in row.findall(f"{W}tc")))
+        if tuple(rows) not in expected:
+            continue
+        grid_key = tuple(rows)
+        properties = table.find(f"{W}tblPr")
+        if properties is None:
+            properties = ET.Element(f"{W}tblPr")
+            table.insert(0, properties)
+        look = properties.find(f"{W}tblLook")
+        if look is None:
+            look = ET.SubElement(properties, f"{W}tblLook")
+        look.attrib.update({f"{W}firstRow": "0", f"{W}lastRow": "0", f"{W}noHBand": "1", f"{W}noVBand": "1"})
+        borders = properties.find(f"{W}tblBorders")
+        if borders is None:
+            borders = ET.SubElement(properties, f"{W}tblBorders")
+        for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            edge = borders.find(f"{W}{side}")
+            if edge is None:
+                edge = ET.SubElement(borders, f"{W}{side}")
+            edge.attrib.clear(); edge.set(f"{W}val", "nil")
+        for row in table.findall(f"{W}tr"):
+            row_properties = row.find(f"{W}trPr")
+            if row_properties is not None:
+                for header in list(row_properties.findall(f"{W}tblHeader")):
+                    row_properties.remove(header)
+            for run_properties in row.findall(f".//{W}rPr"):
+                for bold in list(run_properties.findall(f"{W}b")) + list(run_properties.findall(f"{W}bCs")):
+                    run_properties.remove(bold)
+        fraction = widths_by_grid.get(grid_key)
+        if fraction is not None:
+            width = round(available * max(.35, min(.6, fraction)))
+            table_width = properties.find(f"{W}tblW")
+            if table_width is None:
+                table_width = ET.SubElement(properties, f"{W}tblW")
+            table_width.attrib.update({f"{W}w": str(width), f"{W}type": "dxa"})
+            table_grid = table.find(f"{W}tblGrid")
+            columns = list(table_grid) if table_grid is not None else []
+            per_column = width // len(columns) if columns else width
+            for column in columns:
+                column.set(f"{W}w", str(per_column))
+            for cell in table.findall(f".//{W}tc"):
+                cell_properties = cell.find(f"{W}tcPr")
+                if cell_properties is None:
+                    cell_properties = ET.SubElement(cell, f"{W}tcPr")
+                cell_width = cell_properties.find(f"{W}tcW")
+                if cell_width is None:
+                    cell_width = ET.SubElement(cell_properties, f"{W}tcW")
+                cell_width.attrib.update({f"{W}w": str(per_column), f"{W}type": "dxa"})
+        changed += 1
+    if changed:
+        files["word/document.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        temporary = destination.with_suffix(".native-tables.tmp.docx")
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, value in files.items():
+                archive.writestr(name, value)
+        temporary.replace(destination)
+    return changed
+
+
 def _renderer_python():
     candidates = [os.environ.get("BOOKTEXT_EXPORT_PYTHON"), sys.executable, str(Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3")]
     for candidate in candidates:
@@ -375,24 +502,47 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
     needs_local_assets = any(fmt in requested for fmt in ("markdown", "html", "docx", "epub"))
     if needs_local_assets:
         for block in document["blocks"]:
-            if block["type"] != "figure" or not block.get("image"): continue
-            source = root / block["image"]
+            image = block.get("image") if block["type"] == "figure" else block.get("fallback_visual") if block["type"] == "table" else None
+            if not image: continue
+            source = root / image
             if not source.is_file(): raise ValueError("CDM figure asset is missing")
             destination = export_dir / "assets" / f"{block['block_id']}{source.suffix.lower()}"
             destination.parent.mkdir(exist_ok=True); shutil.copyfile(source, destination)
-            asset_map[block["image"]] = str(destination.relative_to(export_dir))
+            asset_map[image] = str(destination.relative_to(export_dir))
     markdown, html_text = render_markdown(document, root, asset_map), render_html(document, root, asset_map)
     paths = {"markdown": export_dir / f"{basename}.md", "html": export_dir / f"{basename}.html", "docx": export_dir / f"{basename}.docx", "epub": export_dir / f"{basename}.epub", "pdf": export_dir / f"{basename}.pdf", "pdf_image": export_dir / f"{basename}-image.pdf"}
     if "markdown" in requested: _write(paths["markdown"], markdown)
     if "html" in requested: _write(paths["html"], html_text)
-    has_figures = any(block.get("type") == "figure" for block in document["blocks"])
+    has_figures = any(block.get("type") == "figure" or bool(block.get("fallback_visual")) for block in document["blocks"])
     if "docx" in requested:
         docx_markdown = export_dir / f".{basename}-docx-input.md"
         _write(docx_markdown, markdown)
         try:
             _pandoc(docx_markdown, paths["docx"], root)
-            _enable_docx_text_wrapping(paths["docx"])
+            fallback_hashes = {_sha(root / block["fallback_visual"]) for block in document["blocks"]
+                               if block.get("type") == "table" and block.get("fallback_visual")}
+            figure_x = {}
+            for block in document["blocks"]:
+                if block.get("type") != "figure" or not block.get("image"):
+                    continue
+                figure_provenance = block.get("provenance") or {}
+                bounds, dimensions = figure_provenance.get("bbox"), figure_provenance.get("page_size_points")
+                if (isinstance(bounds, list) and len(bounds) == 4 and isinstance(dimensions, list) and len(dimensions) == 2
+                        and isinstance(bounds[0], (int, float)) and isinstance(dimensions[0], (int, float)) and dimensions[0] > 0):
+                    figure_x[_sha(root / block["image"])] = bounds[0] / dimensions[0]
+            _enable_docx_text_wrapping(paths["docx"], inline_image_hashes=fallback_hashes, anchor_x_by_hash=figure_x)
             _format_wide_docx_tables(paths["docx"])
+            native_grids = [_grid(root, block) for block in document["blocks"]
+                            if block.get("type") == "table" and block.get("table_status") == "structured"
+                            and (block.get("provenance", {}).get("source") or {}).get("kind") == "native_pdf_words_geometry"]
+            native_widths = {}
+            for block in document["blocks"]:
+                if block.get("type") != "table" or (block.get("provenance", {}).get("source") or {}).get("kind") != "native_pdf_words_geometry":
+                    continue
+                bounds, dimensions = (block.get("provenance") or {}).get("bbox"), (block.get("provenance") or {}).get("page_size_points")
+                if isinstance(bounds, list) and len(bounds) == 4 and isinstance(dimensions, list) and len(dimensions) == 2 and dimensions[0]:
+                    native_widths[tuple(tuple(str(cell) for cell in row) for row in _grid(root, block))] = max(.46, (bounds[2] - bounds[0]) / dimensions[0] * 1.4)
+            _format_native_geometry_docx_tables(paths["docx"], grids=native_grids, widths_by_grid=native_widths)
         finally:
             docx_markdown.unlink(missing_ok=True)
     if "epub" in requested:
@@ -430,12 +580,16 @@ def export_document(output_dir, formats, *, document_override=None, export_relat
     block_counts = {kind: sum(block["type"] == kind for block in document["blocks"]) for kind in ("unknown", "table")}
     visual_mode = "classified_or_recovered_visual_crops" if has_figures else "no_visual_evidence"
     warnings = list(document.get("warnings", []))
-    fallback_pages = sorted({block.get("provenance", {}).get("source_page") for block in document["blocks"] if block["type"] == "table" and block.get("table_status") == "fallback_review"})
-    for page in fallback_pages:
-        warnings.append({"kind": "fallback_table_not_rendered", "page": page, "message": "No verified table cells: retained in CDM/review evidence, not rendered as publication text."})
+    fallback_blocks = [block for block in document["blocks"] if block["type"] == "table" and block.get("table_status") == "fallback_review"]
+    for block in fallback_blocks:
+        page = block.get("provenance", {}).get("source_page")
+        if block.get("fallback_visual"):
+            warnings.append({"kind": "fallback_table_source_visual_preserved", "page": page, "message": "No verified table cells: source table visual retained without a fabricated grid."})
+        else:
+            warnings.append({"kind": "fallback_table_not_rendered", "page": page, "message": "No verified table cells: retained in CDM/review evidence, not rendered as publication text."})
     if visual_mode == "no_visual_evidence":
         warnings.append({"kind": "no_visual_evidence_for_docx", "message": "CDM has no figure blocks or retained source-page assets; DOCX cannot safely add images."})
-    manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": warnings, "visual_preservation": {"mode": visual_mode, "figure_count": sum(block.get("type") == "figure" for block in document["blocks"]), "policy": "Only CDM figure blocks are embedded. Prepared source pages are provenance, never whole-page figure fallbacks."}, "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
+    manifest = {"schema_version": EXPORT_SCHEMA, "artifact_type": "booktext.export_manifest", "cdm": {"path": "book_document.json", "sha256": _sha(document_path), "schema_version": document["schema_version"]}, "booktext_version": document["metadata"].get("booktext_version"), "generated": {fmt: {"path": str(paths[fmt].relative_to(root)), "named_deliverable": named[fmt], **validations[fmt]} for fmt in requested}, "validation": {"cdm": "PASS", "formats": {fmt: "PASS" for fmt in requested}}, "warnings": warnings, "visual_preservation": {"mode": visual_mode, "figure_count": sum(block.get("type") == "figure" for block in document["blocks"]), "fallback_table_visual_count": sum(bool(block.get("fallback_visual")) for block in fallback_blocks), "policy": "Only CDM figure blocks and explicit fallback-table source crops are embedded. Prepared source pages are provenance, never whole-page figure fallbacks."}, "unresolved_priority_counts": document.get("review", {}).get("unresolved_priority_counts", {}), "fallback_unknown_counts": {"unknown": block_counts["unknown"], "fallback_tables": sum(block.get("table_status") == "fallback_review" for block in document["blocks"] if block["type"] == "table")}, "policy": "Publication outputs are derived from CDM only. CDM remains the canonical machine source for Integra Evidence ingestion."}
     if provenance:
         manifest.update(provenance)
     _write(export_dir / "export_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
@@ -504,7 +658,11 @@ def _pdf_main(document_path, destination):
             prefix = "• " if kind == "list" else ""
             story.extend([Paragraph(prefix + html.escape(block.get("text", "")).replace("\n", "<br/>"), styles["BodyText"]), Spacer(1, 5)])
         elif kind == "table":
-            if block.get("table_status") == "fallback_review": continue
+            if block.get("table_status") == "fallback_review":
+                asset = root / block.get("fallback_visual", "")
+                if asset.is_file():
+                    image = Image(str(asset)); image._restrictSize(650, 450); story.extend([image, Spacer(1, 8)])
+                continue
             else:
                 table = Table(_grid(root, block), repeatRows=1)
                 table.setStyle(TableStyle([("GRID", (0,0), (-1,-1), .25, colors.grey), ("FONTNAME", (0,0), (-1,-1), "BookTextUnicode" if Path(font).is_file() else "Helvetica"), ("FONTSIZE", (0,0), (-1,-1), 7), ("BACKGROUND", (0,0), (-1,0), colors.lightgrey)])); story.extend([table, Spacer(1, 8)])

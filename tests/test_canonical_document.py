@@ -161,6 +161,45 @@ class CanonicalDocumentTests(unittest.TestCase):
         self.assertEqual([b["text"] for b in document["blocks"] if b["type"] == "paragraph"],
                          ["Left top.", "Left bottom.", "Right top."])
 
+    def test_native_two_column_mapping_becomes_verified_structured_native_text_table(self):
+        from PIL import Image
+        (self.root / "surya/surya-input/results.json").unlink()
+        (self.root / "review_decisions.json").unlink()
+        Image.new("RGB", (500, 500), "white").save(self.root / "pages/p1.png")
+        def line(text, x0, y0, x1, y1):
+            return {"text": text, "bbox": [x0, y0, x1, y1], "words": [{"text": text, "bbox": [x0, y0, x1, y1]}]}
+        lines = [line("The symbols are:", 10, 10, 70, 16)]
+        for offset, left, right in ((20, "of Saturn", "triangle"), (30, "of Jupiter", "quadrangle"), (40, "of Mars", "pentagon")):
+            lines.extend([line(left, 20, offset, 46, offset + 6), line(right, 62, offset, 96, offset + 6)])
+        lines.append(line("of Moon a nonagon", 20, 50, 96, 56))
+        lines[-1]["words"] = [
+            {"text": "of", "bbox": [20, 50, 26, 56]},
+            {"text": "Moon", "bbox": [29, 50, 45, 56]},
+            {"text": "a", "bbox": [63, 50, 67, 56]},
+            {"text": "nonagon", "bbox": [70, 50, 96, 56]},
+        ]
+        lines.append(line("The list continues.", 10, 65, 80, 71))
+        self.book["pages"] = [{"page": 1, "text": "The symbols are:", "page_image": "pages/p1.png",
+            "source_provenance": {"page_size_points": [100, 100]}, "visuals": [], "tables": {"tables": []},
+            "layout_blocks": [{"label": "Text", "extraction": "native_pdf_words", "reading_order": 1,
+                               "bbox": [10, 10, 96, 71], "lines": lines,
+                               "text": "\n".join(item["text"] for item in lines)}]}]
+        self.priority["items"] = []
+        write(self.root / "book.json", self.book); write(self.root / "review_priority.json", self.priority)
+        document = build_document(self.root)
+        table = next(block for block in document["blocks"] if block.get("table_status") == "structured")
+        self.assertNotIn("cells", table)
+        self.assertEqual(table["rows"], 4)
+        self.assertEqual(table["columns"], 2)
+        grid = json.loads((self.root / table["artifacts"]["json"]).read_text(encoding="utf-8"))["grid"]
+        self.assertEqual(grid, [["of Saturn", "triangle"], ["of Jupiter", "quadrangle"], ["of Mars", "pentagon"], ["of Moon", "a nonagon"]])
+        self.assertEqual(table["provenance"]["source"]["cell_status"], "verified_native_text_geometry")
+        publication = "\n".join(block.get("text", "") for block in document["blocks"])
+        self.assertIn("The symbols are:", publication)
+        self.assertIn("The list continues.", publication)
+        self.assertNotIn("Saturn\ntriangle", publication)
+        validate_document(document, root=self.root, decisions={"decisions": []})
+
     def test_scan_figure_stays_at_anchored_primary_position_once(self):
         (self.root / "review_decisions.json").unlink()
         self.book["pages"] = [{"page": 1, "text": "Left caption. Right column.", "layout_blocks": [],
@@ -174,6 +213,22 @@ class CanonicalDocumentTests(unittest.TestCase):
         ]}]})
         document = build_document(self.root)
         self.assertEqual([b["type"] for b in document["blocks"]], ["paragraph", "figure", "paragraph", "page_break"])
+
+    def test_native_side_figure_is_ordered_before_the_following_text_region(self):
+        (self.root / "review_decisions.json").unlink()
+        (self.root / "surya/surya-input/results.json").unlink()
+        self.book["pages"] = [{"page": 1, "text": "Before. After.",
+            "source_provenance": {"page_size_points": [100, 100]},
+            "layout_blocks": [
+                {"label": "Text", "reading_order": 1, "bbox": [0, 0, 40, 20], "text": "Before."},
+                {"label": "Text", "reading_order": 2, "bbox": [0, 50, 40, 70], "text": "After."},
+            ],
+            "visuals": [{"index": 1, "image": "images/figure.png", "bbox": [50, 30, 90, 90], "type": "source_figure"}],
+            "tables": {"tables": []}}]
+        self.priority["items"] = []
+        write(self.root / "book.json", self.book); write(self.root / "review_priority.json", self.priority)
+        document = build_document(self.root)
+        self.assertEqual([block["type"] for block in document["blocks"]], ["paragraph", "figure", "paragraph", "page_break"])
 
     def test_v2_extraction_evidence_is_verified_before_offline_build(self):
         import hashlib
